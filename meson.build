@@ -15,7 +15,6 @@ project(
 
 # Dependencies
 opencv_dep = dependency('opencv4', required: true)
-dlib_dep = dependency('dlib-1', required: true)
 pam_dep = dependency('pam', required: false)
 if not pam_dep.found()
     pam_dep = declare_dependency(
@@ -51,14 +50,23 @@ install_emptydir(config_dir)
 install_emptydir(models_dir)
 install_emptydir(log_dir)
 
-# Install default config
+# Install config with preservation logic via custom script
+# Note: Meson doesn't support conditional install, so we use install_data
+# and handle preservation in the Makefile
 install_data(
     'config/faceid.conf',
     install_dir: config_dir,
+    install_mode: 'rw-r--r--',
 )
 
 # Install documentation
 install_data(
     'README.md',
     install_dir: get_option('datadir') / 'doc' / 'faceid',
+)
+
+# Install systemd service
+install_data(
+    'systemd/faceid-presence.service',
+    install_dir: get_option('prefix') / 'lib' / 'systemd' / 'system',
 )

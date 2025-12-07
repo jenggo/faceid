@@ -79,15 +79,12 @@ int cmd_add(const std::string& username) {
     
     // Initialize face detector
     faceid::FaceDetector detector;
-    std::string shape_model = std::string(CONFIG_DIR) + "/shape_predictor_5_face_landmarks.dat";
-    std::string recognition_model = std::string(CONFIG_DIR) + "/dlib_face_recognition_resnet_model_v1.dat";
+    std::string recognition_model = std::string(CONFIG_DIR) + "/models/face_recognition_sface_2021dec.onnx";
     
-    std::cout << "Loading face detection models..." << std::endl;
-    if (!detector.loadModels(shape_model, recognition_model)) {
-        std::cerr << "Error: Failed to load face detection models" << std::endl;
-        std::cerr << "Expected files:" << std::endl;
-        std::cerr << "  " << shape_model << std::endl;
-        std::cerr << "  " << recognition_model << std::endl;
+    std::cout << "Loading face recognition model..." << std::endl;
+    if (!detector.loadModels(recognition_model)) {
+        std::cerr << "Error: Failed to load face recognition model" << std::endl;
+        std::cerr << "Expected file: " << recognition_model << std::endl;
         std::cerr << std::endl;
         std::cerr << "Run: sudo make install-models" << std::endl;
         return 1;
@@ -163,8 +160,9 @@ int cmd_add(const std::string& username) {
     Json::Value encodings_array(Json::arrayValue);
     for (const auto& encoding : encodings) {
         Json::Value encoding_array(Json::arrayValue);
-        for (long i = 0; i < encoding.size(); i++) {
-            encoding_array.append(encoding(i));
+        // SFace encoding is cv::Mat (128x1 float matrix)
+        for (int i = 0; i < encoding.rows * encoding.cols; i++) {
+            encoding_array.append(encoding.at<float>(i));
         }
         encodings_array.append(encoding_array);
     }
@@ -260,9 +258,10 @@ int cmd_test(const std::string& username) {
     std::vector<faceid::FaceEncoding> stored_encodings;
     const Json::Value& encodings_array = model_data["encodings"];
     for (const auto& enc_json : encodings_array) {
-        faceid::FaceEncoding encoding(128, 1);
+        // SFace encoding is 128D float vector as cv::Mat
+        cv::Mat encoding(128, 1, CV_32F);
         for (int i = 0; i < 128 && i < static_cast<int>(enc_json.size()); i++) {
-            encoding(i) = enc_json[i].asDouble();
+            encoding.at<float>(i) = enc_json[i].asFloat();
         }
         stored_encodings.push_back(encoding);
     }
@@ -290,11 +289,11 @@ int cmd_test(const std::string& username) {
     
     // Initialize face detector
     faceid::FaceDetector detector;
-    std::string shape_model = std::string(CONFIG_DIR) + "/shape_predictor_5_face_landmarks.dat";
-    std::string recognition_model = std::string(CONFIG_DIR) + "/dlib_face_recognition_resnet_model_v1.dat";
+    std::string recognition_model = std::string(CONFIG_DIR) + "/models/face_recognition_sface_2021dec.onnx";
     
-    if (!detector.loadModels(shape_model, recognition_model)) {
-        std::cerr << "Error: Failed to load face detection models" << std::endl;
+    if (!detector.loadModels(recognition_model)) {
+        std::cerr << "Error: Failed to load face recognition model" << std::endl;
+        std::cerr << "Expected: " << recognition_model << std::endl;
         return 1;
     }
     

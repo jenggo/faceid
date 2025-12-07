@@ -1,4 +1,5 @@
 .ignore
 .cache/
+*.*backup
 *.md
 !README.md

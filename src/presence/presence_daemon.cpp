@@ -1,0 +1,266 @@
+/**
+ * FaceID Presence Detection Daemon
+ * 
+ * Systemd/OpenRC service that monitors user presence through:
+ * - Activity detection (keyboard/mouse via X11 idle time)
+ * - Face detection (simple detection, no recognition)
+ * - Smart guard conditions (lid, camera, screen lock)
+ * 
+ * State Machine:
+ * 1. ACTIVELY_PRESENT: User is active (typing/mouse) - NO SCANNING
+ * 2. IDLE_WITH_SCANNING: User idle 30+ seconds - SCAN every 2s
+ * 3. AWAY_CONFIRMED: User away (3 failures or 15 min) - LOCK & STOP
+ */
+
+#include "presence_detector.h"
+#include "presence_guard.h"
+#include "../config.h"
+#include "../logger.h"
+#include <csignal>
+#include <atomic>
+#include <thread>
+#include <chrono>
+#include <iostream>
+#include <getopt.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+namespace {
+    std::atomic<bool> g_running{true};
+    std::atomic<bool> g_reload_config{false};
+    
+    void signalHandler(int signal) {
+        if (signal == SIGTERM || signal == SIGINT) {
+            faceid::Logger::getInstance().info("Received shutdown signal");
+            g_running = false;
+        } else if (signal == SIGHUP) {
+            faceid::Logger::getInstance().info("Received reload signal");
+            g_reload_config = true;
+        }
+    }
+    
+    void setupSignalHandlers() {
+        struct sigaction sa;
+        sa.sa_handler = signalHandler;
+        sigemptyset(&sa.sa_mask);
+        sa.sa_flags = 0;
+        
+        sigaction(SIGTERM, &sa, nullptr);
+        sigaction(SIGINT, &sa, nullptr);
+        sigaction(SIGHUP, &sa, nullptr);
+    }
+    
+    void daemonize() {
+        pid_t pid = fork();
+        if (pid < 0) {
+            std::cerr << "Failed to fork daemon process" << std::endl;
+            exit(EXIT_FAILURE);
+        }
+        if (pid > 0) {
+            // Parent exits
+            exit(EXIT_SUCCESS);
+        }
+        
+        // Child continues
+        if (setsid() < 0) {
+            exit(EXIT_FAILURE);
+        }
+        
+        // Fork again to prevent acquiring controlling terminal
+        pid = fork();
+        if (pid < 0) {
+            exit(EXIT_FAILURE);
+        }
+        if (pid > 0) {
+            exit(EXIT_SUCCESS);
+        }
+        
+        // Set file permissions
+        umask(0);
+        
+        // Change working directory to root
+        if (chdir("/") < 0) {
+            exit(EXIT_FAILURE);
+        }
+        
+        // Close standard file descriptors
+        close(STDIN_FILENO);
+        close(STDOUT_FILENO);
+        close(STDERR_FILENO);
+    }
+    
+    void printUsage(const char* program) {
+        std::cout << "Usage: " << program << " [OPTIONS]\n"
+                  << "\nOptions:\n"
+                  << "  -c, --config PATH    Configuration file path (default: /etc/faceid/faceid.conf)\n"
+                  << "  -d, --daemon         Run as daemon (fork to background)\n"
+                  << "  -h, --help           Show this help message\n"
+                  << "  -v, --verbose        Enable verbose logging\n"
+                  << "\nSignals:\n"
+                  << "  SIGTERM/SIGINT       Graceful shutdown\n"
+                  << "  SIGHUP               Reload configuration\n"
+                  << std::endl;
+    }
+    
+    struct DaemonConfig {
+        std::string config_path = "/etc/faceid/faceid.conf";
+        bool daemon_mode = false;
+        bool verbose = false;
+    };
+    
+    DaemonConfig parseArguments(int argc, char* argv[]) {
+        DaemonConfig config;
+        
+        static struct option long_options[] = {
+            {"config",  required_argument, nullptr, 'c'},
+            {"daemon",  no_argument,       nullptr, 'd'},
+            {"help",    no_argument,       nullptr, 'h'},
+            {"verbose", no_argument,       nullptr, 'v'},
+            {nullptr, 0, nullptr, 0}
+        };
+        
+        int opt;
+        while ((opt = getopt_long(argc, argv, "c:dhv", long_options, nullptr)) != -1) {
+            switch (opt) {
+                case 'c':
+                    config.config_path = optarg;
+                    break;
+                case 'd':
+                    config.daemon_mode = true;
+                    break;
+                case 'v':
+                    config.verbose = true;
+                    break;
+                case 'h':
+                    printUsage(argv[0]);
+                    exit(EXIT_SUCCESS);
+                default:
+                    printUsage(argv[0]);
+                    exit(EXIT_FAILURE);
+            }
+        }
+        
+        return config;
+    }
+    
+    bool loadConfiguration(const std::string& config_path) {
+        auto& config = faceid::Config::getInstance();
+        if (!config.load(config_path)) {
+            faceid::Logger::getInstance().error("Failed to load configuration from: " + config_path);
+            return false;
+        }
+        
+        faceid::Logger::getInstance().info("Configuration loaded from: " + config_path);
+        return true;
+    }
+}
+
+int main(int argc, char* argv[]) {
+    // Parse command line arguments
+    auto daemon_config = parseArguments(argc, argv);
+    
+    // Initialize logger
+    auto& logger = faceid::Logger::getInstance();
+    
+    // Daemonize if requested (before logging setup)
+    if (daemon_config.daemon_mode) {
+        daemonize();
+    }
+    
+    logger.info("FaceID Presence Detection Daemon starting...");
+    
+    // Load configuration
+    if (!loadConfiguration(daemon_config.config_path)) {
+        return EXIT_FAILURE;
+    }
+    
+    auto& config = faceid::Config::getInstance();
+    
+    // Read presence detection configuration
+    bool enabled = config.getBool("presence_detection", "enabled").value_or(false);
+    if (!enabled) {
+        logger.info("Presence detection is disabled in configuration");
+        return EXIT_SUCCESS;
+    }
+    
+    int inactive_threshold = config.getInt("presence_detection", "inactive_threshold_seconds").value_or(30);
+    int scan_interval = config.getInt("presence_detection", "scan_interval_seconds").value_or(2);
+    int max_scan_failures = config.getInt("presence_detection", "max_scan_failures").value_or(3);
+    int max_idle_time = config.getInt("presence_detection", "max_idle_time_minutes").value_or(15);
+    std::string camera_device = config.getString("camera", "device").value_or("/dev/video0");
+    
+    logger.info("Presence detection configuration:");
+    logger.info("  Inactive threshold: " + std::to_string(inactive_threshold) + "s");
+    logger.info("  Scan interval: " + std::to_string(scan_interval) + "s");
+    logger.info("  Max failures: " + std::to_string(max_scan_failures));
+    logger.info("  Max idle time: " + std::to_string(max_idle_time) + " min");
+    logger.info("  Camera device: " + camera_device);
+    
+    // Setup signal handlers
+    setupSignalHandlers();
+    
+    // Initialize presence guard
+    faceid::PresenceGuard guard;
+    
+    // Initialize presence detector
+    faceid::PresenceDetector detector(
+        camera_device,
+        std::chrono::seconds(inactive_threshold),
+        std::chrono::seconds(scan_interval),
+        max_scan_failures,
+        std::chrono::minutes(max_idle_time)
+    );
+    
+    if (!detector.start()) {
+        logger.error("Failed to start presence detector");
+        return EXIT_FAILURE;
+    }
+    
+    logger.info("Presence detection daemon started successfully");
+    
+    // Main loop: Monitor guard conditions
+    while (g_running) {
+        // Check if configuration reload requested
+        if (g_reload_config) {
+            logger.info("Reloading configuration...");
+            if (loadConfiguration(daemon_config.config_path)) {
+                // Reread enabled flag
+                enabled = config.getBool("presence_detection", "enabled").value_or(false);
+                if (!enabled) {
+                    logger.info("Presence detection disabled via config reload, shutting down...");
+                    break;
+                }
+            }
+            g_reload_config = false;
+        }
+        
+        // Check guard conditions (and update them)
+        guard.checkGuardConditions();
+        
+        // Detector automatically handles guard state internally
+        // Just sleep and let it do its work
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        
+        // Optionally log statistics periodically (every 5 minutes)
+        static auto last_stats_time = std::chrono::steady_clock::now();
+        auto now = std::chrono::steady_clock::now();
+        if (std::chrono::duration_cast<std::chrono::minutes>(now - last_stats_time).count() >= 5) {
+            auto stats = detector.getStatistics();
+            logger.info("Presence detection statistics:");
+            logger.info("  Total scans: " + std::to_string(stats.totalScans));
+            logger.info("  Faces detected: " + std::to_string(stats.facesDetected));
+            logger.info("  Failed scans: " + std::to_string(stats.failedScans));
+            logger.info("  State transitions: " + std::to_string(stats.stateTransitions));
+            logger.info("  Uptime: " + std::to_string(stats.uptimeSeconds / 3600) + "h " + 
+                       std::to_string((stats.uptimeSeconds % 3600) / 60) + "m");
+            last_stats_time = now;
+        }
+    }
+    
+    // Graceful shutdown
+    logger.info("Shutting down presence detection daemon...");
+    detector.stop();
+    logger.info("Daemon stopped");
+    
+    return EXIT_SUCCESS;
+}
