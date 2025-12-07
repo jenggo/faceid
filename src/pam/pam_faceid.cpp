@@ -10,6 +10,7 @@
 #include "../logger.h"
 #include "../fingerprint_auth.h"
 #include "../lid_detector.h"
+#include "../display_detector.h"
 
 // Suppress OpenCV warnings from external headers
 #pragma GCC diagnostic push
@@ -63,6 +64,32 @@ static bool authenticate_user(const char* username) {
             logger.warning(std::string("Could not determine lid state (") + 
                           lid_detector.getLastError() + "), proceeding with biometric auth");
             syslog(LOG_WARNING, "Unknown lid state, proceeding with biometric auth");
+        }
+    }
+    
+    // Check display state (screen on/off, locked/unlocked)
+    bool check_display = config.getBool("authentication", "check_display_state").value_or(true);
+    
+    if (check_display) {
+        DisplayDetector display_detector;
+        DisplayState display_state = display_detector.getDisplayState();
+        
+        if (display_state == DisplayState::OFF) {
+            logger.info(std::string("Display is OFF (") + display_detector.getDetectionMethod() + 
+                       "), skipping biometric authentication for user " + username);
+            logger.auditAuthFailure(username, "biometric", "display_off");
+            syslog(LOG_INFO, "Display off, skipping biometric auth for user %s", username);
+            closelog();
+            return false;
+        } else if (display_state == DisplayState::ON) {
+            logger.debug(std::string("Display is ON (") + display_detector.getDetectionMethod() + 
+                        "), proceeding with biometric authentication");
+            syslog(LOG_DEBUG, "Display on, proceeding with biometric auth");
+        } else {
+            // Unknown state - proceed with caution but log it
+            logger.warning(std::string("Could not determine display state (") + 
+                          display_detector.getLastError() + "), proceeding with biometric auth");
+            syslog(LOG_WARNING, "Unknown display state, proceeding with biometric auth");
         }
     }
     
@@ -131,11 +158,10 @@ static bool authenticate_user(const char* username) {
                 
                 // Initialize face detector
                 FaceDetector detector;
-                std::string shape_model = std::string(CONFIG_DIR) + "/shape_predictor_5_face_landmarks.dat";
-                std::string recognition_model = std::string(CONFIG_DIR) + "/dlib_face_recognition_resnet_model_v1.dat";
+                std::string recognition_model = std::string(CONFIG_DIR) + "/models/face_recognition_sface_2021dec.onnx";
                 
-                if (!detector.loadModels(shape_model, recognition_model)) {
-                    logger.error("Failed to load face detection models");
+                if (!detector.loadModels(recognition_model)) {
+                    logger.error("Failed to load face recognition model");
                     return false;
                 }
                 
@@ -167,11 +193,29 @@ static bool authenticate_user(const char* username) {
                     
                     // Compare with stored encodings
                     if (model_data.isMember("encodings") && !model_data["encodings"].empty()) {
-                        // TODO: Implement proper JSON to encoding conversion and comparison
-                        // For now, just check if we have encodings
-                        logger.info(std::string("Face detected for user ") + username);
-                        (void)threshold;  // Will be used in full comparison
-                        return true;
+                        // Load stored encodings from JSON
+                        const Json::Value& stored_encodings_json = model_data["encodings"];
+                        
+                        for (const auto& enc_json : stored_encodings_json) {
+                            // Convert JSON to cv::Mat
+                            cv::Mat stored_encoding(128, 1, CV_32F);
+                            for (int i = 0; i < 128 && i < static_cast<int>(enc_json.size()); i++) {
+                                stored_encoding.at<float>(i) = enc_json[i].asFloat();
+                            }
+                            
+                            // Compare with detected faces
+                            for (const auto& detected_encoding : encodings) {
+                                double distance = detector.compareFaces(detected_encoding, stored_encoding);
+                                
+                                // SFace compareFaces returns distance (lower = more similar)
+                                // Default threshold 0.6 works well
+                                if (distance < threshold) {
+                                    logger.info(std::string("Face matched for user ") + username + 
+                                              " (distance: " + std::to_string(distance) + ")");
+                                    return true;
+                                }
+                            }
+                        }
                     }
                 }
                 

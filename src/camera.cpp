@@ -21,7 +21,22 @@ Camera::~Camera() {
 
 bool Camera::open() {
     capture_.open(device_path_, cv::CAP_V4L2);
-    return capture_.isOpened();
+    
+    if (!capture_.isOpened()) {
+        return false;
+    }
+    
+    // Enable hardware acceleration optimizations
+    // Set MJPEG codec for hardware-accelerated decoding on most webcams
+    capture_.set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('M','J','P','G'));
+    
+    // Set reasonable FPS for authentication (we don't need high framerate)
+    capture_.set(cv::CAP_PROP_FPS, 30);
+    
+    // Disable auto-exposure for faster, more consistent capture
+    capture_.set(cv::CAP_PROP_AUTO_EXPOSURE, 0.25);  // Manual mode
+    
+    return true;
 }
 
 bool Camera::open(int width, int height) {
@@ -30,8 +45,24 @@ bool Camera::open(int width, int height) {
         return false;
     }
     
+    // Set resolution first
     capture_.set(cv::CAP_PROP_FRAME_WIDTH, width);
     capture_.set(cv::CAP_PROP_FRAME_HEIGHT, height);
+    
+    // Enable hardware acceleration optimizations
+    // Set MJPEG codec for hardware-accelerated decoding
+    capture_.set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('M','J','P','G'));
+    
+    // Set FPS based on resolution
+    // Lower resolution = can use higher FPS without CPU penalty
+    int target_fps = (width <= 640) ? 30 : 24;
+    capture_.set(cv::CAP_PROP_FPS, target_fps);
+    
+    // Disable auto-exposure for faster, more consistent capture
+    capture_.set(cv::CAP_PROP_AUTO_EXPOSURE, 0.25);  // Manual mode
+    
+    // Enable hardware buffering if available
+    capture_.set(cv::CAP_PROP_BUFFERSIZE, 1);  // Minimal buffering for low latency
     
     return true;
 }

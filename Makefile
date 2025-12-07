@@ -1,4 +1,4 @@
-.PHONY: help deps check-deps setup build install uninstall clean distclean test status full-install pam-install pam-status pam-reset logs-view
+.PHONY: help deps check-deps setup build install uninstall clean distclean test status full-install pam-install pam-status pam-reset logs-view systemd-enable systemd-disable systemd-status systemd-logs presence-status
 
 # Project configuration
 PROJECT_NAME := faceid
@@ -47,6 +47,13 @@ help:
 	@printf "$(COLOR_CYAN)Logging:$(COLOR_RESET)\n"
 	@printf "  $(COLOR_GREEN)logs-view$(COLOR_RESET)    - View recent FaceID authentication logs\n"
 	@printf " \n"
+	@printf "$(COLOR_CYAN)Presence Detection (systemd):$(COLOR_RESET)\n"
+	@printf "  $(COLOR_GREEN)systemd-enable$(COLOR_RESET)  - Enable and start presence detection service\n"
+	@printf "  $(COLOR_GREEN)systemd-disable$(COLOR_RESET) - Disable and stop presence detection service\n"
+	@printf "  $(COLOR_GREEN)systemd-status$(COLOR_RESET)  - Show presence detection service status\n"
+	@printf "  $(COLOR_GREEN)systemd-logs$(COLOR_RESET)    - View presence detection service logs\n"
+	@printf "  $(COLOR_GREEN)presence-status$(COLOR_RESET) - Show comprehensive presence detection status\n"
+	@printf " \n"
 	@printf "$(COLOR_CYAN)Advanced Targets:$(COLOR_RESET)\n"
 	@printf "  $(COLOR_GREEN)reconfigure$(COLOR_RESET)  - Reconfigure the build\n"
 	@printf "  $(COLOR_GREEN)install-debug$(COLOR_RESET)- Install debug version\n"
@@ -61,8 +68,6 @@ check-deps:
 	@printf "$(COLOR_GREEN)✓ ninja$(COLOR_RESET)\n"
 	@pkg-config --exists opencv4 || { printf "$(COLOR_RED)✗ opencv4 not found$(COLOR_RESET)\n"; exit 1; }
 	@printf "$(COLOR_GREEN)✓ opencv4$(COLOR_RESET)\n"
-	@pkg-config --exists dlib-1 || { printf "$(COLOR_RED)✗ dlib-1 not found$(COLOR_RESET)\n"; exit 1; }
-	@printf "$(COLOR_GREEN)✓ dlib-1$(COLOR_RESET)\n"
 	@pkg-config --exists jsoncpp || { printf "$(COLOR_RED)✗ jsoncpp not found$(COLOR_RESET)\n"; exit 1; }
 	@printf "$(COLOR_GREEN)✓ jsoncpp$(COLOR_RESET)\n"
 	@pkg-config --exists pam || { printf "$(COLOR_YELLOW)⚠ pam not found (optional)$(COLOR_RESET)\n"; }
@@ -74,11 +79,11 @@ check-deps:
 deps:
 	@printf "$(COLOR_BOLD)Installing build dependencies...$(COLOR_RESET)\n"
 	@if command -v pacman >/dev/null 2>&1; then \
-		sudo pacman -S --needed base-devel meson ninja opencv dlib jsoncpp pam; \
+		sudo pacman -S --needed base-devel meson ninja opencv jsoncpp pam; \
 	elif command -v apt-get >/dev/null 2>&1; then \
-		sudo apt-get install -y build-essential meson ninja-build libopencv-dev libdlib-dev libjsoncpp-dev libpam-dev pkg-config; \
+		sudo apt-get install -y build-essential meson ninja-build libopencv-dev libjsoncpp-dev libpam-dev pkg-config; \
 	elif command -v dnf >/dev/null 2>&1; then \
-		sudo dnf install -y @development-tools meson ninja opencv-devel dlib-devel jsoncpp-devel pam-devel pkg-config; \
+		sudo dnf install -y @development-tools meson ninja opencv-devel jsoncpp-devel pam-devel pkg-config; \
 	else \
 		printf "$(COLOR_RED)Unsupported package manager. Please install dependencies manually.$(COLOR_RESET)\n"; \
 		exit 1; \
@@ -115,9 +120,53 @@ rebuild: distclean build
 install: build
 	@printf "$(COLOR_BOLD)Installing $(PROJECT_NAME) to system...$(COLOR_RESET)\n"
 	@if [ "$$(id -u)" != "0" ]; then \
-		sudo $(MESON) install -C $(BUILD_DIR); \
+		sudo $(MESON) install -C $(BUILD_DIR) --no-rebuild; \
 	else \
-		$(MESON) install -C $(BUILD_DIR); \
+		$(MESON) install -C $(BUILD_DIR) --no-rebuild; \
+	fi
+	@printf " \n"
+	@printf "$(COLOR_CYAN)Checking configuration file...$(COLOR_RESET)\n"
+	@SOURCE_CONFIG="config/faceid.conf"; \
+	DEST_CONFIG="/etc/faceid/faceid.conf"; \
+	if [ ! -f "$$DEST_CONFIG" ]; then \
+		printf "$(COLOR_GREEN)✓ Installing new config: $$DEST_CONFIG$(COLOR_RESET)\n"; \
+		if [ "$$(id -u)" != "0" ]; then \
+			sudo cp "$$SOURCE_CONFIG" "$$DEST_CONFIG"; \
+			sudo chmod 644 "$$DEST_CONFIG"; \
+		else \
+			cp "$$SOURCE_CONFIG" "$$DEST_CONFIG"; \
+			chmod 644 "$$DEST_CONFIG"; \
+		fi; \
+	else \
+		SOURCE_KEYS=$$(mktemp); \
+		DEST_KEYS=$$(mktemp); \
+		grep -E '^\s*[a-zA-Z_]' "$$SOURCE_CONFIG" | sed 's/\s*=.*//' | sort > "$$SOURCE_KEYS"; \
+		grep -E '^\s*[a-zA-Z_]' "$$DEST_CONFIG" | sed 's/\s*=.*//' | sort > "$$DEST_KEYS"; \
+		if diff -q "$$SOURCE_KEYS" "$$DEST_KEYS" > /dev/null 2>&1; then \
+			printf "$(COLOR_GREEN)✓ Config keys match, preserving user settings$(COLOR_RESET)\n"; \
+			printf "$(COLOR_YELLOW)  Existing config unchanged: $$DEST_CONFIG$(COLOR_RESET)\n"; \
+			if [ "$$(id -u)" != "0" ]; then \
+				sudo cp "$$SOURCE_CONFIG" "$$DEST_CONFIG.new"; \
+			else \
+				cp "$$SOURCE_CONFIG" "$$DEST_CONFIG.new"; \
+			fi; \
+			printf "$(COLOR_CYAN)  New default saved as: $$DEST_CONFIG.new$(COLOR_RESET)\n"; \
+		else \
+			printf "$(COLOR_YELLOW)⚠ Config structure changed, backing up existing config$(COLOR_RESET)\n"; \
+			TIMESTAMP=$$(date +%Y%m%d-%H%M%S); \
+			BACKUP="$$DEST_CONFIG.backup.$$TIMESTAMP"; \
+			if [ "$$(id -u)" != "0" ]; then \
+				sudo cp "$$DEST_CONFIG" "$$BACKUP"; \
+				sudo cp "$$SOURCE_CONFIG" "$$DEST_CONFIG"; \
+			else \
+				cp "$$DEST_CONFIG" "$$BACKUP"; \
+				cp "$$SOURCE_CONFIG" "$$DEST_CONFIG"; \
+			fi; \
+			printf "$(COLOR_GREEN)✓ Backup created: $$BACKUP$(COLOR_RESET)\n"; \
+			printf "$(COLOR_YELLOW)⚠ New config installed: $$DEST_CONFIG$(COLOR_RESET)\n"; \
+			printf "$(COLOR_CYAN)  Please review and merge your settings from: $$BACKUP$(COLOR_RESET)\n"; \
+		fi; \
+		rm -f "$$SOURCE_KEYS" "$$DEST_KEYS"; \
 	fi
 	@printf " \n"
 	@printf "$(COLOR_CYAN)Setting up logging...$(COLOR_RESET)\n"
@@ -129,6 +178,14 @@ install: build
 		chmod 666 /var/log/faceid.log; \
 	fi
 	@printf "$(COLOR_GREEN)✓ Log file created: /var/log/faceid.log$(COLOR_RESET)\n"
+	@printf " \n"
+	@printf "$(COLOR_CYAN)Installing systemd service...$(COLOR_RESET)\n"
+	@if [ -f "$(INSTALL_PREFIX)/lib/systemd/system/faceid-presence.service" ]; then \
+		printf "$(COLOR_GREEN)✓ Systemd service installed: faceid-presence.service$(COLOR_RESET)\n"; \
+		printf "$(COLOR_CYAN)To enable: sudo systemctl enable --now faceid-presence$(COLOR_RESET)\n"; \
+	else \
+		printf "$(COLOR_YELLOW)⚠ Systemd service file not found$(COLOR_RESET)\n"; \
+	fi
 	@printf " \n"
 	@printf "$(COLOR_GREEN)Installation completed!$(COLOR_RESET)\n"
 
@@ -167,8 +224,10 @@ full-install: deps check-deps setup build install
 	@printf "$(COLOR_CYAN)Next steps:$(COLOR_RESET)\n"
 	@printf "  1. Verify installation: faceid --version\n"
 	@printf "  2. Check PAM module: ls -la /usr/lib/security/pam_faceid.so\n"
-	@printf "  3. Configure PAM: Edit /etc/pam.d/system-auth\n"
-	@printf "  4. Review configuration: /etc/faceid/faceid.conf\n"
+	@printf "  3. Check presence daemon: faceid-presence --help\n"
+	@printf "  4. Configure PAM: make pam-install\n"
+	@printf "  5. Enable presence detection: sudo make systemd-enable\n"
+	@printf "  6. Review configuration: /etc/faceid/faceid.conf\n"
 	@printf " \n"
 
 # Run tests
@@ -400,6 +459,163 @@ logs-view:
 		printf "To view live log: tail -f /var/log/faceid.log\n"; \
 		printf "To clear log: sudo truncate -s 0 /var/log/faceid.log\n"; \
 	fi
+	@printf " \n"
+
+# Systemd service management
+systemd-enable:
+	@printf "$(COLOR_BOLD)Enabling FaceID Presence Detection Service$(COLOR_RESET)\n"
+	@printf " \n"
+	@if [ "$$(id -u)" != "0" ]; then \
+		printf "$(COLOR_RED)Error: Systemd management requires root privileges$(COLOR_RESET)\n"; \
+		printf "Please run: sudo make systemd-enable\n"; \
+		exit 1; \
+	fi
+	@if [ ! -f "/usr/lib/systemd/system/faceid-presence.service" ]; then \
+		printf "$(COLOR_RED)Error: Service file not found!$(COLOR_RESET)\n"; \
+		printf "Please run 'sudo make install' first.\n"; \
+		exit 1; \
+	fi
+	@if [ ! -f "/usr/bin/faceid-presence" ]; then \
+		printf "$(COLOR_RED)Error: faceid-presence binary not found!$(COLOR_RESET)\n"; \
+		printf "Please run 'sudo make install' first.\n"; \
+		exit 1; \
+	fi
+	@printf "$(COLOR_CYAN)Checking configuration...$(COLOR_RESET)\n"
+	@if ! grep -q "enabled = true" /etc/faceid/faceid.conf 2>/dev/null; then \
+		printf "$(COLOR_YELLOW)⚠ Presence detection is disabled in config$(COLOR_RESET)\n"; \
+		printf "  Edit /etc/faceid/faceid.conf and set: enabled = true\n"; \
+		printf "  in [presence_detection] section\n"; \
+		printf " \n"; \
+		read -p "Enable now in config? [y/N] " -n 1 -r; \
+		echo; \
+		if [ "$$REPLY" = "y" ] || [ "$$REPLY" = "Y" ]; then \
+			sed -i 's/^enabled = false/enabled = true/' /etc/faceid/faceid.conf; \
+			printf "$(COLOR_GREEN)✓ Enabled presence detection in config$(COLOR_RESET)\n"; \
+		fi; \
+	else \
+		printf "$(COLOR_GREEN)✓ Presence detection enabled in config$(COLOR_RESET)\n"; \
+	fi
+	@printf " \n"
+	@printf "$(COLOR_CYAN)Reloading systemd daemon...$(COLOR_RESET)\n"
+	@systemctl daemon-reload
+	@printf "$(COLOR_GREEN)✓ Daemon reloaded$(COLOR_RESET)\n"
+	@printf " \n"
+	@printf "$(COLOR_CYAN)Enabling service...$(COLOR_RESET)\n"
+	@systemctl enable faceid-presence.service
+	@printf "$(COLOR_GREEN)✓ Service enabled$(COLOR_RESET)\n"
+	@printf " \n"
+	@printf "$(COLOR_CYAN)Starting service...$(COLOR_RESET)\n"
+	@systemctl start faceid-presence.service
+	@sleep 1
+	@if systemctl is-active --quiet faceid-presence.service; then \
+		printf "$(COLOR_GREEN)✓ Service started successfully$(COLOR_RESET)\n"; \
+	else \
+		printf "$(COLOR_RED)✗ Service failed to start$(COLOR_RESET)\n"; \
+		printf "  Check logs: sudo journalctl -u faceid-presence -n 50\n"; \
+		exit 1; \
+	fi
+	@printf " \n"
+	@printf "$(COLOR_GREEN)$(COLOR_BOLD)Presence detection service enabled!$(COLOR_RESET)\n"
+	@printf " \n"
+	@printf "$(COLOR_CYAN)Next steps:$(COLOR_RESET)\n"
+	@printf "  • Check status: make systemd-status\n"
+	@printf "  • View logs: make systemd-logs\n"
+	@printf "  • Full status: make presence-status\n"
+	@printf " \n"
+
+systemd-disable:
+	@printf "$(COLOR_BOLD)Disabling FaceID Presence Detection Service$(COLOR_RESET)\n"
+	@printf " \n"
+	@if [ "$$(id -u)" != "0" ]; then \
+		printf "$(COLOR_RED)Error: Systemd management requires root privileges$(COLOR_RESET)\n"; \
+		printf "Please run: sudo make systemd-disable\n"; \
+		exit 1; \
+	fi
+	@printf "$(COLOR_CYAN)Stopping service...$(COLOR_RESET)\n"
+	@if systemctl is-active --quiet faceid-presence.service; then \
+		systemctl stop faceid-presence.service; \
+		printf "$(COLOR_GREEN)✓ Service stopped$(COLOR_RESET)\n"; \
+	else \
+		printf "$(COLOR_YELLOW)⚠ Service is not running$(COLOR_RESET)\n"; \
+	fi
+	@printf " \n"
+	@printf "$(COLOR_CYAN)Disabling service...$(COLOR_RESET)\n"
+	@systemctl disable faceid-presence.service 2>/dev/null || true
+	@printf "$(COLOR_GREEN)✓ Service disabled$(COLOR_RESET)\n"
+	@printf " \n"
+	@printf "$(COLOR_GREEN)Presence detection service disabled$(COLOR_RESET)\n"
+	@printf " \n"
+
+systemd-status:
+	@printf "$(COLOR_BOLD)FaceID Presence Detection Service Status$(COLOR_RESET)\n"
+	@printf " \n"
+	@systemctl status faceid-presence.service --no-pager || true
+	@printf " \n"
+
+systemd-logs:
+	@printf "$(COLOR_BOLD)FaceID Presence Detection Service Logs$(COLOR_RESET)\n"
+	@printf " \n"
+	@printf "$(COLOR_CYAN)Recent logs (last 50 lines):$(COLOR_RESET)\n"
+	@journalctl -u faceid-presence.service -n 50 --no-pager || printf "$(COLOR_YELLOW)Service not found or no logs available$(COLOR_RESET)\n"
+	@printf " \n"
+	@printf "$(COLOR_CYAN)To follow live logs:$(COLOR_RESET)\n"
+	@printf "  journalctl -u faceid-presence.service -f\n"
+	@printf " \n"
+
+presence-status:
+	@printf "$(COLOR_BOLD)FaceID Presence Detection Status$(COLOR_RESET)\n"
+	@printf " \n"
+	@printf "$(COLOR_CYAN)Installation:$(COLOR_RESET)\n"
+	@if [ -f "/usr/bin/faceid-presence" ]; then \
+		printf "$(COLOR_GREEN)✓ Binary installed: /usr/bin/faceid-presence$(COLOR_RESET)\n"; \
+	else \
+		printf "$(COLOR_RED)✗ Binary not found$(COLOR_RESET)\n"; \
+	fi
+	@if [ -f "/usr/lib/systemd/system/faceid-presence.service" ]; then \
+		printf "$(COLOR_GREEN)✓ Systemd service file installed$(COLOR_RESET)\n"; \
+	else \
+		printf "$(COLOR_RED)✗ Systemd service file not found$(COLOR_RESET)\n"; \
+	fi
+	@printf " \n"
+	@printf "$(COLOR_CYAN)Configuration:$(COLOR_RESET)\n"
+	@if [ -f "/etc/faceid/faceid.conf" ]; then \
+		if grep -q "enabled = true" /etc/faceid/faceid.conf 2>/dev/null; then \
+			printf "$(COLOR_GREEN)✓ Presence detection enabled in config$(COLOR_RESET)\n"; \
+			THRESHOLD=$$(grep "inactive_threshold_seconds" /etc/faceid/faceid.conf | awk '{print $$3}'); \
+			INTERVAL=$$(grep "scan_interval_seconds" /etc/faceid/faceid.conf | awk '{print $$3}'); \
+			FAILURES=$$(grep "max_scan_failures" /etc/faceid/faceid.conf | awk '{print $$3}'); \
+			IDLE=$$(grep "max_idle_time_minutes" /etc/faceid/faceid.conf | awk '{print $$3}'); \
+			printf "  • Inactive threshold: $${THRESHOLD}s\n"; \
+			printf "  • Scan interval: $${INTERVAL}s\n"; \
+			printf "  • Max failures: $${FAILURES}\n"; \
+			printf "  • Max idle time: $${IDLE} min\n"; \
+		else \
+			printf "$(COLOR_YELLOW)⚠ Presence detection disabled in config$(COLOR_RESET)\n"; \
+			printf "  Enable: sudo sed -i 's/enabled = false/enabled = true/' /etc/faceid/faceid.conf\n"; \
+		fi; \
+	else \
+		printf "$(COLOR_RED)✗ Config file not found$(COLOR_RESET)\n"; \
+	fi
+	@printf " \n"
+	@printf "$(COLOR_CYAN)Service Status:$(COLOR_RESET)\n"
+	@if systemctl is-enabled --quiet faceid-presence.service 2>/dev/null; then \
+		printf "$(COLOR_GREEN)✓ Service enabled$(COLOR_RESET)\n"; \
+	else \
+		printf "$(COLOR_YELLOW)⚠ Service not enabled$(COLOR_RESET)\n"; \
+		printf "  Enable: sudo make systemd-enable\n"; \
+	fi
+	@if systemctl is-active --quiet faceid-presence.service 2>/dev/null; then \
+		printf "$(COLOR_GREEN)✓ Service running$(COLOR_RESET)\n"; \
+	else \
+		printf "$(COLOR_RED)✗ Service not running$(COLOR_RESET)\n"; \
+		printf "  Start: sudo systemctl start faceid-presence\n"; \
+	fi
+	@printf " \n"
+	@printf "$(COLOR_CYAN)Quick Actions:$(COLOR_RESET)\n"
+	@printf "  • Enable service:  sudo make systemd-enable\n"
+	@printf "  • Disable service: sudo make systemd-disable\n"
+	@printf "  • View status:     make systemd-status\n"
+	@printf "  • View logs:       make systemd-logs\n"
 	@printf " \n"
 
 # Default target

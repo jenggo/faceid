@@ -1,27 +1,44 @@
 #include "face_detector.h"
-#include <cmath>
 #include <opencv2/imgproc.hpp>
+#include <fstream>
+#include <algorithm>
+#include <cmath>
 
 namespace faceid {
 
 FaceDetector::FaceDetector() {
-    detector_ = dlib::get_frontal_face_detector();
+    // Initialize YuNet detector
+    std::string yunet_model = "/etc/faceid/models/face_detection_yunet_2023mar.onnx";
+    
+    std::ifstream yunet_file(yunet_model);
+    if (yunet_file.good()) {
+        yunet_detector_ = cv::FaceDetectorYN::create(
+            yunet_model,
+            "",                    // config (empty for ONNX)
+            cv::Size(320, 240),   // input size  
+            0.6f,                 // score threshold
+            0.3f,                 // nms threshold
+            5000                  // top_k
+        );
+    }
 }
 
-bool FaceDetector::loadModels(const std::string& shape_predictor_path,
-                              const std::string& face_recognition_model_path) {
+bool FaceDetector::loadModels(const std::string& face_recognition_model_path) {
     try {
-        dlib::deserialize(shape_predictor_path) >> shape_predictor_;
-        dlib::deserialize(face_recognition_model_path) >> net_;
+        // Load SFace recognition model
+        sface_recognizer_ = cv::FaceRecognizerSF::create(
+            face_recognition_model_path,
+            ""  // config (empty for ONNX)
+        );
         models_loaded_ = true;
         return true;
-    } catch (...) {
+    } catch (const std::exception& e) {
         return false;
     }
 }
 
-std::vector<dlib::rectangle> FaceDetector::detectFaces(const cv::Mat& frame, bool downscale) {
-    if (!models_loaded_) {
+std::vector<cv::Rect> FaceDetector::detectFaces(const cv::Mat& frame, bool downscale) {
+    if (yunet_detector_.empty()) {
         return {};
     }
     
@@ -40,21 +57,55 @@ std::vector<dlib::rectangle> FaceDetector::detectFaces(const cv::Mat& frame, boo
     // Downscale for faster detection if enabled
     if (downscale && frame.cols > 640) {
         scale = 640.0 / frame.cols;
-        cv::resize(frame, processed_frame, cv::Size(), scale, scale, cv::INTER_LINEAR);
+        cv::resize(frame, processed_frame, cv::Size(), scale, scale, cv::INTER_AREA);
     }
     
-    dlib::cv_image<dlib::bgr_pixel> dlib_img(processed_frame);
-    auto faces = detector_(dlib_img);
+    // Resize to YuNet's expected input size (320x240)
+    cv::Mat resized;
+    cv::resize(processed_frame, resized, cv::Size(320, 240));
     
-    // Scale face locations back to original size
-    if (scale != 1.0) {
-        for (auto& face : faces) {
-            face = dlib::rectangle(
-                static_cast<long>(face.left() / scale),
-                static_cast<long>(face.top() / scale),
-                static_cast<long>(face.right() / scale),
-                static_cast<long>(face.bottom() / scale)
-            );
+    // Detect faces using YuNet
+    cv::Mat yunet_faces;
+    yunet_detector_->detect(resized, yunet_faces);
+    
+    // Convert YuNet results to cv::Rect
+    std::vector<cv::Rect> faces;
+    double scale_x = static_cast<double>(processed_frame.cols) / 320.0;
+    double scale_y = static_cast<double>(processed_frame.rows) / 240.0;
+    
+    for (int i = 0; i < yunet_faces.rows; i++) {
+        // YuNet output: x, y, w, h, ...landmarks..., confidence
+        float x = yunet_faces.at<float>(i, 0);
+        float y = yunet_faces.at<float>(i, 1);
+        float w = yunet_faces.at<float>(i, 2);
+        float h = yunet_faces.at<float>(i, 3);
+        
+        // Scale back to processed_frame size
+        x *= scale_x;
+        y *= scale_y;
+        w *= scale_x;
+        h *= scale_y;
+        
+        // Scale back to original frame size if we downscaled
+        if (scale != 1.0) {
+            x /= scale;
+            y /= scale;
+            w /= scale;
+            h /= scale;
+        }
+        
+        // Convert to cv::Rect
+        cv::Rect face(
+            static_cast<int>(x),
+            static_cast<int>(y),
+            static_cast<int>(w),
+            static_cast<int>(h)
+        );
+        
+        // Ensure rect is within frame bounds
+        face &= cv::Rect(0, 0, frame.cols, frame.rows);
+        if (face.width > 0 && face.height > 0) {
+            faces.push_back(face);
         }
     }
     
@@ -72,29 +123,80 @@ std::vector<dlib::rectangle> FaceDetector::detectFaces(const cv::Mat& frame, boo
     return faces;
 }
 
+cv::Mat FaceDetector::alignFace(const cv::Mat& frame, const cv::Rect& face_rect) {
+    // Extract face region
+    cv::Mat face_img = frame(face_rect).clone();
+    
+    // SFace expects 112x112 aligned face
+    cv::Mat aligned;
+    cv::resize(face_img, aligned, cv::Size(112, 112));
+    
+    return aligned;
+}
+
 std::vector<FaceEncoding> FaceDetector::encodeFaces(
     const cv::Mat& frame,
-    const std::vector<dlib::rectangle>& face_locations) {
+    const std::vector<cv::Rect>& face_locations) {
     
-    if (!models_loaded_ || face_locations.empty()) {
+    if (!models_loaded_ || face_locations.empty() || sface_recognizer_.empty()) {
         return {};
     }
     
-    dlib::cv_image<dlib::bgr_pixel> dlib_img(frame);
     std::vector<FaceEncoding> encodings;
     
-    for (const auto& face_loc : face_locations) {
-        auto shape = shape_predictor_(dlib_img, face_loc);
-        dlib::matrix<dlib::rgb_pixel> face_chip;
-        dlib::extract_image_chip(dlib_img, dlib::get_face_chip_details(shape, 150, 0.25), face_chip);
-        encodings.push_back(net_(face_chip));
+    for (const auto& face_rect : face_locations) {
+        // Align face for SFace
+        cv::Mat aligned = alignFace(frame, face_rect);
+        
+        // Extract feature using SFace
+        cv::Mat encoding;
+        sface_recognizer_->feature(aligned, encoding);
+        
+        encodings.push_back(encoding);
     }
     
     return encodings;
 }
 
 double FaceDetector::compareFaces(const FaceEncoding& encoding1, const FaceEncoding& encoding2) {
-    return dlib::length(encoding1 - encoding2);
+    // Manual cosine similarity calculation
+    // Encodings can be either 1x128 or 128x1, both are valid
+    
+    // Ensure encodings are valid
+    if (encoding1.empty() || encoding2.empty()) {
+        return 999.0;  // Return large distance for invalid comparison
+    }
+    
+    // Get total elements (should be 128 for both)
+    int size1 = encoding1.rows * encoding1.cols;
+    int size2 = encoding2.rows * encoding2.cols;
+    
+    if (size1 != size2 || size1 != 128) {
+        return 999.0;  // Size mismatch
+    }
+    
+    // Calculate dot product and norms (works for both row and column vectors)
+    double dot_product = 0.0;
+    double norm1 = 0.0;
+    double norm2 = 0.0;
+    
+    for (int i = 0; i < size1; i++) {
+        float val1 = encoding1.at<float>(i);
+        float val2 = encoding2.at<float>(i);
+        dot_product += val1 * val2;
+        norm1 += val1 * val1;
+        norm2 += val2 * val2;
+    }
+    
+    // Compute cosine similarity
+    double cosine_sim = dot_product / (std::sqrt(norm1) * std::sqrt(norm2));
+    
+    // Convert to distance (lower = more similar)
+    // Cosine similarity: 1 (identical) to -1 (opposite)
+    // Distance: 0 (identical) to 2 (opposite)
+    double distance = 1.0 - cosine_sim;
+    
+    return distance;
 }
 
 cv::Mat FaceDetector::preprocessFrame(const cv::Mat& frame) {
@@ -107,14 +209,14 @@ cv::Mat FaceDetector::preprocessFrame(const cv::Mat& frame) {
         processed = frame;
     }
     
-    // Enhance contrast for better detection
+    // Enhance contrast for better detection using optimized CLAHE
     cv::Mat lab;
     cv::cvtColor(processed, lab, cv::COLOR_BGR2Lab);
     
     std::vector<cv::Mat> lab_planes;
     cv::split(lab, lab_planes);
     
-    // Apply CLAHE to L channel
+    // Apply CLAHE to L channel with optimized parameters
     cv::Ptr<cv::CLAHE> clahe = cv::createCLAHE(2.0, cv::Size(8, 8));
     clahe->apply(lab_planes[0], lab_planes[0]);
     
