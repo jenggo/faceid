@@ -74,6 +74,20 @@ static bool authenticate_user(const char* username) {
         DisplayDetector display_detector;
         DisplayState display_state = display_detector.getDisplayState();
         
+        // If we're on lock screen, add delay before checking display state again
+        // This gives the screen time to turn off after pressing lock button (Meta+L)
+        if (display_detector.isLockScreenGreeter() || display_detector.isScreenLocked()) {
+            int delay_ms = config.getInt("authentication", "lock_screen_delay_ms").value_or(1000);
+            if (delay_ms > 0) {
+                logger.debug(std::string("Lock screen detected, waiting ") + std::to_string(delay_ms) + 
+                           "ms before checking display state");
+                std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+                
+                // Recheck display state after delay
+                display_state = display_detector.getDisplayState();
+            }
+        }
+        
         if (display_state == DisplayState::OFF) {
             logger.info(std::string("Display is OFF (") + display_detector.getDetectionMethod() + 
                        "), skipping biometric authentication for user " + username);
