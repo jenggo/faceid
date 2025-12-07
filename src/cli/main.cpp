@@ -8,7 +8,6 @@
 #include "config_paths.h"
 #include "../config.h"
 #include "../face_detector.h"
-#include "../logger.h"
 
 // Suppress warnings from OpenCV headers
 #pragma GCC diagnostic push
@@ -23,13 +22,20 @@ void print_usage() {
     std::cout << "Version: " << VERSION << std::endl << std::endl;
     std::cout << "Usage: faceid <command> [options]" << std::endl << std::endl;
     std::cout << "Commands:" << std::endl;
-    std::cout << "  add <username>      Add face model for user" << std::endl;
-    std::cout << "  remove <username>   Remove face model for user" << std::endl;
-    std::cout << "  list                List all enrolled users" << std::endl;
-    std::cout << "  test <username>     Test face recognition" << std::endl;
-    std::cout << "  devices             List available camera devices" << std::endl;
-    std::cout << "  version             Show version information" << std::endl;
-    std::cout << "  help                Show this help message" << std::endl;
+    std::cout << "  add <username> [face_id]      Add face model for user (default: 'default')" << std::endl;
+    std::cout << "  remove <username> [face_id]   Remove specific face or all faces" << std::endl;
+    std::cout << "  list [username]               List all enrolled users or user's faces" << std::endl;
+    std::cout << "  test <username>               Test face recognition" << std::endl;
+    std::cout << "  devices                       List available camera devices" << std::endl;
+    std::cout << "  version                       Show version information" << std::endl;
+    std::cout << "  help                          Show this help message" << std::endl;
+    std::cout << std::endl;
+    std::cout << "Examples:" << std::endl;
+    std::cout << "  faceid add jenggo             # Add default face" << std::endl;
+    std::cout << "  faceid add jenggo glasses     # Add face with glasses" << std::endl;
+    std::cout << "  faceid list jenggo            # List all faces for jenggo" << std::endl;
+    std::cout << "  faceid remove jenggo glasses  # Remove 'glasses' face only" << std::endl;
+    std::cout << "  faceid remove jenggo          # Remove ALL faces for jenggo" << std::endl;
 }
 
 int cmd_devices() {
@@ -46,8 +52,8 @@ int cmd_devices() {
     return 0;
 }
 
-int cmd_add(const std::string& username) {
-    std::cout << "Adding face model for user: " << username << std::endl;
+int cmd_add(const std::string& username, const std::string& face_id = "default") {
+    std::cout << "Adding face model '" << face_id << "' for user: " << username << std::endl;
     
     // Load configuration
     faceid::Config& config = faceid::Config::getInstance();
@@ -151,11 +157,26 @@ int cmd_add(const std::string& username) {
     
     std::cout << "Successfully captured " << encodings.size() << " samples!" << std::endl;
     
-    // Save to JSON
+    // Load existing model or create new one
+    std::string model_path = std::string(MODELS_DIR) + "/" + username + ".json";
     Json::Value model_data;
-    model_data["username"] = username;
-    model_data["timestamp"] = static_cast<Json::Int64>(std::time(nullptr));
-    model_data["num_samples"] = static_cast<int>(encodings.size());
+    
+    std::ifstream existing_file(model_path);
+    if (existing_file.is_open()) {
+        Json::Reader reader;
+        reader.parse(existing_file, model_data);
+        existing_file.close();
+        std::cout << "Loaded existing model file" << std::endl;
+    } else {
+        // New user
+        model_data["username"] = username;
+        model_data["timestamp"] = static_cast<Json::Int64>(std::time(nullptr));
+    }
+    
+    // Create face data
+    Json::Value face_data;
+    face_data["num_samples"] = static_cast<int>(encodings.size());
+    face_data["created"] = static_cast<Json::Int64>(std::time(nullptr));
     
     Json::Value encodings_array(Json::arrayValue);
     for (const auto& encoding : encodings) {
@@ -166,10 +187,18 @@ int cmd_add(const std::string& username) {
         }
         encodings_array.append(encoding_array);
     }
-    model_data["encodings"] = encodings_array;
+    face_data["encodings"] = encodings_array;
+    
+    // Add or update face
+    if (!model_data.isMember("faces")) {
+        model_data["faces"] = Json::Value(Json::objectValue);
+    }
+    model_data["faces"][face_id] = face_data;
+    
+    // Update timestamp
+    model_data["timestamp"] = static_cast<Json::Int64>(std::time(nullptr));
     
     // Write to file
-    std::string model_path = std::string(MODELS_DIR) + "/" + username + ".json";
     std::ofstream model_file(model_path);
     if (!model_file.is_open()) {
         std::cerr << "Error: Failed to create model file: " << model_path << std::endl;
@@ -183,26 +212,129 @@ int cmd_add(const std::string& username) {
     std::cout << std::endl;
     std::cout << "✓ Face model saved successfully!" << std::endl;
     std::cout << "  File: " << model_path << std::endl;
+    std::cout << "  Face ID: " << face_id << std::endl;
     std::cout << "  Samples: " << encodings.size() << std::endl;
+    
+    // Show total faces for this user
+    int total_faces = model_data["faces"].size();
+    std::cout << "  Total faces for " << username << ": " << total_faces << std::endl;
     std::cout << std::endl;
     std::cout << "You can now use face authentication for user: " << username << std::endl;
     
     return 0;
 }
 
-int cmd_remove(const std::string& username) {
+int cmd_remove(const std::string& username, const std::string& face_id = "") {
     std::string model_path = std::string(MODELS_DIR) + "/" + username + ".json";
-    if (std::remove(model_path.c_str()) == 0) {
-        std::cout << "✓ Removed face model for user: " << username << std::endl;
-        return 0;
-    } else {
-        std::cerr << "✗ Failed to remove face model (file may not exist)" << std::endl;
+    
+    // If no face_id specified, remove entire user model
+    if (face_id.empty()) {
+        if (std::remove(model_path.c_str()) == 0) {
+            std::cout << "✓ Removed ALL face models for user: " << username << std::endl;
+            return 0;
+        } else {
+            std::cerr << "✗ Failed to remove face model (file may not exist)" << std::endl;
+            return 1;
+        }
+    }
+    
+    // Remove specific face_id
+    std::ifstream model_file(model_path);
+    if (!model_file.is_open()) {
+        std::cerr << "Error: No face model found for user: " << username << std::endl;
         return 1;
     }
+    
+    Json::Value model_data;
+    Json::Reader reader;
+    if (!reader.parse(model_file, model_data)) {
+        std::cerr << "Error: Failed to parse face model" << std::endl;
+        return 1;
+    }
+    model_file.close();
+    
+    // Check if face_id exists
+    if (!model_data.isMember("faces") || !model_data["faces"].isMember(face_id)) {
+        std::cerr << "Error: Face ID '" << face_id << "' not found for user: " << username << std::endl;
+        return 1;
+    }
+    
+    // Remove the face_id
+    model_data["faces"].removeMember(face_id);
+    model_data["timestamp"] = static_cast<Json::Int64>(std::time(nullptr));
+    
+    // If no faces left, remove entire file
+    if (model_data["faces"].empty()) {
+        std::remove(model_path.c_str());
+        std::cout << "✓ Removed last face '" << face_id << "', deleted entire model for user: " << username << std::endl;
+        return 0;
+    }
+    
+    // Write updated model
+    std::ofstream out_file(model_path);
+    if (!out_file.is_open()) {
+        std::cerr << "Error: Failed to update model file" << std::endl;
+        return 1;
+    }
+    
+    Json::StyledWriter writer;
+    out_file << writer.write(model_data);
+    out_file.close();
+    
+    int remaining = model_data["faces"].size();
+    std::cout << "✓ Removed face '" << face_id << "' for user: " << username << std::endl;
+    std::cout << "  Remaining faces: " << remaining << std::endl;
+    
+    return 0;
 }
 
-int cmd_list() {
+int cmd_list(const std::string& username = "") {
     std::string models_dir = MODELS_DIR;
+    
+    // List faces for specific user
+    if (!username.empty()) {
+        std::string model_path = models_dir + "/" + username + ".json";
+        std::ifstream model_file(model_path);
+        if (!model_file.is_open()) {
+            std::cerr << "Error: No face model found for user: " << username << std::endl;
+            return 1;
+        }
+        
+        Json::Value model_data;
+        Json::Reader reader;
+        if (!reader.parse(model_file, model_data)) {
+            std::cerr << "Error: Failed to parse face model" << std::endl;
+            return 1;
+        }
+        model_file.close();
+        
+        std::cout << "Faces for user: " << username << std::endl;
+        
+        if (model_data.isMember("faces")) {
+            for (const auto& face_id : model_data["faces"].getMemberNames()) {
+                const Json::Value& face_data = model_data["faces"][face_id];
+                int samples = face_data.get("num_samples", 0).asInt();
+                Json::Int64 created = face_data.get("created", 0).asInt64();
+                
+                std::cout << "  " << face_id;
+                std::cout << " (" << samples << " samples";
+                if (created > 0) {
+                    std::time_t time = static_cast<std::time_t>(created);
+                    char buffer[80];
+                    std::strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", std::localtime(&time));
+                    std::cout << ", created: " << buffer;
+                }
+                std::cout << ")" << std::endl;
+            }
+            std::cout << "Total: " << model_data["faces"].size() << " face(s)" << std::endl;
+        } else {
+            std::cout << "  (none)" << std::endl;
+        }
+        
+        return 0;
+    }
+    
+    // List all users
     DIR* dir = opendir(models_dir.c_str());
     if (!dir) {
         std::cerr << "Error: Cannot open models directory: " << models_dir << std::endl;
@@ -216,8 +348,23 @@ int cmd_list() {
     while ((entry = readdir(dir)) != nullptr) {
         std::string filename = entry->d_name;
         if (filename.size() > 5 && filename.substr(filename.size() - 5) == ".json") {
-            std::string username = filename.substr(0, filename.size() - 5);
-            std::cout << "  " << username << std::endl;
+            std::string user = filename.substr(0, filename.size() - 5);
+            
+            // Load model to count faces
+            std::string model_path = models_dir + "/" + filename;
+            std::ifstream model_file(model_path);
+            int face_count = 0;
+            
+            if (model_file.is_open()) {
+                Json::Value model_data;
+                Json::Reader reader;
+                if (reader.parse(model_file, model_data) && model_data.isMember("faces")) {
+                    face_count = model_data["faces"].size();
+                }
+                model_file.close();
+            }
+            
+            std::cout << "  " << user << " (" << face_count << " face(s))" << std::endl;
             count++;
         }
     }
@@ -251,19 +398,41 @@ int cmd_test(const std::string& username) {
     }
     model_file.close();
     
-    int num_samples = model_data.get("num_samples", 0).asInt();
-    std::cout << "Loaded model with " << num_samples << " samples" << std::endl;
-    
-    // Load stored encodings
+    // Load stored encodings from all faces
     std::vector<faceid::FaceEncoding> stored_encodings;
-    const Json::Value& encodings_array = model_data["encodings"];
-    for (const auto& enc_json : encodings_array) {
-        // SFace encoding is 128D float vector as cv::Mat
-        cv::Mat encoding(128, 1, CV_32F);
-        for (int i = 0; i < 128 && i < static_cast<int>(enc_json.size()); i++) {
-            encoding.at<float>(i) = enc_json[i].asFloat();
+    
+    if (model_data.isMember("faces")) {
+        // New multi-face format
+        for (const auto& face_id : model_data["faces"].getMemberNames()) {
+            const Json::Value& face_data = model_data["faces"][face_id];
+            const Json::Value& encodings_array = face_data["encodings"];
+            
+            for (const auto& enc_json : encodings_array) {
+                cv::Mat encoding(128, 1, CV_32F);
+                for (int i = 0; i < 128 && i < static_cast<int>(enc_json.size()); i++) {
+                    encoding.at<float>(i) = enc_json[i].asFloat();
+                }
+                stored_encodings.push_back(encoding);
+            }
         }
-        stored_encodings.push_back(encoding);
+        std::cout << "Loaded " << stored_encodings.size() << " encoding(s) from " 
+                  << model_data["faces"].size() << " face(s)" << std::endl;
+    } else if (model_data.isMember("encodings")) {
+        // Old single-face format (backward compatibility)
+        const Json::Value& encodings_array = model_data["encodings"];
+        for (const auto& enc_json : encodings_array) {
+            cv::Mat encoding(128, 1, CV_32F);
+            for (int i = 0; i < 128 && i < static_cast<int>(enc_json.size()); i++) {
+                encoding.at<float>(i) = enc_json[i].asFloat();
+            }
+            stored_encodings.push_back(encoding);
+        }
+        std::cout << "Loaded " << stored_encodings.size() << " encoding(s) (old format)" << std::endl;
+    }
+    
+    if (stored_encodings.empty()) {
+        std::cerr << "Error: No face encodings found" << std::endl;
+        return 1;
     }
     
     // Load configuration
@@ -324,7 +493,7 @@ int cmd_test(const std::string& username) {
             continue;
         }
         
-        // Compare with stored encodings
+        // Compare with all stored encodings
         double min_distance = 999.0;
         for (const auto& stored : stored_encodings) {
             double distance = detector.compareFaces(stored, encodings[0]);
@@ -378,7 +547,10 @@ int main(int argc, char* argv[]) {
     }
     
     if (command == "list") {
-        return cmd_list();
+        if (argc >= 3) {
+            return cmd_list(argv[2]);  // List faces for specific user
+        }
+        return cmd_list();  // List all users
     }
     
     if (command == "add") {
@@ -386,7 +558,10 @@ int main(int argc, char* argv[]) {
             std::cerr << "Error: username required" << std::endl;
             return 1;
         }
-        return cmd_add(argv[2]);
+        if (argc >= 4) {
+            return cmd_add(argv[2], argv[3]);  // username + face_id
+        }
+        return cmd_add(argv[2]);  // username only (default face_id)
     }
     
     if (command == "remove") {
@@ -394,7 +569,10 @@ int main(int argc, char* argv[]) {
             std::cerr << "Error: username required" << std::endl;
             return 1;
         }
-        return cmd_remove(argv[2]);
+        if (argc >= 4) {
+            return cmd_remove(argv[2], argv[3]);  // Remove specific face
+        }
+        return cmd_remove(argv[2]);  // Remove all faces
     }
     
     if (command == "test") {
