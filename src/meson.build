@@ -75,3 +75,13 @@ presence_daemon_exe = executable(
     install: true,
     install_dir: get_option('bindir'),
 )
+
+# Config merge utility
+config_merge_exe = executable(
+    'faceid-config-merge',
+    sources: files('config_merge.cpp'),
+    include_directories: inc,
+    cpp_args: cpp_args,
+    install: true,
+    install_dir: get_option('bindir'),
+)

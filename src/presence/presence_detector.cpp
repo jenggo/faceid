@@ -2,6 +2,10 @@
 #include "../logger.h"
 #include <fstream>
 #include <sys/stat.h>
+#include <sys/types.h>
+#include <dirent.h>
+#include <algorithm>
+#include <cctype>
 
 namespace faceid {
 
@@ -224,7 +228,7 @@ void PresenceDetector::updateStateMachine() {
             }
             break;
             
-        case State::IDLE_WITH_SCANNING:
+        case State::IDLE_WITH_SCANNING: {
             // FIRST: Check if user became active (keyboard/mouse input)
             // This takes priority over face scanning
             if (hasRecentActivity()) {
@@ -232,12 +236,39 @@ void PresenceDetector::updateStateMachine() {
                 transitionTo(State::ACTIVELY_PRESENT);
                 last_activity_ = now;
                 scan_failures_ = 0;  // Reset failure counter
+                consecutive_shutter_closed_scans_ = 0;  // Reset shutter counter
                 break;
             }
             
             // Scan for face
             logger.info("Scanning for face... (failures so far: " + std::to_string(scan_failures_) + ")");
-            if (detectFace()) {
+            bool face_detected = detectFace();
+            
+            // Check if failure was due to closed shutter
+            if (!face_detected && last_shutter_state_ == ShutterState::CLOSED) {
+                consecutive_shutter_closed_scans_++;
+                logger.warning("Camera shutter is CLOSED (scan #" + 
+                              std::to_string(consecutive_shutter_closed_scans_) + 
+                              ") - pausing presence detection");
+                
+                // Don't count as "away" - user may have closed shutter for privacy
+                // Just pause scanning and stay in IDLE_WITH_SCANNING state
+                
+                // If shutter has been closed for configured timeout, lock anyway
+                if (consecutive_shutter_closed_scans_ * scan_interval_ms_ > shutter_timeout_ms_) {
+                    logger.info("Camera shutter closed for " + 
+                               std::to_string(shutter_timeout_ms_ / 60000) + 
+                               "+ minutes - locking anyway");
+                    transitionTo(State::AWAY_CONFIRMED);
+                    lockScreen();
+                }
+                break;
+            }
+            
+            // Shutter is open, reset counter
+            consecutive_shutter_closed_scans_ = 0;
+            
+            if (face_detected) {
                 // Face detected! User is still here
                 successful_detections_++;
                 logger.info("Face detected! Returning to active state");
@@ -245,7 +276,7 @@ void PresenceDetector::updateStateMachine() {
                 last_activity_ = now;
                 scan_failures_ = 0;  // Reset failure counter
             } else {
-                // No face detected
+                // No face detected (and shutter is open)
                 failed_detections_++;
                 scan_failures_++;
                 logger.info("No face detected (failure " + std::to_string(scan_failures_) + 
@@ -256,18 +287,19 @@ void PresenceDetector::updateStateMachine() {
                     logger.info("User confirmed away after " + 
                                std::to_string(scan_failures_) + " failed scans - locking screen");
                     transitionTo(State::AWAY_CONFIRMED);
-                    // TODO: Trigger screen lock
+                    lockScreen();
                 }
             }
             
             // Also check timeout
             if (inactive_time > max_idle_time_ms_) {
                 logger.info("User confirmed away after " + 
-                           std::to_string(inactive_time / 1000) + " seconds idle");
+                           std::to_string(inactive_time / 1000) + " seconds idle - locking screen");
                 transitionTo(State::AWAY_CONFIRMED);
-                // TODO: Trigger screen lock
+                lockScreen();
             }
             break;
+        }
             
         case State::AWAY_CONFIRMED:
             // Waiting for input activity to transition back
@@ -321,6 +353,23 @@ bool PresenceDetector::detectFace() {
             return false;
         }
         
+        // CHECK SHUTTER STATE BEFORE DETECTING FACE
+        ShutterState shutter = detectShutterState(frame);
+        last_shutter_state_ = shutter;
+        
+        if (shutter == ShutterState::CLOSED) {
+            Logger::getInstance().warning("Camera shutter is CLOSED - pausing face detection");
+            // Return special value to indicate shutter closed (not a failure)
+            // This will be handled in updateStateMachine()
+            return false;  // Will be handled specially by checking last_shutter_state_
+        }
+        
+        if (shutter == ShutterState::UNCERTAIN) {
+            Logger::getInstance().debug("Camera image is very dark - shutter might be closed");
+            // Continue with detection anyway - might just be a dark room
+        }
+        
+        // Shutter is open, proceed with face detection
         // Resize for faster detection (YuNet expects 320x240 as configured)
         cv::Mat resized;
         cv::resize(frame, resized, cv::Size(320, 240));
@@ -406,74 +455,69 @@ cv::Mat PresenceDetector::captureFrame() {
 }
 
 bool PresenceDetector::hasRecentActivity() const {
-    // Check for keyboard/mouse activity by looking at interrupt count changes
-    // Cache the result to avoid spawning processes too frequently
+    // NEW IMPLEMENTATION: Use /dev/input/event* modification time
+    // This is much faster and more reliable than /proc/interrupts
     
-    auto now = std::chrono::steady_clock::now();
+    time_t last_activity = getLastInputDeviceActivity();
     
-    // Only check interrupts every 500ms to reduce process spawning
-    if (now - last_interrupt_check_ < interrupt_check_interval_) {
-        // Use cached result - no change detected since last check
-        return false;
+    if (last_activity == 0) {
+        return false;  // Could not determine
     }
     
-    last_interrupt_check_ = now;
+    time_t now = time(nullptr);
+    time_t idle_seconds = now - last_activity;
     
-    FILE* pipe = popen("grep -E 'i8042|keyboard|mouse' /proc/interrupts 2>/dev/null | awk '{sum+=$2} END {print sum}'", "r");
-    if (!pipe) {
-        return false;
-    }
-    
-    char buffer[128];
-    if (fgets(buffer, sizeof(buffer), pipe) == nullptr) {
-        pclose(pipe);
-        return false;
-    }
-    pclose(pipe);
-    
-    try {
-        unsigned long interrupt_count = std::stoul(buffer);
-        unsigned long prev_count = last_interrupt_count_;
+    // Apply mouse jitter threshold
+    if (idle_seconds == 0 && last_device_was_mouse_) {
+        // Check if mouse moved very recently (within jitter threshold)
+        auto now_steady = std::chrono::steady_clock::now();
+        auto since_last_mouse = std::chrono::duration_cast<std::chrono::milliseconds>(
+            now_steady - last_mouse_activity_time_).count();
         
-        // Log for debugging (throttled to every 2 seconds)
+        if (since_last_mouse < mouse_jitter_threshold_ms_) {
+            // Too soon after last mouse activity, might be jitter - ignore
+            return false;
+        }
+    }
+    
+    // Activity detected if idle < 2 seconds
+    bool activity = (idle_seconds < 2);
+    
+    if (activity) {
         Logger& logger = Logger::getInstance();
-        static auto last_log = std::chrono::steady_clock::now();
-        if (std::chrono::duration_cast<std::chrono::seconds>(now - last_log).count() >= 2) {
-            logger.info("Interrupt check: current=" + std::to_string(interrupt_count) + 
-                       ", previous=" + std::to_string(prev_count) + 
-                       ", delta=" + std::to_string(interrupt_count - prev_count));
-            last_log = now;
-        }
-        
-        // Check if interrupts increased (indicates activity)
-        if (interrupt_count > prev_count) {
-            logger.info("ACTIVITY DETECTED: Interrupts increased from " + 
-                       std::to_string(prev_count) + " to " + std::to_string(interrupt_count));
-            last_interrupt_count_ = interrupt_count;
-            return true;
-        }
-        
-        // Update the count even if no change (for next comparison)
-        last_interrupt_count_ = interrupt_count;
-        
-        // No change in interrupts = no activity
-        return false;
-    } catch (...) {
-        return false;
+        logger.debug("ACTIVITY DETECTED: Input activity within last " + 
+                    std::to_string(idle_seconds) + " seconds");
     }
+    
+    return activity;
 }
 
 bool PresenceDetector::detectDisplayServer() {
-    // Check for Wayland session
+    // Method 1: Check environment variables (works if service has them)
     const char* wayland_display = getenv("WAYLAND_DISPLAY");
     if (wayland_display && strlen(wayland_display) > 0) {
         return true;  // Wayland
     }
     
-    // Check for XDG_SESSION_TYPE
     const char* session_type = getenv("XDG_SESSION_TYPE");
     if (session_type && strcmp(session_type, "wayland") == 0) {
         return true;  // Wayland
+    }
+    
+    // Method 2: Check via loginctl (more reliable for systemd services)
+    FILE* pipe = popen("loginctl show-session $(loginctl list-sessions --no-legend | awk '{print $1}' | head -1) -p Type --value 2>/dev/null | head -1", "r");
+    if (pipe) {
+        char buffer[32];
+        if (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+            pclose(pipe);
+            std::string type(buffer);
+            // Remove whitespace
+            type.erase(type.find_last_not_of(" \n\r\t") + 1);
+            if (type == "wayland") {
+                return true;  // Wayland
+            }
+        }
+        pclose(pipe);
     }
     
     return false;  // X11 or unknown (assume X11)
@@ -553,6 +597,133 @@ PresenceDetector::Statistics PresenceDetector::getStatistics() const {
         .stateTransitions = state_transitions_.load(),
         .uptimeSeconds = static_cast<int>(uptime)
     };
+}
+
+// NEW: Input device detection using /dev/input mtime
+time_t PresenceDetector::getLastInputDeviceActivity() const {
+    // Use /proc/interrupts to track input activity
+    // This works for both PS/2 (i8042) and USB input devices
+    
+    std::ifstream interrupts("/proc/interrupts");
+    if (!interrupts.is_open()) {
+        return 0;
+    }
+    
+    unsigned long long max_count = 0;
+    std::string line;
+    
+    while (std::getline(interrupts, line)) {
+        // Look for input-related interrupts:
+        // - i8042: PS/2 keyboard/mouse controller
+        // - usb-hid: USB input devices
+        if (line.find("i8042") != std::string::npos ||
+            line.find("usb") != std::string::npos) {
+            
+            // Parse interrupt counts from all CPUs
+            std::istringstream iss(line);
+            std::string irq_num;
+            iss >> irq_num;  // Skip IRQ number
+            
+            unsigned long long count;
+            while (iss >> count) {
+                if (count > max_count) {
+                    max_count = count;
+                }
+            }
+        }
+    }
+    
+    // If no interrupts found or count is 0, return 0
+    if (max_count == 0) {
+        return 0;
+    }
+    
+    // Store the interrupt count
+    static unsigned long long last_interrupt_count = 0;
+    static time_t last_update_time = time(nullptr);
+    
+    // If interrupt count increased, update timestamp
+    if (max_count > last_interrupt_count) {
+        last_interrupt_count = max_count;
+        last_update_time = time(nullptr);
+    }
+    
+    return last_update_time;
+}
+
+
+// NEW: Lock screen trigger
+void PresenceDetector::lockScreen() {
+    Logger& logger = Logger::getInstance();
+    logger.info("Attempting to lock screen...");
+    
+    // Method 1: loginctl lock-sessions (works from systemd service, locks ALL sessions)
+    // This is the most reliable method for systemd services running as root
+    int ret = system("loginctl lock-sessions 2>/dev/null");
+    if (ret == 0) {
+        logger.info("Screen locked successfully via loginctl lock-sessions");
+        return;
+    }
+    
+    // Method 2: Lock specific session (try to get active session)
+    ret = system("loginctl lock-session $(loginctl list-sessions --no-legend | awk '{print $1}' | head -1) 2>/dev/null");
+    if (ret == 0) {
+        logger.info("Screen locked successfully via loginctl lock-session");
+        return;
+    }
+    
+    // Method 3: KDE-specific via user's D-Bus session (requires env variables)
+    // This will fail from systemd service but worth trying
+    ret = system("su - $(loginctl list-sessions --no-legend | awk '{print $3}' | head -1) -c 'qdbus org.freedesktop.ScreenSaver /ScreenSaver Lock' 2>/dev/null");
+    if (ret == 0) {
+        logger.info("Screen locked successfully via user D-Bus session");
+        return;
+    }
+    
+    logger.error("Failed to lock screen - all methods failed");
+}
+
+// NEW: Camera shutter detection
+PresenceDetector::ShutterState PresenceDetector::detectShutterState(const cv::Mat& frame) {
+    if (frame.empty()) {
+        return ShutterState::UNCERTAIN;
+    }
+    
+    // Calculate mean brightness (RGB average)
+    cv::Scalar mean_color = cv::mean(frame);
+    double brightness = (mean_color[0] + mean_color[1] + mean_color[2]) / 3.0;
+    
+    // Convert to grayscale for variance check
+    cv::Mat gray;
+    cv::cvtColor(frame, gray, cv::COLOR_BGR2GRAY);
+    
+    // Calculate standard deviation (variance indicator)
+    cv::Scalar mean, stddev;
+    cv::meanStdDev(gray, mean, stddev);
+    
+    Logger& logger = Logger::getInstance();
+    
+    // Debug logging (throttled to every 5 seconds)
+    static auto last_log = std::chrono::steady_clock::now();
+    auto now = std::chrono::steady_clock::now();
+    if (std::chrono::duration_cast<std::chrono::seconds>(now - last_log).count() >= 5) {
+        logger.debug("Shutter check: brightness=" + std::to_string(brightness) + 
+                    ", stddev=" + std::to_string(stddev[0]));
+        last_log = now;
+    }
+    
+    // Check if image is pure black (shutter closed)
+    if (brightness < shutter_brightness_threshold_ && 
+        stddev[0] < shutter_variance_threshold_) {
+        return ShutterState::CLOSED;
+    }
+    
+    // Check if very dark but with some variance (might be dark room)
+    if (brightness < 15.0) {
+        return ShutterState::UNCERTAIN;
+    }
+    
+    return ShutterState::OPEN;
 }
 
 } // namespace faceid

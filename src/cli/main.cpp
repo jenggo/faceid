@@ -101,6 +101,16 @@ int cmd_add(const std::string& username, const std::string& face_id = "default")
     std::cout << "Please look at the camera and press Enter when ready..." << std::endl;
     std::cin.get();
     
+    // Create preview window
+    const std::string window_name = "FaceID - Face Enrollment Preview";
+    cv::namedWindow(window_name, cv::WINDOW_NORMAL);
+    cv::resizeWindow(window_name, 640, 480);
+    
+    std::cout << std::endl;
+    std::cout << "📷 Preview window opened - adjust your position to show your face clearly" << std::endl;
+    std::cout << "   Press 'q' in the preview window to cancel" << std::endl;
+    std::cout << std::endl;
+    
     // Capture and process multiple frames
     const int num_samples = 5;
     std::vector<faceid::FaceEncoding> encodings;
@@ -117,10 +127,69 @@ int cmd_add(const std::string& username, const std::string& face_id = "default")
         }
         
         // Preprocess frame
-        frame = detector.preprocessFrame(frame);
+        cv::Mat processed_frame = detector.preprocessFrame(frame);
         
         // Detect faces
-        auto faces = detector.detectFaces(frame, true);
+        auto faces = detector.detectFaces(processed_frame, true);
+        
+        // Draw visualization on original frame
+        cv::Mat display_frame = frame.clone();
+        
+        // Draw detected face rectangles
+        for (const auto& face : faces) {
+            cv::Scalar color;
+            
+            if (faces.size() == 1) {
+                color = cv::Scalar(0, 255, 0);  // Green for good detection
+            } else {
+                color = cv::Scalar(0, 0, 255);  // Red for multiple faces
+            }
+            
+            // Draw rectangle around face
+            cv::rectangle(display_frame, face, color, 2);
+        }
+        
+        // Draw status text
+        std::string status_text;
+        cv::Scalar status_color;
+        
+        if (faces.empty()) {
+            status_text = "No face detected - position yourself in frame";
+            status_color = cv::Scalar(0, 165, 255);  // Orange
+        } else if (faces.size() > 1) {
+            status_text = "Multiple faces (" + std::to_string(faces.size()) + ") - only one person should be visible";
+            status_color = cv::Scalar(0, 0, 255);  // Red
+        } else {
+            status_text = "Face detected - capturing sample " + std::to_string(i + 1) + "/" + std::to_string(num_samples);
+            status_color = cv::Scalar(0, 255, 0);  // Green
+        }
+        
+        // Draw status banner at top
+        cv::rectangle(display_frame, cv::Point(0, 0), cv::Point(display_frame.cols, 40), 
+                     cv::Scalar(0, 0, 0), -1);
+        cv::putText(display_frame, status_text,
+                   cv::Point(10, 25),
+                   cv::FONT_HERSHEY_SIMPLEX, 0.6, status_color, 2);
+        
+        // Show progress bar at bottom
+        int progress_width = (display_frame.cols * (i + 1)) / num_samples;
+        cv::rectangle(display_frame, 
+                     cv::Point(0, display_frame.rows - 10), 
+                     cv::Point(progress_width, display_frame.rows),
+                     cv::Scalar(0, 255, 0), -1);
+        
+        // Display the frame
+        cv::imshow(window_name, display_frame);
+        
+        // Check for quit key (short wait to keep display responsive)
+        int key = cv::waitKey(30);
+        if (key == 'q' || key == 'Q' || key == 27) {  // q or ESC
+            std::cout << std::endl << "Cancelled by user" << std::endl;
+            cv::destroyWindow(window_name);
+            return 1;
+        }
+        
+        // Validate detection
         if (faces.empty()) {
             std::cout << "No face detected, retrying..." << std::endl;
             i--;  // Retry this sample
@@ -128,15 +197,27 @@ int cmd_add(const std::string& username, const std::string& face_id = "default")
             continue;
         }
         
+        // If multiple faces, select the largest one (closest to camera)
+        cv::Rect selected_face;
         if (faces.size() > 1) {
-            std::cout << "Multiple faces detected, please ensure only one person is visible" << std::endl;
-            i--;  // Retry this sample
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
-            continue;
+            std::cout << "Multiple faces detected (" << faces.size() << "), selecting largest... " << std::flush;
+            
+            // Find the largest face by area
+            int max_area = 0;
+            for (const auto& face : faces) {
+                int area = face.width * face.height;
+                if (area > max_area) {
+                    max_area = area;
+                    selected_face = face;
+                }
+            }
+        } else {
+            selected_face = faces[0];
         }
         
-        // Encode face
-        auto face_encodings = detector.encodeFaces(frame, faces);
+        // Encode the selected face
+        std::vector<cv::Rect> single_face = {selected_face};
+        auto face_encodings = detector.encodeFaces(processed_frame, single_face);
         if (face_encodings.empty()) {
             std::cout << "Failed to encode face, retrying..." << std::endl;
             i--;  // Retry this sample
@@ -145,10 +226,14 @@ int cmd_add(const std::string& username, const std::string& face_id = "default")
         }
         
         encodings.push_back(face_encodings[0]);
-        std::cout << "OK" << std::endl;
+        std::cout << "✓ OK" << std::endl;
         
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
+    
+    // Close preview window
+    cv::destroyWindow(window_name);
+    std::cout << std::endl;
     
     if (encodings.empty()) {
         std::cerr << "Error: Failed to capture any face samples" << std::endl;

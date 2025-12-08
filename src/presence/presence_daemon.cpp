@@ -176,6 +176,27 @@ int main(int argc, char* argv[]) {
     
     auto& config = faceid::Config::getInstance();
     
+    // Configure logging from config file
+    std::string log_file = config.getString("logging", "log_file").value_or("/var/log/faceid.log");
+    std::string log_level_str = config.getString("logging", "log_level").value_or("INFO");
+    
+    logger.setLogFile(log_file);
+    
+    // Parse log level
+    faceid::LogLevel log_level = faceid::LogLevel::INFO;
+    if (log_level_str == "DEBUG") {
+        log_level = faceid::LogLevel::DEBUG;
+    } else if (log_level_str == "INFO") {
+        log_level = faceid::LogLevel::INFO;
+    } else if (log_level_str == "WARNING") {
+        log_level = faceid::LogLevel::WARNING;
+    } else if (log_level_str == "ERROR") {
+        log_level = faceid::LogLevel::ERROR;
+    }
+    logger.setLogLevel(log_level);
+    
+    logger.info("Logging configured: file=" + log_file + ", level=" + log_level_str);
+    
     // Read presence detection configuration
     bool enabled = config.getBool("presence_detection", "enabled").value_or(false);
     if (!enabled) {
@@ -187,6 +208,10 @@ int main(int argc, char* argv[]) {
     int scan_interval = config.getInt("presence_detection", "scan_interval_seconds").value_or(2);
     int max_scan_failures = config.getInt("presence_detection", "max_scan_failures").value_or(3);
     int max_idle_time = config.getInt("presence_detection", "max_idle_time_minutes").value_or(15);
+    int mouse_jitter_threshold = config.getInt("presence_detection", "mouse_jitter_threshold_ms").value_or(300);
+    double shutter_brightness = config.getDouble("presence_detection", "shutter_brightness_threshold").value_or(10.0);
+    double shutter_variance = config.getDouble("presence_detection", "shutter_variance_threshold").value_or(2.0);
+    int shutter_timeout = config.getInt("presence_detection", "shutter_timeout_minutes").value_or(5);
     std::string camera_device = config.getString("camera", "device").value_or("/dev/video0");
     
     logger.info("Presence detection configuration:");
@@ -194,6 +219,10 @@ int main(int argc, char* argv[]) {
     logger.info("  Scan interval: " + std::to_string(scan_interval) + "s");
     logger.info("  Max failures: " + std::to_string(max_scan_failures));
     logger.info("  Max idle time: " + std::to_string(max_idle_time) + " min");
+    logger.info("  Mouse jitter threshold: " + std::to_string(mouse_jitter_threshold) + "ms");
+    logger.info("  Shutter brightness threshold: " + std::to_string(shutter_brightness));
+    logger.info("  Shutter variance threshold: " + std::to_string(shutter_variance));
+    logger.info("  Shutter timeout: " + std::to_string(shutter_timeout) + " min");
     logger.info("  Camera device: " + camera_device);
     
     // Setup signal handlers
@@ -210,6 +239,12 @@ int main(int argc, char* argv[]) {
         max_scan_failures,
         std::chrono::minutes(max_idle_time)
     );
+    
+    // Configure additional options
+    detector.setMouseJitterThreshold(mouse_jitter_threshold);
+    detector.setShutterBrightnessThreshold(shutter_brightness);
+    detector.setShutterVarianceThreshold(shutter_variance);
+    detector.setShutterTimeout(shutter_timeout * 60 * 1000);  // Convert minutes to milliseconds
     
     if (!detector.start()) {
         logger.error("Failed to start presence detector");
@@ -238,8 +273,9 @@ int main(int argc, char* argv[]) {
         guard.checkGuardConditions();
         
         // Detector automatically handles guard state internally
-        // Just sleep and let it do its work
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        // Sleep for 2 seconds between guard checks (aligned with lock state cache)
+        // This significantly reduces process spawning overhead
+        std::this_thread::sleep_for(std::chrono::seconds(2));
         
         // Optionally log statistics periodically (every 5 minutes)
         static auto last_stats_time = std::chrono::steady_clock::now();
