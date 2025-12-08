@@ -22,6 +22,12 @@ public:
         AWAY_CONFIRMED      // User confirmed away, screen locked
     };
     
+    enum class ShutterState {
+        OPEN,       // Camera shutter is open
+        CLOSED,     // Camera shutter is closed (physical privacy)
+        UNCERTAIN   // Very dark image, might be closed or dark room
+    };
+    
     PresenceDetector(
         const std::string& camera_device = "/dev/video0",
         std::chrono::seconds inactive_threshold = std::chrono::seconds(30),
@@ -56,6 +62,10 @@ public:
     void setScanInterval(int ms) { scan_interval_ms_ = ms; }
     void setMaxScanFailures(int count) { max_scan_failures_ = count; }
     void setMaxIdleTime(int ms) { max_idle_time_ms_ = ms; }
+    void setMouseJitterThreshold(int ms) { mouse_jitter_threshold_ms_ = ms; }
+    void setShutterBrightnessThreshold(double threshold) { shutter_brightness_threshold_ = threshold; }
+    void setShutterVarianceThreshold(double threshold) { shutter_variance_threshold_ = threshold; }
+    void setShutterTimeout(int ms) { shutter_timeout_ms_ = ms; }
     
     // Statistics
     struct Statistics {
@@ -83,8 +93,17 @@ private:
     bool detectFace();
     cv::Mat captureFrame();
     
-    // Input activity monitoring
+    // Camera shutter detection
+    ShutterState detectShutterState(const cv::Mat& frame);
+    
+    // Input activity monitoring (NEW implementation)
     bool hasRecentActivity() const;
+    time_t getLastInputDeviceActivity() const;
+    
+    // Lock screen trigger
+    void lockScreen();
+    
+    // Legacy methods (keeping for compatibility)
     std::chrono::steady_clock::time_point getLastInputActivity() const;
     bool detectDisplayServer();  // Detect X11 vs Wayland
     
@@ -119,6 +138,18 @@ private:
     int scan_interval_ms_ = 2000;        // 2 seconds
     int max_scan_failures_ = 3;          // 3 consecutive failures
     int max_idle_time_ms_ = 900000;      // 15 minutes
+    
+    // NEW: Mouse jitter filtering
+    int mouse_jitter_threshold_ms_ = 300;  // Ignore mouse within 300ms
+    mutable bool last_device_was_mouse_ = false;
+    mutable std::chrono::steady_clock::time_point last_mouse_activity_time_;
+    
+    // NEW: Camera shutter detection
+    double shutter_brightness_threshold_ = 10.0;   // Max brightness for "closed"
+    double shutter_variance_threshold_ = 2.0;      // Max stddev for "closed"
+    int shutter_timeout_ms_ = 300000;              // 5 minutes
+    int consecutive_shutter_closed_scans_ = 0;
+    ShutterState last_shutter_state_ = ShutterState::OPEN;
     
     // Display server detection (set once at startup)
     bool is_wayland_ = false;

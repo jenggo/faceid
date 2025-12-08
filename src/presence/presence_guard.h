@@ -41,6 +41,11 @@ private:
     std::string cached_session_id_;
     std::chrono::steady_clock::time_point last_session_check_;
     
+    // Cache the actual lock state result to avoid excessive process spawning
+    bool cached_lock_state_;
+    std::chrono::steady_clock::time_point last_lock_state_check_;
+    static constexpr int LOCK_STATE_CACHE_SECONDS = 2;  // Check lock state every 2 seconds max
+    
     // Individual check implementations
     bool checkLidState();
     bool checkCameraShutter();

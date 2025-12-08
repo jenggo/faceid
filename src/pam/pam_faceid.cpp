@@ -74,6 +74,20 @@ static bool authenticate_user(const char* username) {
         DisplayDetector display_detector;
         DisplayState display_state = display_detector.getDisplayState();
         
+        // If we're on lock screen, add delay before checking display state again
+        // This gives the screen time to turn off after pressing lock button (Meta+L)
+        if (display_detector.isLockScreenGreeter() || display_detector.isScreenLocked()) {
+            int delay_ms = config.getInt("authentication", "lock_screen_delay_ms").value_or(1000);
+            if (delay_ms > 0) {
+                logger.debug(std::string("Lock screen detected, waiting ") + std::to_string(delay_ms) + 
+                           "ms before checking display state");
+                std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+                
+                // Recheck display state after delay
+                display_state = display_detector.getDisplayState();
+            }
+        }
+        
         if (display_state == DisplayState::OFF) {
             logger.info(std::string("Display is OFF (") + display_detector.getDetectionMethod() + 
                        "), skipping biometric authentication for user " + username);
@@ -192,28 +206,52 @@ static bool authenticate_user(const char* username) {
                     }
                     
                     // Compare with stored encodings
-                    if (model_data.isMember("encodings") && !model_data["encodings"].empty()) {
-                        // Load stored encodings from JSON
+                    std::vector<cv::Mat> stored_encodings;
+                    
+                    // Try new multi-face format first
+                    if (model_data.isMember("faces") && !model_data["faces"].empty()) {
+                        const Json::Value& faces_data = model_data["faces"];
+                        
+                        // Load all encodings from all faces
+                        for (const auto& face_id : faces_data.getMemberNames()) {
+                            const Json::Value& face_data = faces_data[face_id];
+                            if (face_data.isMember("encodings")) {
+                                const Json::Value& encodings_array = face_data["encodings"];
+                                
+                                for (const auto& enc_json : encodings_array) {
+                                    cv::Mat stored_encoding(128, 1, CV_32F);
+                                    for (int i = 0; i < 128 && i < static_cast<int>(enc_json.size()); i++) {
+                                        stored_encoding.at<float>(i) = enc_json[i].asFloat();
+                                    }
+                                    stored_encodings.push_back(stored_encoding);
+                                }
+                            }
+                        }
+                    }
+                    // Fallback to old single-face format (backward compatibility)
+                    else if (model_data.isMember("encodings") && !model_data["encodings"].empty()) {
                         const Json::Value& stored_encodings_json = model_data["encodings"];
                         
                         for (const auto& enc_json : stored_encodings_json) {
-                            // Convert JSON to cv::Mat
                             cv::Mat stored_encoding(128, 1, CV_32F);
                             for (int i = 0; i < 128 && i < static_cast<int>(enc_json.size()); i++) {
                                 stored_encoding.at<float>(i) = enc_json[i].asFloat();
                             }
+                            stored_encodings.push_back(stored_encoding);
+                        }
+                    }
+                    
+                    // Compare detected faces with all stored encodings
+                    for (const auto& stored_encoding : stored_encodings) {
+                        for (const auto& detected_encoding : encodings) {
+                            double distance = detector.compareFaces(detected_encoding, stored_encoding);
                             
-                            // Compare with detected faces
-                            for (const auto& detected_encoding : encodings) {
-                                double distance = detector.compareFaces(detected_encoding, stored_encoding);
-                                
-                                // SFace compareFaces returns distance (lower = more similar)
-                                // Default threshold 0.6 works well
-                                if (distance < threshold) {
-                                    logger.info(std::string("Face matched for user ") + username + 
-                                              " (distance: " + std::to_string(distance) + ")");
-                                    return true;
-                                }
+                            // SFace compareFaces returns distance (lower = more similar)
+                            // Default threshold 0.6 works well
+                            if (distance < threshold) {
+                                logger.info(std::string("Face matched for user ") + username + 
+                                          " (distance: " + std::to_string(distance) + ")");
+                                return true;
                             }
                         }
                     }

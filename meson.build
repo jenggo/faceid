@@ -50,14 +50,9 @@ install_emptydir(config_dir)
 install_emptydir(models_dir)
 install_emptydir(log_dir)
 
-# Install config with preservation logic via custom script
-# Note: Meson doesn't support conditional install, so we use install_data
-# and handle preservation in the Makefile
-install_data(
-    'config/faceid.conf',
-    install_dir: config_dir,
-    install_mode: 'rw-r--r--',
-)
+# Config installation handled by Makefile using faceid-config-merge utility
+# This allows preserving user settings during upgrades
+# The Makefile runs: faceid-config-merge config/faceid.conf /etc/faceid/faceid.conf
 
 # Install documentation
 install_data(

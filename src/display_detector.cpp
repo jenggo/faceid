@@ -98,7 +98,51 @@ bool DisplayDetector::isScreenLocked() {
 }
 
 bool DisplayDetector::isDisplayBlanked() {
-    // Method 1: Check DPMS state via xset (X11)
+    // Method 1: Check DRM power state for laptop's built-in display (eDP) FIRST
+    // This is the MOST RELIABLE method on KDE Plasma and modern Linux systems
+    // NOTE: Only check eDP specifically - external DP/HDMI ports may be "Off" when disconnected
+    // which would cause false positives if we check all displays with wildcards
+    FILE* pipe = popen("cat /sys/class/drm/card*/card*-eDP-*/dpms 2>/dev/null | head -1", "r");
+    if (pipe) {
+        char buffer[128];
+        if (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+            pclose(pipe);
+            std::string result(buffer);
+            if (result.find("Off") != std::string::npos || 
+                result.find("off") != std::string::npos) {
+                return true;
+            }
+            // eDP is On, screen is definitely on
+            return false;
+        } else {
+            pclose(pipe);
+        }
+    }
+    
+    // Method 2: Check backlight state as fallback
+    // Note: On some systems (KDE Plasma), backlight may not go to 0 even when display is "Off"
+    // so we use this as secondary check only
+    pipe = popen("cat /sys/class/backlight/*/actual_brightness 2>/dev/null | head -1", "r");
+    if (pipe) {
+        char buffer[128];
+        if (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+            pclose(pipe);
+            try {
+                int brightness = std::stoi(buffer);
+                if (brightness == 0) {
+                    return true;  // Screen is definitely off
+                }
+                // Brightness > 0, but we already checked DRM above
+                // Don't return false here - continue to other methods
+            } catch (...) {
+                // Ignore parse errors, try other methods
+            }
+        } else {
+            pclose(pipe);
+        }
+    }
+    
+    // Method 3: Check DPMS state via xset (X11 only)
     if (!is_wayland_) {
         FILE* pipe = popen("DISPLAY=:0 xset q 2>/dev/null | grep 'Monitor is' | awk '{print $3}'", "r");
         if (pipe) {
@@ -110,50 +154,14 @@ bool DisplayDetector::isDisplayBlanked() {
                     result.find("off") != std::string::npos) {
                     return true;
                 }
+                return false;
             } else {
                 pclose(pipe);
             }
         }
     }
     
-    // Method 2: Check backlight state (works for both X11 and Wayland)
-    // Most laptops have backlight in /sys/class/backlight/
-    FILE* pipe = popen("cat /sys/class/backlight/*/actual_brightness 2>/dev/null | head -1", "r");
-    if (pipe) {
-        char buffer[128];
-        if (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
-            pclose(pipe);
-            try {
-                int brightness = std::stoi(buffer);
-                if (brightness == 0) {
-                    return true;
-                }
-            } catch (...) {
-                // Ignore parse errors
-            }
-        } else {
-            pclose(pipe);
-        }
-    }
-    
-    // Method 3: Check DRM power state for laptop's built-in display (eDP)
-    // NOTE: Only check eDP specifically - external DP/HDMI ports may be "Off" when disconnected
-    // which would cause false positives if we check all displays with wildcards
-    pipe = popen("cat /sys/class/drm/card*/card*-eDP-*/dpms 2>/dev/null | head -1", "r");
-    if (pipe) {
-        char buffer[128];
-        if (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
-            pclose(pipe);
-            std::string result(buffer);
-            if (result.find("Off") != std::string::npos || 
-                result.find("off") != std::string::npos) {
-                return true;
-            }
-        } else {
-            pclose(pipe);
-        }
-    }
-    
+    // Could not determine, assume screen is on (safe default)
     return false;
 }
 

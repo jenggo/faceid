@@ -9,7 +9,9 @@ PresenceGuard::PresenceGuard()
     , camera_shutter_open_(false)
     , screen_unlocked_(false)
     , last_update_(std::chrono::steady_clock::time_point::min())
-    , last_session_check_(std::chrono::steady_clock::time_point::min()) {
+    , last_session_check_(std::chrono::steady_clock::time_point::min())
+    , cached_lock_state_(true)  // Assume unlocked initially
+    , last_lock_state_check_(std::chrono::steady_clock::time_point::min()) {
 }
 
 void PresenceGuard::updateState() {
@@ -56,15 +58,24 @@ bool PresenceGuard::checkCameraShutter() {
 }
 
 bool PresenceGuard::checkScreenLock() {
-    // For Wayland: Use loginctl with cached session ID
-    // This is much more efficient than spawning shells constantly
-    
+    // Return cached state if checked recently (every 2 seconds max)
+    // This prevents spawning loginctl processes 10 times per second
     auto now = std::chrono::steady_clock::now();
-    auto time_since_last_check = std::chrono::duration_cast<std::chrono::seconds>(
-        now - last_session_check_).count();
+    auto time_since_lock_check = std::chrono::duration_cast<std::chrono::seconds>(
+        now - last_lock_state_check_).count();
+    
+    if (time_since_lock_check < LOCK_STATE_CACHE_SECONDS) {
+        return cached_lock_state_;
+    }
+    
+    // Time to refresh - check actual lock state
+    bool is_unlocked = true;  // Default: assume unlocked
     
     // Cache session ID (only lookup every 30 seconds)
-    if (cached_session_id_.empty() || time_since_last_check > 30) {
+    auto time_since_session_check = std::chrono::duration_cast<std::chrono::seconds>(
+        now - last_session_check_).count();
+    
+    if (cached_session_id_.empty() || time_since_session_check > 30) {
         FILE* pipe = popen("loginctl list-sessions --no-legend 2>/dev/null | awk '{print $1}' | head -1", "r");
         if (pipe) {
             char buffer[128];
@@ -94,10 +105,16 @@ bool PresenceGuard::checkScreenLock() {
                 result.erase(result.find_last_not_of(" \n\r\t") + 1);
                 if (result == "yes") {
                     // Session is locked
-                    return false;
+                    is_unlocked = false;
+                } else {
+                    // "no" or empty means unlocked
+                    is_unlocked = true;
                 }
-                // "no" or empty means unlocked
-                return true;
+                
+                // Update cache and return
+                cached_lock_state_ = is_unlocked;
+                last_lock_state_check_ = now;
+                return cached_lock_state_;
             }
             pclose(pipe);
         }
@@ -111,13 +128,14 @@ bool PresenceGuard::checkScreenLock() {
         int status = pclose(pipe);
         if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
             // kscreenlocker_greet is running = screen is locked
-            return false;
+            is_unlocked = false;
         }
     }
     
-    // Default: assume unlocked if we can't determine
-    // (Conservative approach - allow presence detection to proceed)
-    return true;
+    // Update cache and return
+    cached_lock_state_ = is_unlocked;
+    last_lock_state_check_ = now;
+    return cached_lock_state_;
 }
 
 } // namespace faceid

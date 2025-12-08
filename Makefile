@@ -128,45 +128,28 @@ install: build
 	@printf "$(COLOR_CYAN)Checking configuration file...$(COLOR_RESET)\n"
 	@SOURCE_CONFIG="config/faceid.conf"; \
 	DEST_CONFIG="/etc/faceid/faceid.conf"; \
-	if [ ! -f "$$DEST_CONFIG" ]; then \
-		printf "$(COLOR_GREEN)✓ Installing new config: $$DEST_CONFIG$(COLOR_RESET)\n"; \
-		if [ "$$(id -u)" != "0" ]; then \
-			sudo cp "$$SOURCE_CONFIG" "$$DEST_CONFIG"; \
-			sudo chmod 644 "$$DEST_CONFIG"; \
+	MERGE_UTIL="$(BUILD_DIR)/src/faceid-config-merge"; \
+	if [ ! -f "$$MERGE_UTIL" ]; then \
+		printf "$(COLOR_RED)✗ Config merge utility not found: $$MERGE_UTIL$(COLOR_RESET)\n"; \
+		printf "$(COLOR_YELLOW)⚠ Falling back to simple copy...$(COLOR_RESET)\n"; \
+		if [ ! -f "$$DEST_CONFIG" ]; then \
+			if [ "$$(id -u)" != "0" ]; then \
+				sudo cp "$$SOURCE_CONFIG" "$$DEST_CONFIG"; \
+				sudo chmod 644 "$$DEST_CONFIG"; \
+			else \
+				cp "$$SOURCE_CONFIG" "$$DEST_CONFIG"; \
+				chmod 644 "$$DEST_CONFIG"; \
+			fi; \
+			printf "$(COLOR_GREEN)✓ New config installed: $$DEST_CONFIG$(COLOR_RESET)\n"; \
 		else \
-			cp "$$SOURCE_CONFIG" "$$DEST_CONFIG"; \
-			chmod 644 "$$DEST_CONFIG"; \
+			printf "$(COLOR_YELLOW)⚠ Existing config unchanged: $$DEST_CONFIG$(COLOR_RESET)\n"; \
 		fi; \
 	else \
-		SOURCE_KEYS=$$(mktemp); \
-		DEST_KEYS=$$(mktemp); \
-		grep -E '^\s*[a-zA-Z_]' "$$SOURCE_CONFIG" | sed 's/\s*=.*//' | sort > "$$SOURCE_KEYS"; \
-		grep -E '^\s*[a-zA-Z_]' "$$DEST_CONFIG" | sed 's/\s*=.*//' | sort > "$$DEST_KEYS"; \
-		if diff -q "$$SOURCE_KEYS" "$$DEST_KEYS" > /dev/null 2>&1; then \
-			printf "$(COLOR_GREEN)✓ Config keys match, preserving user settings$(COLOR_RESET)\n"; \
-			printf "$(COLOR_YELLOW)  Existing config unchanged: $$DEST_CONFIG$(COLOR_RESET)\n"; \
-			if [ "$$(id -u)" != "0" ]; then \
-				sudo cp "$$SOURCE_CONFIG" "$$DEST_CONFIG.new"; \
-			else \
-				cp "$$SOURCE_CONFIG" "$$DEST_CONFIG.new"; \
-			fi; \
-			printf "$(COLOR_CYAN)  New default saved as: $$DEST_CONFIG.new$(COLOR_RESET)\n"; \
+		if [ "$$(id -u)" != "0" ]; then \
+			sudo "$$MERGE_UTIL" "$$SOURCE_CONFIG" "$$DEST_CONFIG"; \
 		else \
-			printf "$(COLOR_YELLOW)⚠ Config structure changed, backing up existing config$(COLOR_RESET)\n"; \
-			TIMESTAMP=$$(date +%Y%m%d-%H%M%S); \
-			BACKUP="$$DEST_CONFIG.backup.$$TIMESTAMP"; \
-			if [ "$$(id -u)" != "0" ]; then \
-				sudo cp "$$DEST_CONFIG" "$$BACKUP"; \
-				sudo cp "$$SOURCE_CONFIG" "$$DEST_CONFIG"; \
-			else \
-				cp "$$DEST_CONFIG" "$$BACKUP"; \
-				cp "$$SOURCE_CONFIG" "$$DEST_CONFIG"; \
-			fi; \
-			printf "$(COLOR_GREEN)✓ Backup created: $$BACKUP$(COLOR_RESET)\n"; \
-			printf "$(COLOR_YELLOW)⚠ New config installed: $$DEST_CONFIG$(COLOR_RESET)\n"; \
-			printf "$(COLOR_CYAN)  Please review and merge your settings from: $$BACKUP$(COLOR_RESET)\n"; \
+			"$$MERGE_UTIL" "$$SOURCE_CONFIG" "$$DEST_CONFIG"; \
 		fi; \
-		rm -f "$$SOURCE_KEYS" "$$DEST_KEYS"; \
 	fi
 	@printf " \n"
 	@printf "$(COLOR_CYAN)Setting up logging...$(COLOR_RESET)\n"
