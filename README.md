@@ -6,13 +6,13 @@ Tested in my T14 Gen4 Ryzen (Manjaro Plasma Wayland).
 ## Key Features
 
 - **Parallel Biometric Auth**: Face + fingerprint run simultaneously, first to succeed wins (~50-500ms)
-- **Hybrid Face Detection**: YuNet (fast detection) + SFace (fast recognition)
+- **Fast Face Detection**: LibFaceDetection CNN (embedded model, no external files) + SFace (recognition)
 - **Smart Lid Detection**: Skips biometric auth when lid closed, saves 5-second timeout
 - **Shoulder Surfing Detection**: Detects multiple faces and blanks screen if someone looks over your shoulder
 - **Live Camera Preview**: `faceid show` command displays real-time face detection visualization
 - **Single Binary**: C++20, no Python dependencies, low memory footprint (~50-100 MB)
 - **D-Bus Fingerprint**: Integrates with fprintd, uses existing enrollments
-- **Performance**: ~63ms total (YuNet ~50ms + SFace ~13ms), 4x faster than dlib
+- **Performance**: ~45-60ms total (LibFaceDetection ~40ms + SFace ~13ms), with AVX512 optimization
 - **Comprehensive Logging**: Audit trail at `/var/log/faceid.log`
 - **PAM Compatible**: Works with sudo, login, lock screen, GDM, LightDM
 
@@ -47,17 +47,14 @@ sudo meson install -C build
 
 Or use Makefile: `make build && sudo make install`
 
-### 3. Download Face Models
+### 3. Download Face Recognition Model
 
 ```bash
 # Create directories
 sudo mkdir -p /etc/faceid/models && cd /etc/faceid/models
 
-# Download YuNet face detection model (227KB)
-sudo wget -O face_detection_yunet_2023mar.onnx \
-    https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx
-
 # Download SFace face recognition model (37MB)
+# NOTE: Face detection uses LibFaceDetection with embedded model weights - no download needed!
 sudo wget -O face_recognition_sface_2021dec.onnx \
     https://github.com/opencv/opencv_zoo/raw/main/models/face_recognition_sface/face_recognition_sface_2021dec.onnx
 ```
@@ -213,7 +210,7 @@ cat /proc/acpi/button/lid/*/state   # Test detection
 A: No! Any combination works: face only, fingerprint only, both (faster), or neither (falls to password).
 
 **Q: Which is faster?**  
-A: Face (~63ms) is now faster than fingerprint (~200-400ms), but both run in parallel so first to succeed wins.
+A: Face (~45-60ms) is now faster than fingerprint (~200-400ms), but both run in parallel so first to succeed wins.
 
 **Q: What happens when lid is closed?**  
 A: Biometric auth is skipped immediately (< 1ms), goes straight to password.
@@ -253,16 +250,16 @@ sudo rm -rf /etc/faceid
 
 **Authentication Flow:**
 1. Check lid state → skip if closed
-2. Launch parallel threads: face (YuNet detection + SFace recognition) + fingerprint (D-Bus → fprintd)
+2. Launch parallel threads: face (LibFaceDetection CNN + SFace recognition) + fingerprint (D-Bus → fprintd)
 3. First success cancels the other → PAM_SUCCESS
 4. Both timeout (5s) → PAM_FAILURE → password prompt
 
 **Face Detection Pipeline:**
-- **Detection**: OpenCV YuNet (ONNX model, 227KB, ~50ms)
+- **Detection**: LibFaceDetection CNN (embedded 436KB model weights, ~40ms with AVX512)
 - **Recognition**: OpenCV SFace/MobileFaceNet (ONNX model, 37MB, ~13ms, 128D encodings)
-- **Hybrid advantage**: Fast lightweight detection + fast accurate recognition
+- **Advantages**: Embedded model (no external files), SIMD optimized (AVX512/AVX2/NEON), faster than OpenCV YuNet
 - **Multi-face Analysis**: Calculates center-to-center distances and face sizes to distinguish multiple people
-- **Speed**: 4x faster than dlib (63ms vs 246ms total time)
+- **Speed**: 45-60ms total (faster than YuNet's 63ms)
 
 **Shoulder Surfing Detection ("No Peek"):**
 - **Purpose**: Detects when additional faces appear in the frame (shoulder surfing attempt)
@@ -273,8 +270,8 @@ sudo rm -rf /etc/faceid
 
 **Performance:**
 - Auth time: ~50-500ms (parallel), ~50-100MB memory
-- Total face auth: ~63ms (YuNet 50ms + SFace 13ms)
-- Optimizations: YuNet fast detection, SFace fast recognition, frame downscaling, detection caching
+- Total face auth: ~45-60ms (LibFaceDetection 40ms + SFace 13ms)
+- Optimizations: LibFaceDetection with AVX512/AVX2/NEON SIMD, SFace fast recognition, frame downscaling, detection caching
 - Logging: `/var/log/faceid.log` with timestamps, durations, methods
 
 **Storage:**

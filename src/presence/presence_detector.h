@@ -8,7 +8,6 @@
 #include <chrono>
 #include <memory>
 #include <opencv2/opencv.hpp>
-#include <opencv2/objdetect.hpp>  // For FaceDetectorYN
 #include <opencv2/core/ocl.hpp>   // OpenCL support
 #include "presence_guard.h"
 
@@ -149,8 +148,8 @@ private:
     cv::Mat last_captured_frame_;  // Cache for peek detection (avoids reopening camera)
     
     // Detection (YuNet)
-    cv::Ptr<cv::FaceDetectorYN> detector_;
-    bool detector_initialized_;
+    // LibFaceDetection has embedded models - no detector instance needed
+    // No detector initialization needed - LibFaceDetection has embedded models
     
     // Guard conditions
     PresenceGuard guard_;

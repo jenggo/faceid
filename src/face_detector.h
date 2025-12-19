@@ -5,8 +5,8 @@
 #include <vector>
 #include <unordered_map>
 #include <opencv2/opencv.hpp>     // For cv::Mat and other OpenCV types
-#include <opencv2/objdetect.hpp>  // For FaceDetectorYN
 #include <opencv2/objdetect/face.hpp>  // For FaceRecognizerSF
+#include "libfacedetection/facedetectcnn.h"  // LibFaceDetection
 
 namespace faceid {
 
@@ -17,11 +17,11 @@ class FaceDetector {
 public:
     FaceDetector();
     
-    // Simplified: Only need recognition model path (no shape predictor needed)
+    // Only need recognition model path (no detection model needed - embedded in LibFaceDetection)
     bool loadModels(const std::string& face_recognition_model_path);
     
-    // YuNet returns cv::Rect instead of dlib::rectangle
-    std::vector<cv::Rect> detectFaces(const cv::Mat& frame, bool downscale = true);
+    // LibFaceDetection returns cv::Rect directly
+    std::vector<cv::Rect> detectFaces(const cv::Mat& frame, bool downscale = false);
     
     // Encode faces using SFace
     std::vector<FaceEncoding> encodeFaces(const cv::Mat& frame,
@@ -53,10 +53,7 @@ public:
     static int countDistinctFaces(const std::vector<cv::Rect>& faces, int min_distance);
 
 private:
-    // YuNet face detector
-    cv::Ptr<cv::FaceDetectorYN> yunet_detector_;
-    
-    // SFace face recognizer (replaces dlib)
+    // SFace face recognizer (unchanged - still using OpenCV for recognition)
     cv::Ptr<cv::FaceRecognizerSF> sface_recognizer_;
     
     bool models_loaded_ = false;

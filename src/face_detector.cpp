@@ -7,25 +7,12 @@
 namespace faceid {
 
 FaceDetector::FaceDetector() {
-    // Initialize YuNet detector
-    std::string yunet_model = "/etc/faceid/models/face_detection_yunet_2023mar.onnx";
-    
-    std::ifstream yunet_file(yunet_model);
-    if (yunet_file.good()) {
-        yunet_detector_ = cv::FaceDetectorYN::create(
-            yunet_model,
-            "",                    // config (empty for ONNX)
-            cv::Size(320, 240),   // input size  
-            0.6f,                 // score threshold
-            0.3f,                 // nms threshold
-            5000                  // top_k
-        );
-    }
+    // LibFaceDetection has embedded models - no initialization needed
 }
 
 bool FaceDetector::loadModels(const std::string& face_recognition_model_path) {
     try {
-        // Load SFace recognition model
+        // Load SFace recognition model (unchanged)
         sface_recognizer_ = cv::FaceRecognizerSF::create(
             face_recognition_model_path,
             ""  // config (empty for ONNX)
@@ -38,10 +25,6 @@ bool FaceDetector::loadModels(const std::string& face_recognition_model_path) {
 }
 
 std::vector<cv::Rect> FaceDetector::detectFaces(const cv::Mat& frame, bool downscale) {
-    if (yunet_detector_.empty()) {
-        return {};
-    }
-    
     // Check cache first
     if (use_cache_) {
         uint64_t frame_hash = hashFrame(frame);
@@ -54,58 +37,72 @@ std::vector<cv::Rect> FaceDetector::detectFaces(const cv::Mat& frame, bool downs
     cv::Mat processed_frame = frame;
     double scale = 1.0;
     
-    // Downscale for faster detection if enabled
+    // Downscale for faster detection if enabled (optional - LibFaceDetection is already fast)
     if (downscale && frame.cols > 640) {
         scale = 640.0 / frame.cols;
         cv::resize(frame, processed_frame, cv::Size(), scale, scale, cv::INTER_AREA);
     }
     
-    // Resize to YuNet's expected input size (320x240)
-    cv::Mat resized;
-    cv::resize(processed_frame, resized, cv::Size(320, 240));
+    // LibFaceDetection detection
+    // Allocate result buffer (fixed size required by LibFaceDetection)
+    unsigned char result_buffer[0x20000];
     
-    // Detect faces using YuNet
-    cv::Mat yunet_faces;
-    yunet_detector_->detect(resized, yunet_faces);
+    // Call LibFaceDetection
+    // Note: LibFaceDetection expects BGR format (OpenCV default)
+    int* pResults = facedetect_cnn(
+        result_buffer,
+        (unsigned char*)processed_frame.data,
+        processed_frame.cols,
+        processed_frame.rows,
+        (int)processed_frame.step[0]
+    );
     
-    // Convert YuNet results to cv::Rect
+    // Extract results
     std::vector<cv::Rect> faces;
-    double scale_x = static_cast<double>(processed_frame.cols) / 320.0;
-    double scale_y = static_cast<double>(processed_frame.rows) / 240.0;
     
-    for (int i = 0; i < yunet_faces.rows; i++) {
-        // YuNet output: x, y, w, h, ...landmarks..., confidence
-        float x = yunet_faces.at<float>(i, 0);
-        float y = yunet_faces.at<float>(i, 1);
-        float w = yunet_faces.at<float>(i, 2);
-        float h = yunet_faces.at<float>(i, 3);
+    if (pResults) {
+        int face_count = *pResults;  // First element is the count
         
-        // Scale back to processed_frame size
-        x *= scale_x;
-        y *= scale_y;
-        w *= scale_x;
-        h *= scale_y;
+        // IMPORTANT: facedetect_cnn returns data as short integers, not FaceRect structs!
+        // Format: [count(int)] + N * [score(short), x(short), y(short), w(short), h(short), landmarks(10 shorts)]
+        short* face_data = (short*)(pResults + 1);
         
-        // Scale back to original frame size if we downscaled
-        if (scale != 1.0) {
-            x /= scale;
-            y /= scale;
-            w /= scale;
-            h /= scale;
-        }
+        // Confidence threshold (score is stored as short, 0-100 scale)
+        const int min_confidence_score = 60;  // 60/100 = 0.6
         
-        // Convert to cv::Rect
-        cv::Rect face(
-            static_cast<int>(x),
-            static_cast<int>(y),
-            static_cast<int>(w),
-            static_cast<int>(h)
-        );
-        
-        // Ensure rect is within frame bounds
-        face &= cv::Rect(0, 0, frame.cols, frame.rows);
-        if (face.width > 0 && face.height > 0) {
-            faces.push_back(face);
+        for (int i = 0; i < face_count; i++) {
+            // Each face has 16 shorts: score(1) + bbox(4) + landmarks(10) + padding(1)
+            short* p = face_data + 16 * i;
+            
+            // Parse data (see facedetectcnn-model.cpp lines 228-239)
+            int score = p[0];           // Score * 100 (0-100 range)
+            int x = p[1];
+            int y = p[2];
+            int w = p[3];
+            int h = p[4];
+            // landmarks at p[5] through p[14]
+            
+            // Check confidence score
+            if (score < min_confidence_score) {
+                continue;  // Skip low confidence detections
+            }
+            
+            // Scale back to original frame size if we downscaled
+            if (scale != 1.0) {
+                x = static_cast<int>(x / scale);
+                y = static_cast<int>(y / scale);
+                w = static_cast<int>(w / scale);
+                h = static_cast<int>(h / scale);
+            }
+            
+            // Convert to cv::Rect
+            cv::Rect face(x, y, w, h);
+            
+            // Ensure rect is within frame bounds
+            face &= cv::Rect(0, 0, frame.cols, frame.rows);
+            if (face.width > 0 && face.height > 0) {
+                faces.push_back(face);
+            }
         }
     }
     

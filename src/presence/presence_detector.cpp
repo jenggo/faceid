@@ -1,4 +1,5 @@
 #include "presence_detector.h"
+#include "../libfacedetection/facedetectcnn.h"
 #include "../logger.h"
 #include "../face_detector.h"
 #include <fstream>
@@ -17,7 +18,7 @@ PresenceDetector::PresenceDetector(
     int max_scan_failures,
     std::chrono::minutes max_idle_time)
     : camera_device_(camera_device)
-    , detector_initialized_(false)
+    
     , current_state_(State::ACTIVELY_PRESENT)
     , last_activity_(std::chrono::steady_clock::now())
     , state_entry_time_(std::chrono::steady_clock::now())
@@ -54,12 +55,6 @@ bool PresenceDetector::initialize() {
 bool PresenceDetector::start() {
     if (running_.load()) {
         return true; // Already running
-    }
-    
-    if (!detector_initialized_) {
-        if (!initialize()) {
-            return false;
-        }
     }
     
     Logger& logger = Logger::getInstance();
@@ -365,54 +360,8 @@ void PresenceDetector::transitionTo(State new_state) {
 }
 
 bool PresenceDetector::ensureDetectorInitialized() {
-    if (detector_initialized_) {
-        return true;
-    }
-    
-    Logger& logger = Logger::getInstance();
-    logger.info("Lazy loading YuNet face detector...");
-    
-    try {
-        std::string model_path = "/etc/faceid/models/face_detection_yunet_2023mar.onnx";
-        
-        // Check if model file exists
-        std::ifstream model_file(model_path);
-        if (!model_file.good()) {
-            char log_buf[512];
-            snprintf(log_buf, sizeof(log_buf), 
-                    "YuNet model not found at %s", model_path.c_str());
-            logger.error(log_buf);
-            return false;
-        }
-        model_file.close();
-        
-        // Create YuNet detector with optimized settings
-        // Parameters: model_path, config, input_size, score_threshold, nms_threshold, top_k
-        detector_ = cv::FaceDetectorYN::create(
-            model_path,
-            "",                      // No config file needed
-            cv::Size(320, 240),      // Input size (must match resize in detectFace)
-            0.6f,                    // Score threshold
-            0.3f,                    // NMS threshold
-            5000                     // Top K
-        );
-        
-        if (detector_.empty()) {
-            logger.error("Failed to create YuNet detector");
-            return false;
-        }
-        
-        detector_initialized_ = true;
-        logger.info("YuNet face detector loaded successfully");
-        return true;
-        
-    } catch (const std::exception& e) {
-        char log_buf[512];
-        snprintf(log_buf, sizeof(log_buf), 
-                "Exception loading YuNet detector: %s", e.what());
-        logger.error(log_buf);
-        return false;
-    }
+    // LibFaceDetection has embedded models - no initialization needed
+    return true;
 }
 
 bool PresenceDetector::detectFace() {
@@ -433,47 +382,64 @@ bool PresenceDetector::detectFace() {
                     "Camera shutter closed, skipping face detection (closed count: %d)",
                     consecutive_shutter_closed_scans_);
             Logger::getInstance().info(log_buf);
+            last_shutter_state_ = ShutterState::CLOSED;
             failed_detections_++;
             return false;
         }
         
         if (shutter == ShutterState::UNCERTAIN) {
             Logger::getInstance().debug("Camera image is very dark - shutter might be closed");
-            // Continue with detection anyway - might just be a dark room
         }
+        last_shutter_state_ = shutter;
         
-        // Lazy load detector if not already loaded
-        if (!ensureDetectorInitialized()) {
-            Logger::getInstance().error("Cannot detect face: YuNet detector not available");
-            failed_detections_++;
-            return false;
-        }
+        // LibFaceDetection detection
+        unsigned char result_buffer[0x20000];
+        int* pResults = facedetect_cnn(
+            result_buffer,
+            (unsigned char*)frame.data,
+            frame.cols, frame.rows,
+            (int)frame.step[0]
+        );
         
-        // Shutter is open, proceed with face detection
-        // Resize for faster detection (YuNet expects 320x240 as configured)
-        cv::Mat resized;
-        cv::resize(frame, resized, cv::Size(320, 240));
-        
-        // Detect faces using YuNet
-        cv::Mat faces;
-        detector_->detect(resized, faces);
-        
-        // faces.rows contains the number of detected faces
-        // Each row has: x, y, w, h, x_re, y_re, x_le, y_le, x_nt, y_nt, x_rcm, y_rcm, x_lcm, y_lcm, confidence
-        bool detected = (faces.rows > 0);
-        
-        if (detected) {
-            // Log confidence of first detected face
-            float confidence = faces.at<float>(0, 14);
-            Logger::getInstance().debug("Face detected with confidence: " + 
-                                      std::to_string(confidence));
+        bool detected = false;
+        if (pResults) {
+            int face_count = *pResults;
+            
+            // IMPORTANT: facedetect_cnn returns data as short integers, not FaceRect structs!
+            // Format: [score(short), x(short), y(short), w(short), h(short), landmarks(10 shorts)]
+            short* face_data = (short*)(pResults + 1);
+            
+            // Confidence threshold - score is 0-100 range (stored as short)
+            const int min_confidence_score = 60;  // 60/100 = 0.6
+            
+            // Check if any face meets confidence threshold
+            for (int i = 0; i < face_count; i++) {
+                short* p = face_data + 16 * i;  // Each face is 16 shorts
+                int score = p[0];  // Score is in 0-100 range
+                
+                if (score >= min_confidence_score) {
+                    detected = true;
+                    Logger::getInstance().debug("Face detected with confidence: " + 
+                                              std::to_string(score / 100.0));
+                    // Cache frame for peek detection
+                    last_captured_frame_ = frame.clone();
+                    break;
+                }
+            }
+            
+            if (!detected && face_count > 0) {
+                short* p = face_data;
+                int best_score = p[0];
+                Logger::getInstance().debug("Faces detected but below confidence threshold (best: " + 
+                                          std::to_string(best_score / 100.0) + ")");
+            }
         }
         
         return detected;
         
     } catch (const std::exception& e) {
         Logger::getInstance().error(std::string("Face detection error: ") + e.what());
-        last_captured_frame_ = cv::Mat();  // Clear cached frame
+        last_captured_frame_ = cv::Mat();
         return false;
     }
 }
@@ -906,38 +872,39 @@ bool PresenceDetector::detectPeek(const cv::Mat& frame) {
     Logger& logger = Logger::getInstance();
     
     try {
-        // Resize for faster detection (YuNet expects 320x240 as configured)
-        cv::Mat resized;
-        cv::resize(frame, resized, cv::Size(320, 240));
+        // LibFaceDetection detection
+        unsigned char result_buffer[0x20000];
+        int* pResults = facedetect_cnn(
+            result_buffer,
+            (unsigned char*)frame.data,
+            frame.cols, frame.rows,
+            (int)frame.step[0]
+        );
         
-        // Detect faces using YuNet
-        cv::Mat faces;
-        detector_->detect(resized, faces);
-        
-        if (faces.rows == 0) {
+        if (!pResults || *pResults == 0) {
             return false;  // No faces at all
         }
         
-        // Convert YuNet results to cv::Rect for analysis
-        std::vector<cv::Rect> face_rects;
-        double scale_x = static_cast<double>(frame.cols) / 320.0;
-        double scale_y = static_cast<double>(frame.rows) / 240.0;
+        int face_count = *pResults;
         
-        for (int i = 0; i < faces.rows; i++) {
-            float x = faces.at<float>(i, 0) * scale_x;
-            float y = faces.at<float>(i, 1) * scale_y;
-            float w = faces.at<float>(i, 2) * scale_x;
-            float h = faces.at<float>(i, 3) * scale_y;
-            float confidence = faces.at<float>(i, 14);
+        // IMPORTANT: facedetect_cnn returns data as short integers, not FaceRect structs!
+        short* face_data = (short*)(pResults + 1);
+        
+        // Convert to cv::Rect for analysis
+        std::vector<cv::Rect> face_rects;
+        
+        for (int i = 0; i < face_count; i++) {
+            short* p = face_data + 16 * i;  // Each face is 16 shorts
             
-            // Only count faces with reasonable confidence
-            if (confidence > 0.6) {
-                cv::Rect face(
-                    static_cast<int>(x),
-                    static_cast<int>(y),
-                    static_cast<int>(w),
-                    static_cast<int>(h)
-                );
+            int score = p[0];  // Score in 0-100 range
+            int x = p[1];
+            int y = p[2];
+            int w = p[3];
+            int h = p[4];
+            
+            // Only count faces with reasonable confidence (60/100 = 0.6)
+            if (score > 60) {
+                cv::Rect face(x, y, w, h);
                 
                 // Filter out faces that are too small (too far away to see screen)
                 double face_size_percent = static_cast<double>(w) / frame.cols;
