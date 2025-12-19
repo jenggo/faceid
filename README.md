@@ -8,6 +8,8 @@ Tested in my T14 Gen4 Ryzen (Manjaro Plasma Wayland).
 - **Parallel Biometric Auth**: Face + fingerprint run simultaneously, first to succeed wins (~50-500ms)
 - **Hybrid Face Detection**: YuNet (fast detection) + SFace (fast recognition)
 - **Smart Lid Detection**: Skips biometric auth when lid closed, saves 5-second timeout
+- **Shoulder Surfing Detection**: Detects multiple faces and blanks screen if someone looks over your shoulder
+- **Live Camera Preview**: `faceid show` command displays real-time face detection visualization
 - **Single Binary**: C++20, no Python dependencies, low memory footprint (~50-100 MB)
 - **D-Bus Fingerprint**: Integrates with fprintd, uses existing enrollments
 - **Performance**: ~63ms total (YuNet ~50ms + SFace ~13ms), 4x faster than dlib
@@ -125,6 +127,19 @@ enable_fingerprint = true
 enable_optimizations = true
 check_lid_state = true   # Skip biometric auth when lid closed
 
+[no_peek]
+enabled = true
+min_face_distance_pixels = 80    # Min distance between faces to count as separate person
+min_face_size_percent = 0.08     # Min face size (% of screen width) to trigger blanking
+peek_detection_delay_seconds = 2 # Delay before blanking screen
+unblank_delay_seconds = 3        # Grace period before re-enabling screen
+
+[schedule]
+enabled = false
+active_days = 1,2,3,4,5          # Weekdays only (1=Monday, 7=Sunday)
+time_start = 0900                # Start time (HHMM format)
+time_end = 1700                  # End time (HHMM format)
+
 [logging]
 log_file = /var/log/faceid.log
 log_level = INFO
@@ -134,6 +149,7 @@ log_level = INFO
 
 ```bash
 faceid devices              # List cameras
+faceid show                 # Live camera preview with face detection
 sudo faceid add <user>      # Enroll face
 sudo faceid remove <user>   # Remove face model
 sudo faceid test <user>     # Test recognition
@@ -209,6 +225,15 @@ A: No camera/sensor over SSH. Password will be used automatically.
 - Face: `sudo faceid remove $(whoami)`
 - Fingerprint: `fprintd-delete $(whoami)`
 
+**Q: What is shoulder surfing detection?**  
+A: The "no peek" feature detects multiple faces in the camera frame and blanks the screen if someone stands behind you. Adjustable via `min_face_distance_pixels` and `min_face_size_percent` in the `[no_peek]` config section.
+
+**Q: How do I preview the camera and see face detection?**  
+A: Run `faceid show` for a live camera feed with real-time face detection rectangles (green for primary face, yellow for additional faces). Shows FPS, face count, and resolution.
+
+**Q: What does schedule-based presence do?**  
+A: Presence detection can be limited to specific days/times (e.g., weekdays 9-5). Enable via `enabled = true` in `[schedule]` section and set `active_days` and time range.
+
 ## Uninstallation
 
 ```bash
@@ -236,7 +261,15 @@ sudo rm -rf /etc/faceid
 - **Detection**: OpenCV YuNet (ONNX model, 227KB, ~50ms)
 - **Recognition**: OpenCV SFace/MobileFaceNet (ONNX model, 37MB, ~13ms, 128D encodings)
 - **Hybrid advantage**: Fast lightweight detection + fast accurate recognition
+- **Multi-face Analysis**: Calculates center-to-center distances and face sizes to distinguish multiple people
 - **Speed**: 4x faster than dlib (63ms vs 246ms total time)
+
+**Shoulder Surfing Detection ("No Peek"):**
+- **Purpose**: Detects when additional faces appear in the frame (shoulder surfing attempt)
+- **Method**: Compares face distances and sizes; if multiple distinct faces detected, blanks screen
+- **Configurable**: `min_face_distance_pixels`, `min_face_size_percent`, detection/unblank delays
+- **Behavior**: Screen blanks after `peek_detection_delay_seconds` if extra face persists; unblank delay prevents flickering
+- **Security**: Complements biometric auth by protecting screen content from over-the-shoulder viewers
 
 **Performance:**
 - Auth time: ~50-500ms (parallel), ~50-100MB memory
@@ -247,6 +280,13 @@ sudo rm -rf /etc/faceid
 **Storage:**
 - Face models: `/etc/faceid/models/<user>.json` (128D SFace encodings)
 - Fingerprints: fprintd database (`/var/lib/fprint/`, managed via D-Bus)
+
+**Live Camera Preview (`faceid show`):**
+- **Purpose**: Debug camera setup and visualize face detection in real-time
+- **Display**: Green rectangle for primary (closest) face, yellow for additional faces
+- **Info Banner**: Shows detected face count, FPS, and resolution
+- **Controls**: Press 'q' or ESC to quit
+- **Use Cases**: Verify camera is working, test detection sensitivity, check lighting conditions
 
 ## Credits
 

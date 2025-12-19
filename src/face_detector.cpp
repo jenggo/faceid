@@ -255,4 +255,67 @@ uint64_t FaceDetector::hashFrame(const cv::Mat& frame) {
     return hash;
 }
 
+// Multi-face detection helpers for "no peek" feature
+double FaceDetector::faceDistance(const cv::Rect& face1, const cv::Rect& face2) {
+    // Calculate center points
+    double cx1 = face1.x + face1.width / 2.0;
+    double cy1 = face1.y + face1.height / 2.0;
+    double cx2 = face2.x + face2.width / 2.0;
+    double cy2 = face2.y + face2.height / 2.0;
+    
+    // Euclidean distance
+    double dx = cx2 - cx1;
+    double dy = cy2 - cy1;
+    return std::sqrt(dx * dx + dy * dy);
+}
+
+bool FaceDetector::areDistinctFaces(const cv::Rect& face1, const cv::Rect& face2, int min_distance) {
+    double distance = faceDistance(face1, face2);
+    return distance >= min_distance;
+}
+
+double FaceDetector::getFaceSizePercent(const cv::Rect& face, int frame_width) {
+    if (frame_width <= 0) return 0.0;
+    return static_cast<double>(face.width) / frame_width;
+}
+
+int FaceDetector::countDistinctFaces(const std::vector<cv::Rect>& faces, int min_distance) {
+    if (faces.empty()) return 0;
+    if (faces.size() == 1) return 1;
+    
+    // Mark faces that are distinct
+    std::vector<bool> is_distinct(faces.size(), true);
+    
+    // Compare each pair of faces
+    for (size_t i = 0; i < faces.size(); i++) {
+        if (!is_distinct[i]) continue;
+        
+        for (size_t j = i + 1; j < faces.size(); j++) {
+            if (!is_distinct[j]) continue;
+            
+            // If faces are too close, mark the smaller one as not distinct
+            if (!areDistinctFaces(faces[i], faces[j], min_distance)) {
+                // Keep the larger face (closer to camera)
+                int area_i = faces[i].width * faces[i].height;
+                int area_j = faces[j].width * faces[j].height;
+                
+                if (area_i >= area_j) {
+                    is_distinct[j] = false;
+                } else {
+                    is_distinct[i] = false;
+                    break;  // Face i is not distinct, skip to next i
+                }
+            }
+        }
+    }
+    
+    // Count distinct faces
+    int count = 0;
+    for (bool distinct : is_distinct) {
+        if (distinct) count++;
+    }
+    
+    return count;
+}
+
 } // namespace faceid

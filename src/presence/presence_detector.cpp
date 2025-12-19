@@ -1,5 +1,6 @@
 #include "presence_detector.h"
 #include "../logger.h"
+#include "../face_detector.h"
 #include <fstream>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -38,35 +39,11 @@ bool PresenceDetector::initialize() {
     Logger& logger = Logger::getInstance();
     
     try {
-        // Set YuNet model path (will be installed to /etc/faceid/models/)
-        std::string model_path = "/etc/faceid/models/face_detection_yunet_2023mar.onnx";
-        
-        // Check if model exists
-        std::ifstream model_file(model_path);
-        if (!model_file.good()) {
-            logger.error("YuNet model not found at: " + model_path);
-            logger.error("Please run: sudo cp models/face_detection_yunet_2023mar.onnx /etc/faceid/models/");
-            return false;
-        }
-        
-        // Initialize YuNet face detector
-        detector_ = cv::FaceDetectorYN::create(
-            model_path,
-            "",                    // config (empty for ONNX)
-            cv::Size(320, 240),   // input size (matches our resize)
-            0.6f,                 // score threshold (lower = more strict)
-            0.3f,                 // nms threshold
-            5000                  // top_k
-        );
-        
-        detector_initialized_ = true;
-        logger.info("YuNet face detector initialized successfully");
-        
         // Detect display server (X11 vs Wayland)
         is_wayland_ = detectDisplayServer();
         logger.info(std::string("Display server: ") + (is_wayland_ ? "Wayland" : "X11"));
         
-        logger.info("Presence detector initialized successfully");
+        logger.info("Presence detector initialized successfully (lazy loading enabled)");
         return true;
     } catch (const std::exception& e) {
         logger.error(std::string("Failed to initialize presence detector: ") + e.what());
@@ -177,6 +154,19 @@ void PresenceDetector::detectionLoop() {
         // Update guard conditions
         guard_.updateState();
         
+        // Check schedule first
+        if (!isWithinSchedule()) {
+            // Outside scheduled hours/days, pause detection
+            // If we were scanning, transition to ACTIVELY_PRESENT (assume user present)
+            if (current_state_ == State::IDLE_WITH_SCANNING || 
+                current_state_ == State::AWAY_CONFIRMED) {
+                Logger::getInstance().info("Outside schedule - pausing presence detection");
+                transitionTo(State::ACTIVELY_PRESENT);
+            }
+            std::this_thread::sleep_for(std::chrono::seconds(60));  // Check every minute
+            continue;
+        }
+        
         if (!guard_.shouldRunPresenceDetection()) {
             // Guard conditions not met, pause detection
             std::this_thread::sleep_for(std::chrono::milliseconds(1000));
@@ -191,7 +181,8 @@ void PresenceDetector::detectionLoop() {
             std::this_thread::sleep_for(std::chrono::milliseconds(scan_interval_ms_));
         } else {
             // Not scanning, just monitoring activity
-            std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+            // Use longer interval to reduce memory churn from /proc/interrupts reads
+            std::this_thread::sleep_for(std::chrono::seconds(2));
         }
     }
 }
@@ -207,10 +198,15 @@ void PresenceDetector::updateStateMachine() {
     static auto last_debug_log = std::chrono::steady_clock::now();
     if (std::chrono::duration_cast<std::chrono::seconds>(now - last_debug_log).count() >= 5) {
         bool has_activity = hasRecentActivity();
-        logger.info("State: " + getStateString() + 
-                   ", Inactive time: " + std::to_string(inactive_time / 1000) + "s" +
-                   ", Has recent activity: " + (has_activity ? "YES" : "NO") +
-                   ", Threshold: " + std::to_string(inactive_threshold_ms_ / 1000) + "s");
+        // Use static buffer to avoid string allocation overhead
+        static char log_buf[256];
+        snprintf(log_buf, sizeof(log_buf), 
+                "State: %s, Inactive time: %lds, Has recent activity: %s, Threshold: %ds",
+                getStateString().c_str(), 
+                (long)(inactive_time / 1000),
+                has_activity ? "YES" : "NO",
+                inactive_threshold_ms_ / 1000);
+        logger.info(log_buf);
         last_debug_log = now;
     }
     
@@ -241,24 +237,30 @@ void PresenceDetector::updateStateMachine() {
             }
             
             // Scan for face
-            logger.info("Scanning for face... (failures so far: " + std::to_string(scan_failures_) + ")");
+            static char scan_buf[128];
+            snprintf(scan_buf, sizeof(scan_buf), "Scanning for face... (failures so far: %d)", scan_failures_);
+            logger.info(scan_buf);
             bool face_detected = detectFace();
             
             // Check if failure was due to closed shutter
             if (!face_detected && last_shutter_state_ == ShutterState::CLOSED) {
                 consecutive_shutter_closed_scans_++;
-                logger.warning("Camera shutter is CLOSED (scan #" + 
-                              std::to_string(consecutive_shutter_closed_scans_) + 
-                              ") - pausing presence detection");
+                static char shutter_buf[128];
+                snprintf(shutter_buf, sizeof(shutter_buf), 
+                        "Camera shutter is CLOSED (scan #%d) - pausing presence detection",
+                        consecutive_shutter_closed_scans_);
+                logger.warning(shutter_buf);
                 
                 // Don't count as "away" - user may have closed shutter for privacy
                 // Just pause scanning and stay in IDLE_WITH_SCANNING state
                 
                 // If shutter has been closed for configured timeout, lock anyway
                 if (consecutive_shutter_closed_scans_ * scan_interval_ms_ > shutter_timeout_ms_) {
-                    logger.info("Camera shutter closed for " + 
-                               std::to_string(shutter_timeout_ms_ / 60000) + 
-                               "+ minutes - locking anyway");
+                    static char timeout_buf[128];
+                    snprintf(timeout_buf, sizeof(timeout_buf), 
+                            "Camera shutter closed for %d+ minutes - locking anyway",
+                            shutter_timeout_ms_ / 60000);
+                    logger.info(timeout_buf);
                     transitionTo(State::AWAY_CONFIRMED);
                     lockScreen();
                 }
@@ -275,17 +277,32 @@ void PresenceDetector::updateStateMachine() {
                 transitionTo(State::ACTIVELY_PRESENT);
                 last_activity_ = now;
                 scan_failures_ = 0;  // Reset failure counter
+                
+                // Check for peek (shoulder surfing) using cached frame
+                // This avoids reopening the camera after it was just released
+                if (no_peek_enabled_ && !last_captured_frame_.empty()) {
+                    bool peek = detectPeek(last_captured_frame_);
+                    updatePeekState(peek);
+                    // Clear cached frame after use
+                    last_captured_frame_ = cv::Mat();
+                }
             } else {
                 // No face detected (and shutter is open)
                 failed_detections_++;
                 scan_failures_++;
-                logger.info("No face detected (failure " + std::to_string(scan_failures_) + 
-                           " of " + std::to_string(max_scan_failures_) + ")");
+                static char failure_buf[128];
+                snprintf(failure_buf, sizeof(failure_buf), 
+                        "No face detected (failure %d of %d)",
+                        scan_failures_, max_scan_failures_);
+                logger.info(failure_buf);
                 
                 if (scan_failures_ >= max_scan_failures_) {
                     // Too many failures, user is away
-                    logger.info("User confirmed away after " + 
-                               std::to_string(scan_failures_) + " failed scans - locking screen");
+                    static char away_buf[128];
+                    snprintf(away_buf, sizeof(away_buf), 
+                            "User confirmed away after %d failed scans - locking screen",
+                            scan_failures_);
+                    logger.info(away_buf);
                     transitionTo(State::AWAY_CONFIRMED);
                     lockScreen();
                 }
@@ -293,8 +310,11 @@ void PresenceDetector::updateStateMachine() {
             
             // Also check timeout
             if (inactive_time > max_idle_time_ms_) {
-                logger.info("User confirmed away after " + 
-                           std::to_string(inactive_time / 1000) + " seconds idle - locking screen");
+                static char idle_buf[128];
+                snprintf(idle_buf, sizeof(idle_buf), 
+                        "User confirmed away after %ld seconds idle - locking screen",
+                        (long)(inactive_time / 1000));
+                logger.info(idle_buf);
                 transitionTo(State::AWAY_CONFIRMED);
                 lockScreen();
             }
@@ -344,29 +364,89 @@ void PresenceDetector::transitionTo(State new_state) {
     state_entry_time_ = std::chrono::steady_clock::now();
 }
 
-bool PresenceDetector::detectFace() {
-    total_scans_++;
+bool PresenceDetector::ensureDetectorInitialized() {
+    if (detector_initialized_) {
+        return true;
+    }
+    
+    Logger& logger = Logger::getInstance();
+    logger.info("Lazy loading YuNet face detector...");
     
     try {
-        cv::Mat frame = captureFrame();
-        if (frame.empty()) {
+        std::string model_path = "/etc/faceid/models/face_detection_yunet_2023mar.onnx";
+        
+        // Check if model file exists
+        std::ifstream model_file(model_path);
+        if (!model_file.good()) {
+            char log_buf[512];
+            snprintf(log_buf, sizeof(log_buf), 
+                    "YuNet model not found at %s", model_path.c_str());
+            logger.error(log_buf);
+            return false;
+        }
+        model_file.close();
+        
+        // Create YuNet detector with optimized settings
+        // Parameters: model_path, config, input_size, score_threshold, nms_threshold, top_k
+        detector_ = cv::FaceDetectorYN::create(
+            model_path,
+            "",                      // No config file needed
+            cv::Size(320, 240),      // Input size (must match resize in detectFace)
+            0.6f,                    // Score threshold
+            0.3f,                    // NMS threshold
+            5000                     // Top K
+        );
+        
+        if (detector_.empty()) {
+            logger.error("Failed to create YuNet detector");
             return false;
         }
         
-        // CHECK SHUTTER STATE BEFORE DETECTING FACE
-        ShutterState shutter = detectShutterState(frame);
-        last_shutter_state_ = shutter;
+        detector_initialized_ = true;
+        logger.info("YuNet face detector loaded successfully");
+        return true;
         
+    } catch (const std::exception& e) {
+        char log_buf[512];
+        snprintf(log_buf, sizeof(log_buf), 
+                "Exception loading YuNet detector: %s", e.what());
+        logger.error(log_buf);
+        return false;
+    }
+}
+
+bool PresenceDetector::detectFace() {
+    try {
+        total_scans_++;
+        
+        cv::Mat frame = captureFrame();
+        if (frame.empty()) {
+            failed_detections_++;
+            return false;
+        }
+        
+        // Check if camera shutter is closed
+        ShutterState shutter = detectShutterState(frame);
         if (shutter == ShutterState::CLOSED) {
-            Logger::getInstance().warning("Camera shutter is CLOSED - pausing face detection");
-            // Return special value to indicate shutter closed (not a failure)
-            // This will be handled in updateStateMachine()
-            return false;  // Will be handled specially by checking last_shutter_state_
+            char log_buf[256];
+            snprintf(log_buf, sizeof(log_buf), 
+                    "Camera shutter closed, skipping face detection (closed count: %d)",
+                    consecutive_shutter_closed_scans_);
+            Logger::getInstance().info(log_buf);
+            failed_detections_++;
+            return false;
         }
         
         if (shutter == ShutterState::UNCERTAIN) {
             Logger::getInstance().debug("Camera image is very dark - shutter might be closed");
             // Continue with detection anyway - might just be a dark room
+        }
+        
+        // Lazy load detector if not already loaded
+        if (!ensureDetectorInitialized()) {
+            Logger::getInstance().error("Cannot detect face: YuNet detector not available");
+            failed_detections_++;
+            return false;
         }
         
         // Shutter is open, proceed with face detection
@@ -393,6 +473,7 @@ bool PresenceDetector::detectFace() {
         
     } catch (const std::exception& e) {
         Logger::getInstance().error(std::string("Face detection error: ") + e.what());
+        last_captured_frame_ = cv::Mat();  // Clear cached frame
         return false;
     }
 }
@@ -508,16 +589,19 @@ bool PresenceDetector::detectDisplayServer() {
     FILE* pipe = popen("loginctl show-session $(loginctl list-sessions --no-legend | awk '{print $1}' | head -1) -p Type --value 2>/dev/null | head -1", "r");
     if (pipe) {
         char buffer[32];
+        bool wayland = false;
         if (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
-            pclose(pipe);
             std::string type(buffer);
             // Remove whitespace
             type.erase(type.find_last_not_of(" \n\r\t") + 1);
             if (type == "wayland") {
-                return true;  // Wayland
+                wayland = true;
             }
         }
-        pclose(pipe);
+        pclose(pipe);  // Only close once
+        if (wayland) {
+            return true;  // Wayland
+        }
     }
     
     return false;  // X11 or unknown (assume X11)
@@ -601,54 +685,141 @@ PresenceDetector::Statistics PresenceDetector::getStatistics() const {
 
 // NEW: Input device detection using /dev/input mtime
 time_t PresenceDetector::getLastInputDeviceActivity() const {
+    // Cache activity checks to reduce /proc/interrupts reads and memory churn
+    auto now = std::chrono::steady_clock::now();
+    auto time_since_last_check = std::chrono::duration_cast<std::chrono::seconds>(
+        now - last_activity_check_).count();
+    
+    // Return cached value if checked recently (within activity_cache_duration_)
+    if (time_since_last_check < activity_cache_duration_.count()) {
+        return cached_last_activity_;
+    }
+    
+    // Time to perform actual check
+    last_activity_check_ = now;
+    
     // Use /proc/interrupts to track input activity
-    // This works for both PS/2 (i8042) and USB input devices
+    // This works for PS/2 (i8042), USB, and Bluetooth (xhci_hcd) input devices
+    
+    Logger& logger = Logger::getInstance();
     
     std::ifstream interrupts("/proc/interrupts");
     if (!interrupts.is_open()) {
-        return 0;
+        logger.debug("Failed to open /proc/interrupts");
+        return cached_last_activity_;  // Return cached value on error
     }
     
-    unsigned long long max_count = 0;
-    std::string line;
+    unsigned long long total_count = 0;
+    static std::string line;  // Static to avoid reallocation
+    line.clear();
+    line.reserve(256);  // Pre-allocate to reduce reallocations
     
     while (std::getline(interrupts, line)) {
         // Look for input-related interrupts:
-        // - i8042: PS/2 keyboard/mouse controller
-        // - usb-hid: USB input devices
+        // - i8042: PS/2 keyboard/mouse controller (laptop built-in keyboard/touchpad)
+        // - amd_gpio: GPIO-based i2c devices (modern touchscreens/touchpads)
+        // NOTE: Removed xhci_hcd and usb because they include camera and other non-input USB devices
+        // which cause false positive activity detection
         if (line.find("i8042") != std::string::npos ||
-            line.find("usb") != std::string::npos) {
+            line.find("amd_gpio") != std::string::npos) {
             
-            // Parse interrupt counts from all CPUs
-            std::istringstream iss(line);
-            std::string irq_num;
-            iss >> irq_num;  // Skip IRQ number
+            // Parse interrupt counts from all CPUs and sum them
+            // Use C-style parsing to avoid istringstream allocation overhead
+            const char* ptr = line.c_str();
             
+            // Skip IRQ number (everything before first colon)
+            while (*ptr && *ptr != ':') ptr++;
+            if (*ptr == ':') ptr++;
+            
+            // Sum all CPU interrupt counts
             unsigned long long count;
-            while (iss >> count) {
-                if (count > max_count) {
-                    max_count = count;
+            while (*ptr) {
+                while (*ptr == ' ' || *ptr == '\t') ptr++;  // Skip whitespace
+                if (*ptr >= '0' && *ptr <= '9') {
+                    char* end;
+                    count = strtoull(ptr, &end, 10);
+                    total_count += count;
+                    ptr = end;
+                } else {
+                    break;  // Reached device name part
                 }
             }
         }
     }
     
-    // If no interrupts found or count is 0, return 0
-    if (max_count == 0) {
-        return 0;
+    interrupts.close();  // Explicit close to free resources immediately
+    
+    // If no interrupts found or count is 0, return cached value
+    if (total_count == 0) {
+        logger.debug("No input interrupts found in /proc/interrupts");
+        return cached_last_activity_;
     }
     
-    // Store the interrupt count
+    // Store the interrupt count (static for persistence across calls)
     static unsigned long long last_interrupt_count = 0;
     static time_t last_update_time = time(nullptr);
     
-    // If interrupt count increased, update timestamp
-    if (max_count > last_interrupt_count) {
-        last_interrupt_count = max_count;
+    // If interrupt count increased, update timestamp  
+    if (total_count > last_interrupt_count) {
+        last_interrupt_count = total_count;
         last_update_time = time(nullptr);
     }
     
+    // Update cache
+    cached_last_activity_ = last_update_time;
+    
     return last_update_time;
+}
+
+// NEW: Schedule checking
+bool PresenceDetector::isWithinSchedule() const {
+    // If schedule is disabled, always return true (active all the time)
+    if (!schedule_enabled_) {
+        return true;
+    }
+    
+    Logger& logger = Logger::getInstance();
+    
+    // Get current day of week and time
+    time_t now = time(nullptr);
+    struct tm* local_time = localtime(&now);
+    
+    // tm_wday: 0=Sunday, 1=Monday, ..., 6=Saturday
+    // Convert to: 1=Monday, 7=Sunday
+    int current_day = (local_time->tm_wday == 0) ? 7 : local_time->tm_wday;
+    
+    // Current time in HHMM format
+    int current_time = local_time->tm_hour * 100 + local_time->tm_min;
+    
+    // Check if current day is in active days
+    bool day_active = false;
+    for (int day : active_days_) {
+        if (day == current_day) {
+            day_active = true;
+            break;
+        }
+    }
+    
+    if (!day_active) {
+        logger.debug("Outside schedule: Current day " + std::to_string(current_day) + 
+                    " not in active days");
+        return false;
+    }
+    
+    // Check if current time is within active range
+    bool time_active = (current_time >= schedule_time_start_ && 
+                       current_time <= schedule_time_end_);
+    
+    if (!time_active) {
+        logger.debug("Outside schedule: Current time " + std::to_string(current_time) + 
+                    " not in range " + std::to_string(schedule_time_start_) + 
+                    "-" + std::to_string(schedule_time_end_));
+        return false;
+    }
+    
+    logger.debug("Within schedule: Day " + std::to_string(current_day) + 
+                ", Time " + std::to_string(current_time));
+    return true;
 }
 
 
@@ -724,6 +895,247 @@ PresenceDetector::ShutterState PresenceDetector::detectShutterState(const cv::Ma
     }
     
     return ShutterState::OPEN;
+}
+
+// No-peek detection (detects shoulder surfing - additional faces behind user)
+bool PresenceDetector::detectPeek(const cv::Mat& frame) {
+    if (!no_peek_enabled_ || frame.empty()) {
+        return false;
+    }
+    
+    Logger& logger = Logger::getInstance();
+    
+    try {
+        // Resize for faster detection (YuNet expects 320x240 as configured)
+        cv::Mat resized;
+        cv::resize(frame, resized, cv::Size(320, 240));
+        
+        // Detect faces using YuNet
+        cv::Mat faces;
+        detector_->detect(resized, faces);
+        
+        if (faces.rows == 0) {
+            return false;  // No faces at all
+        }
+        
+        // Convert YuNet results to cv::Rect for analysis
+        std::vector<cv::Rect> face_rects;
+        double scale_x = static_cast<double>(frame.cols) / 320.0;
+        double scale_y = static_cast<double>(frame.rows) / 240.0;
+        
+        for (int i = 0; i < faces.rows; i++) {
+            float x = faces.at<float>(i, 0) * scale_x;
+            float y = faces.at<float>(i, 1) * scale_y;
+            float w = faces.at<float>(i, 2) * scale_x;
+            float h = faces.at<float>(i, 3) * scale_y;
+            float confidence = faces.at<float>(i, 14);
+            
+            // Only count faces with reasonable confidence
+            if (confidence > 0.6) {
+                cv::Rect face(
+                    static_cast<int>(x),
+                    static_cast<int>(y),
+                    static_cast<int>(w),
+                    static_cast<int>(h)
+                );
+                
+                // Filter out faces that are too small (too far away to see screen)
+                double face_size_percent = static_cast<double>(w) / frame.cols;
+                if (face_size_percent >= min_face_size_percent_) {
+                    face_rects.push_back(face);
+                }
+            }
+        }
+        
+        // Check if we have multiple distinct faces
+        if (face_rects.size() < 2) {
+            return false;  // Only one person (or none after filtering)
+        }
+        
+        // Use FaceDetector helper to count distinct faces
+        // (This filters out same person detected multiple times due to movement)
+        int distinct_count = FaceDetector::countDistinctFaces(face_rects, min_face_distance_pixels_);
+        
+        bool peek = (distinct_count >= 2);
+        
+        if (peek) {
+            logger.warning("NO PEEK: Detected " + std::to_string(distinct_count) + 
+                          " distinct faces (potential shoulder surfing)");
+        }
+        
+        return peek;
+        
+    } catch (const std::exception& e) {
+        logger.error(std::string("Peek detection error: ") + e.what());
+        return false;
+    }
+}
+
+void PresenceDetector::updatePeekState(bool peek_detected) {
+    if (!no_peek_enabled_) {
+        return;
+    }
+    
+    Logger& logger = Logger::getInstance();
+    auto now = std::chrono::steady_clock::now();
+    
+    if (peek_detected) {
+        // Peek detected in current frame
+        if (peek_state_ == PeekState::NO_PEEK) {
+            // First detection
+            peek_state_ = PeekState::PEEK_DETECTED;
+            peek_first_detected_ = now;
+            consecutive_peek_detections_ = 1;
+            logger.info("Peek DETECTED (first time)");
+        } else {
+            // Already detected, check if we should confirm
+            consecutive_peek_detections_++;
+            
+            auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - peek_first_detected_).count();
+            
+            if (duration_ms >= peek_detection_delay_ms_ && 
+                peek_state_ != PeekState::PEEK_CONFIRMED) {
+                // Confirmed: peek has persisted long enough
+                peek_state_ = PeekState::PEEK_CONFIRMED;
+                logger.warning("Peek CONFIRMED - blanking screen");
+                blankScreen();
+            }
+        }
+        
+        peek_last_seen_ = now;
+        
+    } else {
+        // No peek in current frame
+        if (peek_state_ != PeekState::NO_PEEK) {
+            // Check if peek disappeared long enough to unblank
+            auto time_since_last_peek_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - peek_last_seen_).count();
+            
+            if (time_since_last_peek_ms >= unblank_delay_ms_) {
+                // Peek has been gone for grace period
+                logger.info("Peek cleared - unblanking screen");
+                peek_state_ = PeekState::NO_PEEK;
+                consecutive_peek_detections_ = 0;
+                unblankScreen();
+            }
+        }
+    }
+}
+
+void PresenceDetector::blankScreen() {
+    if (screen_blanked_) {
+        return;  // Already blanked
+    }
+    
+    Logger& logger = Logger::getInstance();
+    logger.warning("BLANKING screen due to peek detection");
+    
+    // Try multiple methods to blank screen
+    bool success = false;
+    
+    // Method 1: DPMS off via xset (works on X11)
+    int ret = system("DISPLAY=:0 xset dpms force off 2>/dev/null");
+    if (ret == 0) {
+        success = true;
+        logger.info("Screen blanked via xset (X11)");
+    }
+    
+    // Method 2: KDE Plasma screen blanking (Wayland)
+    if (!success) {
+        ret = system("qdbus org.kde.KWin.ScreenSaver2 /ScreenSaver setActive true 2>/dev/null");
+        if (ret == 0) {
+            success = true;
+            logger.info("Screen blanked via KDE ScreenSaver (Wayland)");
+        }
+    }
+    
+    // Method 3: GNOME (Wayland/X11)
+    if (!success) {
+        ret = system("dbus-send --session --type=method_call --dest=org.gnome.ScreenSaver "
+                    "/org/gnome/ScreenSaver org.gnome.ScreenSaver.SetActive boolean:true 2>/dev/null");
+        if (ret == 0) {
+            success = true;
+            logger.info("Screen blanked via GNOME ScreenSaver");
+        }
+    }
+    
+    // Method 4: Generic wlr-randr for wlroots compositors (Sway, etc.)
+    if (!success) {
+        ret = system("wlr-randr --output '*' --off 2>/dev/null");
+        if (ret == 0) {
+            success = true;
+            logger.info("Screen blanked via wlr-randr");
+        }
+    }
+    
+    if (success) {
+        screen_blanked_ = true;
+    } else {
+        logger.error("Failed to blank screen - all methods failed");
+    }
+}
+
+void PresenceDetector::unblankScreen() {
+    if (!screen_blanked_) {
+        return;  // Not blanked
+    }
+    
+    Logger& logger = Logger::getInstance();
+    logger.info("UNBLANKING screen - peek cleared");
+    
+    // Try multiple methods to unblank screen
+    bool success = false;
+    
+    // Method 1: DPMS on via xset (works on X11)
+    int ret = system("DISPLAY=:0 xset dpms force on 2>/dev/null");
+    if (ret == 0) {
+        success = true;
+        logger.info("Screen unblanked via xset (X11)");
+    }
+    
+    // Method 2: KDE Plasma screen unblanking (Wayland)
+    if (!success) {
+        ret = system("qdbus org.kde.KWin.ScreenSaver2 /ScreenSaver setActive false 2>/dev/null");
+        if (ret == 0) {
+            success = true;
+            logger.info("Screen unblanked via KDE ScreenSaver (Wayland)");
+        }
+    }
+    
+    // Method 3: GNOME (Wayland/X11)
+    if (!success) {
+        ret = system("dbus-send --session --type=method_call --dest=org.gnome.ScreenSaver "
+                    "/org/gnome/ScreenSaver org.gnome.ScreenSaver.SetActive boolean:false 2>/dev/null");
+        if (ret == 0) {
+            success = true;
+            logger.info("Screen unblanked via GNOME ScreenSaver");
+        }
+    }
+    
+    // Method 4: Generic wlr-randr for wlroots compositors
+    if (!success) {
+        ret = system("wlr-randr --output '*' --on 2>/dev/null");
+        if (ret == 0) {
+            success = true;
+            logger.info("Screen unblanked via wlr-randr");
+        }
+    }
+    
+    // Method 5: Simple mouse wiggle to wake screen (fallback)
+    if (!success) {
+        ret = system("xdotool mousemove_relative -- 1 0 2>/dev/null");
+        if (ret == 0) {
+            success = true;
+            logger.info("Screen unblanked via mouse wiggle");
+        }
+    }
+    
+    if (success) {
+        screen_blanked_ = false;
+    } else {
+        logger.error("Failed to unblank screen - may need manual intervention");
+    }
 }
 
 } // namespace faceid

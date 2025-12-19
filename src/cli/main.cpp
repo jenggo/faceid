@@ -26,6 +26,7 @@ void print_usage() {
     std::cout << "  remove <username> [face_id]   Remove specific face or all faces" << std::endl;
     std::cout << "  list [username]               List all enrolled users or user's faces" << std::endl;
     std::cout << "  test <username>               Test face recognition" << std::endl;
+    std::cout << "  show                          Show live camera view with face detection" << std::endl;
     std::cout << "  devices                       List available camera devices" << std::endl;
     std::cout << "  version                       Show version information" << std::endl;
     std::cout << "  help                          Show this help message" << std::endl;
@@ -36,6 +37,7 @@ void print_usage() {
     std::cout << "  faceid list jenggo            # List all faces for jenggo" << std::endl;
     std::cout << "  faceid remove jenggo glasses  # Remove 'glasses' face only" << std::endl;
     std::cout << "  faceid remove jenggo          # Remove ALL faces for jenggo" << std::endl;
+    std::cout << "  faceid show                   # Live camera preview with detection" << std::endl;
 }
 
 int cmd_devices() {
@@ -463,6 +465,154 @@ int cmd_list(const std::string& username = "") {
     return 0;
 }
 
+int cmd_show() {
+    std::cout << "Starting live camera preview with face detection..." << std::endl;
+    std::cout << "Press 'q' or ESC to quit" << std::endl << std::endl;
+    
+    // Load configuration
+    faceid::Config& config = faceid::Config::getInstance();
+    std::string config_path = std::string(CONFIG_DIR) + "/faceid.conf";
+    if (!config.load(config_path)) {
+        std::cerr << "Warning: Could not load config, using defaults" << std::endl;
+    }
+    
+    // Get camera settings
+    auto device = config.getString("camera", "device").value_or("/dev/video0");
+    auto width = config.getInt("camera", "width").value_or(640);
+    auto height = config.getInt("camera", "height").value_or(480);
+    
+    std::cout << "Using camera: " << device << " (" << width << "x" << height << ")" << std::endl;
+    
+    // Initialize camera
+    Camera camera(device);
+    if (!camera.open(width, height)) {
+        std::cerr << "Error: Failed to open camera " << device << std::endl;
+        std::cerr << "Available devices:" << std::endl;
+        for (const auto& dev : Camera::listDevices()) {
+            std::cerr << "  " << dev << std::endl;
+        }
+        return 1;
+    }
+    
+    // Initialize face detector
+    faceid::FaceDetector detector;
+    std::string recognition_model = std::string(CONFIG_DIR) + "/models/face_recognition_sface_2021dec.onnx";
+    
+    std::cout << "Loading face detection model..." << std::endl;
+    if (!detector.loadModels(recognition_model)) {
+        std::cerr << "Error: Failed to load face detection model" << std::endl;
+        std::cerr << "Expected file: " << recognition_model << std::endl;
+        std::cerr << "Run: sudo make install-models" << std::endl;
+        return 1;
+    }
+    
+    std::cout << "Models loaded successfully!" << std::endl;
+    
+    // Create preview window
+    const std::string window_name = "FaceID - Live Camera View";
+    cv::namedWindow(window_name, cv::WINDOW_NORMAL);
+    cv::resizeWindow(window_name, 800, 600);
+    
+    std::cout << "\nLive preview started. Press 'q' or ESC in the preview window to quit.\n" << std::endl;
+    
+    int frame_count = 0;
+    auto start_time = std::chrono::steady_clock::now();
+    
+    while (true) {
+        cv::Mat frame;
+        if (!camera.read(frame)) {
+            std::cerr << "Failed to read frame from camera" << std::endl;
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            continue;
+        }
+        
+        // Preprocess and detect faces
+        cv::Mat processed_frame = detector.preprocessFrame(frame);
+        auto faces = detector.detectFaces(processed_frame, true);
+        
+        // Clone frame for display
+        cv::Mat display_frame = frame.clone();
+        
+        // Draw detected faces
+        for (size_t i = 0; i < faces.size(); i++) {
+            const auto& face = faces[i];
+            
+            // Color based on face index (primary face is green, others are yellow)
+            cv::Scalar color;
+            if (i == 0) {
+                color = cv::Scalar(0, 255, 0);  // Green for primary face
+            } else {
+                color = cv::Scalar(0, 255, 255);  // Yellow for additional faces
+            }
+            
+            // Draw rectangle around face
+            cv::rectangle(display_frame, face, color, 2);
+            
+            // Label faces
+            std::string label = (i == 0) ? "Face 1 (Primary)" : "Face " + std::to_string(i + 1);
+            cv::putText(display_frame, label,
+                       cv::Point(face.x, face.y - 10),
+                       cv::FONT_HERSHEY_SIMPLEX, 0.6, color, 2);
+        }
+        
+        // Calculate FPS
+        frame_count++;
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count();
+        if (elapsed > 0) {
+            double fps = static_cast<double>(frame_count) / elapsed;
+            
+            // Draw info banner at top
+            cv::rectangle(display_frame, cv::Point(0, 0), cv::Point(display_frame.cols, 70), 
+                         cv::Scalar(0, 0, 0), -1);
+            
+            // Face count
+            std::string info_text = "Detected faces: " + std::to_string(faces.size());
+            cv::putText(display_frame, info_text,
+                       cv::Point(10, 25),
+                       cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(255, 255, 255), 2);
+            
+            // FPS
+            std::string fps_text = "FPS: " + std::to_string(static_cast<int>(fps));
+            cv::putText(display_frame, fps_text,
+                       cv::Point(10, 50),
+                       cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 255, 0), 2);
+            
+            // Resolution
+            std::string res_text = std::to_string(frame.cols) + "x" + std::to_string(frame.rows);
+            cv::putText(display_frame, res_text,
+                       cv::Point(display_frame.cols - 150, 25),
+                       cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(200, 200, 200), 2);
+        }
+        
+        // Draw help text at bottom
+        cv::rectangle(display_frame, 
+                     cv::Point(0, display_frame.rows - 30), 
+                     cv::Point(display_frame.cols, display_frame.rows),
+                     cv::Scalar(0, 0, 0), -1);
+        cv::putText(display_frame, "Press 'q' or ESC to quit",
+                   cv::Point(10, display_frame.rows - 10),
+                   cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 255, 255), 1);
+        
+        // Display the frame
+        cv::imshow(window_name, display_frame);
+        
+        // Check for quit key
+        int key = cv::waitKey(30);
+        if (key == 'q' || key == 'Q' || key == 27) {  // q or ESC
+            break;
+        }
+    }
+    
+    // Cleanup
+    cv::destroyWindow(window_name);
+    
+    std::cout << "\nLive preview stopped." << std::endl;
+    std::cout << "Total frames processed: " << frame_count << std::endl;
+    
+    return 0;
+}
+
 int cmd_test(const std::string& username) {
     std::cout << "Testing face recognition for user: " << username << std::endl;
     
@@ -629,6 +779,10 @@ int main(int argc, char* argv[]) {
     
     if (command == "devices") {
         return cmd_devices();
+    }
+    
+    if (command == "show") {
+        return cmd_show();
     }
     
     if (command == "list") {

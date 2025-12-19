@@ -38,6 +38,19 @@ public:
     
     // Clear encoding cache
     void clearCache();
+    
+    // Multi-face detection helpers for "no peek" feature
+    // Calculate distance between two face rectangles (center-to-center)
+    static double faceDistance(const cv::Rect& face1, const cv::Rect& face2);
+    
+    // Check if two faces are distinct persons (not same person at different position)
+    static bool areDistinctFaces(const cv::Rect& face1, const cv::Rect& face2, int min_distance);
+    
+    // Get face size as percentage of frame width
+    static double getFaceSizePercent(const cv::Rect& face, int frame_width);
+    
+    // Count distinct faces (filtering out duplicates/reflections)
+    static int countDistinctFaces(const std::vector<cv::Rect>& faces, int min_distance);
 
 private:
     // YuNet face detector
