@@ -2,14 +2,53 @@
 #include "../libfacedetection/facedetectcnn.h"
 #include "../logger.h"
 #include "../face_detector.h"
+#include "../image.h"
+#include <libyuv.h>
 #include <fstream>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <dirent.h>
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 
 namespace faceid {
+
+// Helper function: Fast BGR to GRAY conversion using libyuv with Image classes
+// Currently unused, but kept for future reference
+/*
+static Image convertBGRToGrayLibyuv(const ImageView& src_bgr) {
+    Image dst_gray(src_bgr.width(), src_bgr.height(), 1);
+    
+    // Use libyuv's RGB24ToJ400 (grayscale) conversion
+    // Note: OpenCV's BGR = RGB24, J400 is grayscale (full range 0-255)
+    libyuv::RGB24ToJ400(src_bgr.data(), src_bgr.stride(), 
+                        dst_gray.data(), dst_gray.stride(), 
+                        src_bgr.width(), src_bgr.height());
+    
+    return dst_gray;
+}
+*/
+
+// Helper function: Fast GRAY to BGR conversion using libyuv with Image classes
+static Image convertGrayToBGRLibyuv(const ImageView& src_gray) {
+    Image dst_bgr(src_gray.width(), src_gray.height(), 3);
+    
+    // Convert grayscale to ARGB first, then to RGB24
+    Image argb_temp(src_gray.width(), src_gray.height(), 4);
+    
+    // J400 (grayscale) to ARGB
+    libyuv::J400ToARGB(src_gray.data(), src_gray.stride(), 
+                       argb_temp.data(), argb_temp.stride(), 
+                       src_gray.width(), src_gray.height());
+    
+    // ARGB to RGB24 (BGR)
+    libyuv::ARGBToRGB24(argb_temp.data(), argb_temp.stride(), 
+                        dst_bgr.data(), dst_bgr.stride(), 
+                        dst_bgr.width(), dst_bgr.height());
+    
+    return dst_bgr;
+}
 
 PresenceDetector::PresenceDetector(
     const std::string& camera_device,
@@ -83,7 +122,7 @@ void PresenceDetector::stop() {
     // Release camera
     std::lock_guard<std::mutex> lock(camera_mutex_);
     if (camera_ && camera_->isOpened()) {
-        camera_->release();
+        camera_->close();
         camera_.reset();
     }
 }
@@ -121,7 +160,7 @@ void PresenceDetector::pauseForAuthentication() {
         // Release camera for PAM auth
         std::lock_guard<std::mutex> cam_lock(camera_mutex_);
         if (camera_ && camera_->isOpened()) {
-            camera_->release();
+            camera_->close();
         }
     }
 }
@@ -276,10 +315,10 @@ void PresenceDetector::updateStateMachine() {
                 // Check for peek (shoulder surfing) using cached frame
                 // This avoids reopening the camera after it was just released
                 if (no_peek_enabled_ && !last_captured_frame_.empty()) {
-                    bool peek = detectPeek(last_captured_frame_);
+                    bool peek = detectPeek(last_captured_frame_.view());
                     updatePeekState(peek);
                     // Clear cached frame after use
-                    last_captured_frame_ = cv::Mat();
+                    last_captured_frame_ = Image();
                 }
             } else {
                 // No face detected (and shutter is open)
@@ -349,7 +388,7 @@ void PresenceDetector::transitionTo(State new_state) {
         (new_state == State::ACTIVELY_PRESENT || new_state == State::AWAY_CONFIRMED)) {
         std::lock_guard<std::mutex> lock(camera_mutex_);
         if (camera_ && camera_->isOpened()) {
-            camera_->release();
+            camera_->close();
             camera_.reset();
             logger.info("Camera released (no longer scanning)");
         }
@@ -368,14 +407,14 @@ bool PresenceDetector::detectFace() {
     try {
         total_scans_++;
         
-        cv::Mat frame = captureFrame();
+        Image frame = captureFrame();
         if (frame.empty()) {
             failed_detections_++;
             return false;
         }
         
         // Check if camera shutter is closed
-        ShutterState shutter = detectShutterState(frame);
+        ShutterState shutter = detectShutterState(frame.view());
         if (shutter == ShutterState::CLOSED) {
             char log_buf[256];
             snprintf(log_buf, sizeof(log_buf), 
@@ -392,22 +431,22 @@ bool PresenceDetector::detectFace() {
         }
         last_shutter_state_ = shutter;
         
-        // Use FaceDetector with tracking for better performance
-        // Convert frame to BGR if needed (presence capture might be different format)
-        cv::Mat bgr_frame = frame;
-        if (frame.channels() != 3) {
-            cv::cvtColor(frame, bgr_frame, cv::COLOR_GRAY2BGR);
-        }
-        
-        // Detect faces with tracking optimization
-        auto faces = face_detector_.detectOrTrackFaces(bgr_frame, tracking_interval_);
+         // Use FaceDetector with tracking for better performance
+         // Convert frame to BGR if needed (Camera might return grayscale)
+         Image bgr_frame = std::move(frame);
+         if (bgr_frame.channels() != 3) {
+             bgr_frame = convertGrayToBGRLibyuv(bgr_frame.view());
+         }
+         
+         // Detect faces with tracking optimization
+         auto faces = face_detector_.detectOrTrackFaces(bgr_frame.view(), tracking_interval_);
         
         bool detected = !faces.empty();
         
         if (detected) {
             Logger::getInstance().debug("Face detected in presence check");
             // Cache frame for peek detection
-            last_captured_frame_ = frame.clone();
+            last_captured_frame_ = bgr_frame.clone();
         }
         
         if (detected) {
@@ -421,63 +460,34 @@ bool PresenceDetector::detectFace() {
         
     } catch (const std::exception& e) {
         Logger::getInstance().error(std::string("Face detection error: ") + e.what());
-        last_captured_frame_ = cv::Mat();
+        last_captured_frame_ = Image();
         return false;
     }
 }
 
-cv::Mat PresenceDetector::captureFrame() {
+Image PresenceDetector::captureFrame() {
     std::lock_guard<std::mutex> lock(camera_mutex_);
     
     // Initialize camera if not already open
     if (!camera_ || !camera_->isOpened()) {
-        camera_ = std::make_unique<cv::VideoCapture>();
+        camera_ = std::make_unique<Camera>(camera_device_);
         
-        // Open with V4L2 backend for better hardware support
-        camera_->open(camera_device_, cv::CAP_V4L2);
-        
-        if (!camera_->isOpened()) {
+        // Open with 640x480 (smaller for presence detection = faster processing)
+        if (!camera_->open(640, 480)) {
             Logger::getInstance().error("Failed to open camera: " + camera_device_);
-            return cv::Mat();
+            return Image();
         }
         
         Logger& logger = Logger::getInstance();
-        logger.info("Camera opened with V4L2 backend");
-        
-        // Set resolution (smaller for presence detection = faster processing)
-        camera_->set(cv::CAP_PROP_FRAME_WIDTH, 640);
-        camera_->set(cv::CAP_PROP_FRAME_HEIGHT, 480);
-        
-        // Set MJPEG format for hardware acceleration on most webcams
-        camera_->set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('M','J','P','G'));
-        
-        // Set FPS to reduce CPU load (we don't need high framerate for presence)
-        camera_->set(cv::CAP_PROP_FPS, 15);
-        
-        // Disable auto-exposure for faster capture (optional)
-        camera_->set(cv::CAP_PROP_AUTO_EXPOSURE, 0.25);  // Manual mode
-        
-        // Log actual settings
-        logger.info("Camera resolution: " + 
-                   std::to_string((int)camera_->get(cv::CAP_PROP_FRAME_WIDTH)) + "x" +
-                   std::to_string((int)camera_->get(cv::CAP_PROP_FRAME_HEIGHT)));
-        logger.info("Camera FPS: " + std::to_string((int)camera_->get(cv::CAP_PROP_FPS)));
-        
-        int fourcc = (int)camera_->get(cv::CAP_PROP_FOURCC);
-        char fourcc_str[5] = {
-            (char)(fourcc & 0xFF),
-            (char)((fourcc >> 8) & 0xFF),
-            (char)((fourcc >> 16) & 0xFF),
-            (char)((fourcc >> 24) & 0xFF),
-            '\0'
-        };
-        logger.info("Camera codec: " + std::string(fourcc_str));
+        logger.info("Camera opened for presence detection");
+        logger.info("Camera device: " + camera_device_);
+        logger.info("Camera resolution: 640x480");
     }
     
-    cv::Mat frame;
+    Image frame;
     if (!camera_->read(frame)) {
         Logger::getInstance().error("Failed to capture frame");
-        return cv::Mat();
+        return Image();
     }
     
     return frame;
@@ -803,22 +813,45 @@ void PresenceDetector::lockScreen() {
 }
 
 // NEW: Camera shutter detection
-PresenceDetector::ShutterState PresenceDetector::detectShutterState(const cv::Mat& frame) {
+PresenceDetector::ShutterState PresenceDetector::detectShutterState(const ImageView& frame) {
     if (frame.empty()) {
         return ShutterState::UNCERTAIN;
     }
     
-    // Calculate mean brightness (RGB average)
-    cv::Scalar mean_color = cv::mean(frame);
-    double brightness = (mean_color[0] + mean_color[1] + mean_color[2]) / 3.0;
+    // Calculate mean brightness (average across all pixels and channels)
+    double sum = 0.0;
+    int pixel_count = 0;
+    const uint8_t* data = frame.data();
+    int stride = frame.stride();
+    int channels = frame.channels();
     
-    // Convert to grayscale for variance check
-    cv::Mat gray;
-    cv::cvtColor(frame, gray, cv::COLOR_BGR2GRAY);
+    for (int y = 0; y < frame.height(); y++) {
+        const uint8_t* row = data + y * stride;
+        for (int x = 0; x < frame.width(); x++) {
+            for (int c = 0; c < channels; c++) {
+                sum += row[x * channels + c];
+            }
+            pixel_count += channels;
+        }
+    }
+    
+    double brightness = (pixel_count > 0) ? (sum / pixel_count) : 0.0;
     
     // Calculate standard deviation (variance indicator)
-    cv::Scalar mean, stddev;
-    cv::meanStdDev(gray, mean, stddev);
+    // First pass: calculate mean (already have it as brightness)
+    double variance_sum = 0.0;
+    for (int y = 0; y < frame.height(); y++) {
+        const uint8_t* row = data + y * stride;
+        for (int x = 0; x < frame.width(); x++) {
+            for (int c = 0; c < channels; c++) {
+                double pixel_val = row[x * channels + c];
+                double diff = pixel_val - brightness;
+                variance_sum += diff * diff;
+            }
+        }
+    }
+    
+    double stddev = (pixel_count > 0) ? std::sqrt(variance_sum / pixel_count) : 0.0;
     
     Logger& logger = Logger::getInstance();
     
@@ -827,13 +860,13 @@ PresenceDetector::ShutterState PresenceDetector::detectShutterState(const cv::Ma
     auto now = std::chrono::steady_clock::now();
     if (std::chrono::duration_cast<std::chrono::seconds>(now - last_log).count() >= 5) {
         logger.debug("Shutter check: brightness=" + std::to_string(brightness) + 
-                    ", stddev=" + std::to_string(stddev[0]));
+                    ", stddev=" + std::to_string(stddev));
         last_log = now;
     }
     
     // Check if image is pure black (shutter closed)
     if (brightness < shutter_brightness_threshold_ && 
-        stddev[0] < shutter_variance_threshold_) {
+        stddev < shutter_variance_threshold_) {
         return ShutterState::CLOSED;
     }
     
@@ -846,58 +879,61 @@ PresenceDetector::ShutterState PresenceDetector::detectShutterState(const cv::Ma
 }
 
 // No-peek detection (detects shoulder surfing - additional faces behind user)
-bool PresenceDetector::detectPeek(const cv::Mat& frame) {
-    if (!no_peek_enabled_ || frame.empty()) {
-        return false;
-    }
-    
-    Logger& logger = Logger::getInstance();
-    
-    try {
-        // Use FaceDetector with tracking for peek detection
-        cv::Mat bgr_frame = frame;
-        if (frame.channels() != 3) {
-            cv::cvtColor(frame, bgr_frame, cv::COLOR_GRAY2BGR);
-        }
-        
-        // Detect faces with tracking
-        auto face_rects = face_detector_.detectOrTrackFaces(bgr_frame, tracking_interval_);
-        
-        if (face_rects.empty()) {
-            return false;  // No faces at all
-        }
-        
-        // Filter out faces that are too small (too far away to see screen)
-        std::vector<cv::Rect> filtered_faces;
-        for (const auto& face : face_rects) {
-            double face_size_percent = static_cast<double>(face.width) / frame.cols;
-            if (face_size_percent >= min_face_size_percent_) {
-                filtered_faces.push_back(face);
-            }
-        }
-        
-        // Check if we have multiple distinct faces
-        if (filtered_faces.size() < 2) {
-            return false;  // Only one person (or none after filtering)
-        }
-        
-        // Use FaceDetector helper to count distinct faces
-        // (This filters out same person detected multiple times due to movement)
-        int distinct_count = FaceDetector::countDistinctFaces(filtered_faces, min_face_distance_pixels_);
-        
-        bool peek = (distinct_count >= 2);
-        
-        if (peek) {
-            logger.warning("NO PEEK: Detected " + std::to_string(distinct_count) + 
-                          " distinct faces (potential shoulder surfing)");
-        }
-        
-        return peek;
-        
-    } catch (const std::exception& e) {
-        logger.error(std::string("Peek detection error: ") + e.what());
-        return false;
-    }
+bool PresenceDetector::detectPeek(const ImageView& frame) {
+     if (!no_peek_enabled_ || frame.empty()) {
+         return false;
+     }
+     
+     Logger& logger = Logger::getInstance();
+     
+     try {
+         // Use FaceDetector with tracking for peek detection
+         std::vector<Rect> face_rects;
+         
+         if (frame.channels() != 3) {
+             // Convert grayscale to BGR if needed
+             Image bgr_frame = convertGrayToBGRLibyuv(frame);
+             face_rects = face_detector_.detectOrTrackFaces(bgr_frame.view(), tracking_interval_);
+         } else {
+             // Already BGR, just use the frame directly
+             face_rects = face_detector_.detectOrTrackFaces(frame, tracking_interval_);
+         }
+         
+         if (face_rects.empty()) {
+             return false;  // No faces at all
+         }
+         
+         // Filter out faces that are too small (too far away to see screen)
+         std::vector<Rect> filtered_faces;
+         for (const auto& face : face_rects) {
+             double face_size_percent = static_cast<double>(face.width) / frame.width();
+             if (face_size_percent >= min_face_size_percent_) {
+                 filtered_faces.push_back(face);
+             }
+         }
+         
+         // Check if we have multiple distinct faces
+         if (filtered_faces.size() < 2) {
+             return false;  // Only one person (or none after filtering)
+         }
+         
+         // Use FaceDetector helper to count distinct faces
+         // (This filters out same person detected multiple times due to movement)
+         int distinct_count = FaceDetector::countDistinctFaces(filtered_faces, min_face_distance_pixels_);
+         
+         bool peek = (distinct_count >= 2);
+         
+         if (peek) {
+             logger.warning("NO PEEK: Detected " + std::to_string(distinct_count) + 
+                           " distinct faces (potential shoulder surfing)");
+         }
+         
+         return peek;
+         
+     } catch (const std::exception& e) {
+         logger.error(std::string("Peek detection error: ") + e.what());
+         return false;
+     }
 }
 
 void PresenceDetector::updatePeekState(bool peek_detected) {

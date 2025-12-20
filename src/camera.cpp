@@ -205,7 +205,7 @@ bool Camera::isOpened() const {
     return fd_ >= 0 && streaming_;
 }
 
-bool Camera::read(cv::Mat& frame) {
+bool Camera::read(Image& frame) {
     if (!isOpened()) {
         return false;
     }
@@ -239,16 +239,16 @@ bool Camera::read(cv::Mat& frame) {
         return false;
     }
     
-    // Allocate frame if needed
-    if (frame.empty() || frame.cols != jpeg_width || frame.rows != jpeg_height) {
-        frame = cv::Mat(jpeg_height, jpeg_width, CV_8UC3);
+    // Allocate/reallocate frame if needed (reuses memory if same size)
+    if (frame.empty() || frame.width() != jpeg_width || frame.height() != jpeg_height) {
+        frame = Image(jpeg_width, jpeg_height, 3);  // BGR = 3 channels
     }
     
-    // Decompress to BGR
+    // Decompress to BGR directly into our aligned Image buffer
     if (tjDecompress2(tjhandle_,
                      (unsigned char*)buffers_[buf.index].start,
                      buf.bytesused,
-                     frame.data,
+                     frame.data(),
                      jpeg_width, 0, jpeg_height,
                      TJPF_BGR,
                      TJFLAG_FASTDCT) < 0) {

@@ -186,22 +186,22 @@ static bool authenticate_user(const char* username) {
                 while (!cancel_flag.load() && std::chrono::duration_cast<std::chrono::seconds>(
                        std::chrono::steady_clock::now() - start).count() < timeout) {
                     
-                    cv::Mat frame;
+                    faceid::Image frame;
                     if (!camera.read(frame)) {
                         continue;
                     }
                     
                     // Preprocess for better detection
-                    frame = detector.preprocessFrame(frame);
+                    faceid::Image processed_frame = detector.preprocessFrame(frame.view());
                     
                     // Detect faces (with tracking optimization)
-                    auto faces = detector.detectOrTrackFaces(frame, tracking_interval);
+                    auto faces = detector.detectOrTrackFaces(processed_frame.view(), tracking_interval);
                     if (faces.empty()) {
                         continue;
                     }
                     
                     // Encode faces
-                    auto encodings = detector.encodeFaces(frame, faces);
+                    auto encodings = detector.encodeFaces(processed_frame.view(), faces);
                     if (encodings.empty()) {
                         continue;
                     }

@@ -7,9 +7,9 @@
 #include <mutex>
 #include <chrono>
 #include <memory>
-#include <opencv2/opencv.hpp>
-#include <opencv2/core/ocl.hpp>   // OpenCL support
 #include "presence_guard.h"
+#include "../camera.h"
+#include "../image.h"
 #include "../face_detector.h"  // For face tracking support
 
 namespace faceid {
@@ -116,14 +116,14 @@ private:
     
     // Face detection
     bool detectFace();
-    cv::Mat captureFrame();
+    Image captureFrame();
     bool ensureDetectorInitialized();  // Lazy load YuNet detector
     
     // Camera shutter detection
-    ShutterState detectShutterState(const cv::Mat& frame);
+    ShutterState detectShutterState(const ImageView& frame);
     
     // No-peek detection
-    bool detectPeek(const cv::Mat& frame);
+    bool detectPeek(const ImageView& frame);
     void updatePeekState(bool peek_detected);
     void blankScreen();
     void unblankScreen();
@@ -144,9 +144,9 @@ private:
     
     // Camera
     std::string camera_device_;
-    std::unique_ptr<cv::VideoCapture> camera_;
+    std::unique_ptr<Camera> camera_;
     std::mutex camera_mutex_;
-    cv::Mat last_captured_frame_;  // Cache for peek detection (avoids reopening camera)
+    Image last_captured_frame_;  // Cache for peek detection (avoids reopening camera)
     
     // Face detection with tracking support
     faceid::FaceDetector face_detector_;

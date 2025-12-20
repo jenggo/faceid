@@ -1,9 +1,9 @@
 #ifndef FACEID_CAMERA_H
 #define FACEID_CAMERA_H
 
+#include "image.h"
 #include <string>
 #include <vector>
-#include <opencv2/core.hpp>
 #include <turbojpeg.h>
 
 namespace faceid {
@@ -18,7 +18,8 @@ public:
     void close();
     bool isOpened() const;
     
-    bool read(cv::Mat& frame);
+    // Read frame into provided Image buffer (reuses allocation if same size)
+    bool read(Image& frame);
     
     std::string getDevicePath() const { return device_path_; }
     

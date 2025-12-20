@@ -66,12 +66,14 @@ check-deps:
 	@printf "$(COLOR_GREEN)✓ meson$(COLOR_RESET)\n"
 	@command -v ninja >/dev/null 2>&1 || { printf "$(COLOR_RED)✗ ninja not found$(COLOR_RESET)\n"; exit 1; }
 	@printf "$(COLOR_GREEN)✓ ninja$(COLOR_RESET)\n"
-	@pkg-config --exists opencv4 || { printf "$(COLOR_RED)✗ opencv4 not found$(COLOR_RESET)\n"; exit 1; }
-	@printf "$(COLOR_GREEN)✓ opencv4$(COLOR_RESET)\n"
 	@pkg-config --exists ncnn || { printf "$(COLOR_RED)✗ ncnn not found$(COLOR_RESET)\n"; exit 1; }
 	@printf "$(COLOR_GREEN)✓ ncnn$(COLOR_RESET)\n"
 	@pkg-config --exists jsoncpp || { printf "$(COLOR_RED)✗ jsoncpp not found$(COLOR_RESET)\n"; exit 1; }
 	@printf "$(COLOR_GREEN)✓ jsoncpp$(COLOR_RESET)\n"
+	@pkg-config --exists libturbojpeg || { printf "$(COLOR_RED)✗ libturbojpeg not found$(COLOR_RESET)\n"; exit 1; }
+	@printf "$(COLOR_GREEN)✓ libturbojpeg$(COLOR_RESET)\n"
+	@pkg-config --exists sdl2 || { printf "$(COLOR_RED)✗ sdl2 not found$(COLOR_RESET)\n"; exit 1; }
+	@printf "$(COLOR_GREEN)✓ sdl2$(COLOR_RESET)\n"
 	@pkg-config --exists pam || { printf "$(COLOR_YELLOW)⚠ pam not found (optional)$(COLOR_RESET)\n"; }
 	@command -v pkg-config >/dev/null 2>&1 || { printf "$(COLOR_RED)✗ pkg-config not found$(COLOR_RESET)\n"; exit 1; }
 	@printf "$(COLOR_GREEN)✓ pkg-config$(COLOR_RESET)\n"
@@ -81,11 +83,11 @@ check-deps:
 deps:
 	@printf "$(COLOR_BOLD)Installing build dependencies...$(COLOR_RESET)\n"
 	@if command -v pacman >/dev/null 2>&1; then \
-		sudo pacman -S --needed base-devel meson ninja opencv jsoncpp ncnn pam; \
+		sudo pacman -S --needed base-devel meson ninja jsoncpp ncnn pam libjpeg-turbo sdl2 libyuv; \
 	elif command -v apt-get >/dev/null 2>&1; then \
-		sudo apt-get install -y build-essential meson ninja-build libopencv-dev libjsoncpp-dev libncnn-dev libpam-dev pkg-config; \
+		sudo apt-get install -y build-essential meson ninja-build libjsoncpp-dev libncnn-dev libpam-dev libturbojpeg0-dev libsdl2-dev libyuv-dev pkg-config; \
 	elif command -v dnf >/dev/null 2>&1; then \
-		sudo dnf install -y @development-tools meson ninja opencv-devel jsoncpp-devel ncnn-devel pam-devel pkg-config; \
+		sudo dnf install -y @development-tools meson ninja jsoncpp-devel ncnn-devel pam-devel turbojpeg-devel SDL2-devel libyuv-devel pkg-config; \
 	else \
 		printf "$(COLOR_RED)Unsupported package manager. Please install dependencies manually.$(COLOR_RESET)\n"; \
 		exit 1; \

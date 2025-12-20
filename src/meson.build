@@ -1,6 +1,5 @@
 # Compiler flags to suppress external library warnings
 cpp_args = [
-    '-Wno-overloaded-virtual',  # Suppress OpenCV warnings
     '-Wno-unused-parameter',    # Suppress unused PAM parameter warnings
 ]
 
@@ -31,6 +30,7 @@ endif
 # Dependencies
 gio_dep = dependency('gio-2.0', required: true)
 glib_dep = dependency('glib-2.0', required: true)
+sdl2_dep = dependency('sdl2', required: true)
 
 # LibFaceDetection sources
 libfacedetection_sources = files(
@@ -44,6 +44,7 @@ core_sources = files(
     'config.cpp',
     'camera.cpp',
     'face_detector.cpp',
+    'clahe.cpp',
     'logger.cpp',
     'fingerprint_auth.cpp',
     'lid_detector.cpp',
@@ -56,7 +57,7 @@ core_lib = static_library(
     'faceid-core',
     sources: core_sources + libfacedetection_sources,
     include_directories: inc,
-    dependencies: [opencv_dep, ncnn_dep, turbojpeg_dep, gio_dep, glib_dep],
+    dependencies: [ncnn_dep, turbojpeg_dep, libyuv_dep, gio_dep, glib_dep],
     cpp_args: libface_cpp_args,
 )
 
@@ -70,7 +71,7 @@ pam_module = shared_module(
     'pam_faceid',
     sources: pam_sources,
     include_directories: inc,
-    dependencies: [pam_dep, opencv_dep, ncnn_dep, turbojpeg_dep, jsoncpp_dep],
+    dependencies: [pam_dep, ncnn_dep, turbojpeg_dep, libyuv_dep, jsoncpp_dep, gio_dep, glib_dep],
     link_with: core_lib,
     cpp_args: libface_cpp_args,
     link_args: ['-ldl', '-lpthread'],  # For threading support
@@ -80,13 +81,16 @@ pam_module = shared_module(
 )
 
 # CLI tool
-cli_sources = files('cli/main.cpp')
+cli_sources = files(
+    'cli/main.cpp',
+    'display.cpp'
+)
 
 cli_exe = executable(
     'faceid',
     sources: cli_sources,
     include_directories: inc,
-    dependencies: [opencv_dep, ncnn_dep, turbojpeg_dep, jsoncpp_dep],
+    dependencies: [ncnn_dep, turbojpeg_dep, libyuv_dep, jsoncpp_dep, sdl2_dep],
     link_with: core_lib,
     cpp_args: libface_cpp_args,
     install: true,
@@ -99,7 +103,7 @@ presence_daemon_exe = executable(
     'faceid-presence',
     sources: presence_daemon_sources,
     include_directories: inc,
-    dependencies: [opencv_dep, ncnn_dep, turbojpeg_dep],
+    dependencies: [ncnn_dep, turbojpeg_dep, libyuv_dep],
     link_with: core_lib,
     cpp_args: libface_cpp_args,
     link_args: ['-lpthread'],
