@@ -1,62 +1,88 @@
 #ifndef FACEID_FACE_DETECTOR_H
 #define FACEID_FACE_DETECTOR_H
 
+#include "image.h"
 #include <string>
 #include <vector>
 #include <unordered_map>
-#include <opencv2/opencv.hpp>     // For cv::Mat and other OpenCV types
-#include <opencv2/objdetect.hpp>  // For FaceDetectorYN
-#include <opencv2/objdetect/face.hpp>  // For FaceRecognizerSF
+#include <ncnn/net.h>             // NCNN for face recognition
+#include "libfacedetection/facedetectcnn.h"  // LibFaceDetection
 
 namespace faceid {
 
-// SFace uses cv::Mat for encodings (128D float vector)
-using FaceEncoding = cv::Mat;
+// Face encodings are 128D float vectors stored in std::vector for NCNN
+using FaceEncoding = std::vector<float>;
 
 class FaceDetector {
 public:
     FaceDetector();
     
-    // Simplified: Only need recognition model path (no shape predictor needed)
+    // Only need recognition model path (no detection model needed - embedded in LibFaceDetection)
     bool loadModels(const std::string& face_recognition_model_path);
     
-    // YuNet returns cv::Rect instead of dlib::rectangle
-    std::vector<cv::Rect> detectFaces(const cv::Mat& frame, bool downscale = true);
+    // Detect faces in frame using LibFaceDetection
+    std::vector<Rect> detectFaces(const ImageView& frame, bool downscale = false);
+    
+    // Detect or track faces (automatically uses tracking when possible)
+    // track_interval: how many frames to track before re-detecting (0 = always detect)
+    std::vector<Rect> detectOrTrackFaces(const ImageView& frame, int track_interval = 5);
+    
+    // Force re-detection on next frame (useful after scene change)
+    void resetTracking();
     
     // Encode faces using SFace
-    std::vector<FaceEncoding> encodeFaces(const cv::Mat& frame,
-                                          const std::vector<cv::Rect>& face_locations);
+    std::vector<FaceEncoding> encodeFaces(const ImageView& frame,
+                                          const std::vector<Rect>& face_locations);
     
     // Compare two face encodings (cosine similarity)
     double compareFaces(const FaceEncoding& encoding1, const FaceEncoding& encoding2);
     
-    // Performance: Pre-process frame for faster detection
-    cv::Mat preprocessFrame(const cv::Mat& frame);
+    // Performance: Pre-process frame for faster detection (CLAHE enhancement)
+    Image preprocessFrame(const ImageView& frame);
     
     // Enable/disable caching for repeated detections
     void enableCache(bool enable);
     
     // Clear encoding cache
     void clearCache();
+    
+    // Multi-face detection helpers for "no peek" feature
+    // Calculate distance between two face rectangles (center-to-center)
+    static double faceDistance(const Rect& face1, const Rect& face2);
+    
+    // Check if two faces are distinct persons (not same person at different position)
+    static bool areDistinctFaces(const Rect& face1, const Rect& face2, int min_distance);
+    
+    // Get face size as percentage of frame width
+    static double getFaceSizePercent(const Rect& face, int frame_width);
+    
+    // Count distinct faces (filtering out duplicates/reflections)
+    static int countDistinctFaces(const std::vector<Rect>& faces, int min_distance);
 
 private:
-    // YuNet face detector
-    cv::Ptr<cv::FaceDetectorYN> yunet_detector_;
-    
-    // SFace face recognizer (replaces dlib)
-    cv::Ptr<cv::FaceRecognizerSF> sface_recognizer_;
+    // NCNN face recognition network (SFace model)
+    ncnn::Net ncnn_net_;
     
     bool models_loaded_ = false;
     
     // Performance optimizations
     bool use_cache_ = true;
-    std::unordered_map<uint64_t, std::vector<cv::Rect>> detection_cache_;
+    std::unordered_map<uint64_t, std::vector<Rect>> detection_cache_;
+    
+    // Face tracking state (to reduce detection frequency)
+    std::vector<Rect> tracked_faces_;
+    Image prev_gray_frame_;
+    int frames_since_detection_ = 0;
+    bool tracking_initialized_ = false;
     
     // Hash function for frame caching
-    uint64_t hashFrame(const cv::Mat& frame);
+    uint64_t hashFrame(const ImageView& frame);
+    
+    // Helper: Track faces using optical flow
+    std::vector<Rect> trackFaces(const ImageView& current_frame);
     
     // Helper: Align face for SFace (expects 112x112)
-    cv::Mat alignFace(const cv::Mat& frame, const cv::Rect& face_rect);
+    Image alignFace(const ImageView& frame, const Rect& face_rect);
 };
 
 } // namespace faceid

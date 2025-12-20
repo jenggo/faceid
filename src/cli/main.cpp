@@ -3,17 +3,15 @@
 #include <fstream>
 #include <thread>
 #include <chrono>
+#include <iomanip>
+#include <algorithm>
 #include <dirent.h>
 #include <json/json.h>
 #include "config_paths.h"
 #include "../config.h"
 #include "../face_detector.h"
-
-// Suppress warnings from OpenCV headers
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Woverloaded-virtual"
 #include "../camera.h"
-#pragma GCC diagnostic pop
+#include "../display.h"
 
 using namespace faceid;
 
@@ -26,6 +24,7 @@ void print_usage() {
     std::cout << "  remove <username> [face_id]   Remove specific face or all faces" << std::endl;
     std::cout << "  list [username]               List all enrolled users or user's faces" << std::endl;
     std::cout << "  test <username>               Test face recognition" << std::endl;
+    std::cout << "  show                          Show live camera view with face detection" << std::endl;
     std::cout << "  devices                       List available camera devices" << std::endl;
     std::cout << "  version                       Show version information" << std::endl;
     std::cout << "  help                          Show this help message" << std::endl;
@@ -36,6 +35,7 @@ void print_usage() {
     std::cout << "  faceid list jenggo            # List all faces for jenggo" << std::endl;
     std::cout << "  faceid remove jenggo glasses  # Remove 'glasses' face only" << std::endl;
     std::cout << "  faceid remove jenggo          # Remove ALL faces for jenggo" << std::endl;
+    std::cout << "  faceid show                   # Live camera preview with detection" << std::endl;
 }
 
 int cmd_devices() {
@@ -67,6 +67,7 @@ int cmd_add(const std::string& username, const std::string& face_id = "default")
     auto device = config.getString("camera", "device").value_or("/dev/video0");
     auto width = config.getInt("camera", "width").value_or(640);
     auto height = config.getInt("camera", "height").value_or(480);
+    int tracking_interval = config.getInt("face_detection", "tracking_interval").value_or(10);
     
     std::cout << "Using camera: " << device << " (" << width << "x" << height << ")" << std::endl;
     
@@ -101,10 +102,8 @@ int cmd_add(const std::string& username, const std::string& face_id = "default")
     std::cout << "Please look at the camera and press Enter when ready..." << std::endl;
     std::cin.get();
     
-    // Create preview window
-    const std::string window_name = "FaceID - Face Enrollment Preview";
-    cv::namedWindow(window_name, cv::WINDOW_NORMAL);
-    cv::resizeWindow(window_name, 640, 480);
+     // Create preview window
+    faceid::Display display("FaceID - Face Enrollment Preview", 640, 480);
     
     std::cout << std::endl;
     std::cout << "📷 Preview window opened - adjust your position to show your face clearly" << std::endl;
@@ -120,72 +119,66 @@ int cmd_add(const std::string& username, const std::string& face_id = "default")
     for (int i = 0; i < num_samples; i++) {
         std::cout << "  Sample " << (i + 1) << "/" << num_samples << "... " << std::flush;
         
-        cv::Mat frame;
+        faceid::Image frame;
         if (!camera.read(frame)) {
             std::cerr << "Failed to read frame" << std::endl;
             continue;
         }
         
         // Preprocess frame
-        cv::Mat processed_frame = detector.preprocessFrame(frame);
+        faceid::Image processed_frame = detector.preprocessFrame(frame.view());
         
-        // Detect faces
-        auto faces = detector.detectFaces(processed_frame, true);
+        // Detect faces (with tracking optimization)
+        auto faces = detector.detectOrTrackFaces(processed_frame.view(), tracking_interval);
         
         // Draw visualization on original frame
-        cv::Mat display_frame = frame.clone();
+        faceid::Image display_frame = frame.clone();
         
-        // Draw detected face rectangles
+        // Draw detected face rectangles (adjust coordinates for SDL flip)
         for (const auto& face : faces) {
-            cv::Scalar color;
+            faceid::Color color = (faces.size() == 1) 
+                ? faceid::Color::Green()  // Green for good detection
+                : faceid::Color::Red();   // Red for multiple faces
             
-            if (faces.size() == 1) {
-                color = cv::Scalar(0, 255, 0);  // Green for good detection
-            } else {
-                color = cv::Scalar(0, 0, 255);  // Red for multiple faces
-            }
-            
-            // Draw rectangle around face
-            cv::rectangle(display_frame, face, color, 2);
+            // Draw rectangle at ORIGINAL position (SDL will flip it correctly)
+            faceid::drawRectangle(display_frame, face.x, face.y, 
+                                 face.width, face.height, color, 2);
         }
         
         // Draw status text
         std::string status_text;
-        cv::Scalar status_color;
+        faceid::Color status_color = faceid::Color::Black();  // Initialize with default
         
         if (faces.empty()) {
             status_text = "No face detected - position yourself in frame";
-            status_color = cv::Scalar(0, 165, 255);  // Orange
+            status_color = faceid::Color::Orange();
         } else if (faces.size() > 1) {
             status_text = "Multiple faces (" + std::to_string(faces.size()) + ") - only one person should be visible";
-            status_color = cv::Scalar(0, 0, 255);  // Red
+            status_color = faceid::Color::Red();
         } else {
             status_text = "Face detected - capturing sample " + std::to_string(i + 1) + "/" + std::to_string(num_samples);
-            status_color = cv::Scalar(0, 255, 0);  // Green
+            status_color = faceid::Color::Green();
         }
         
         // Draw status banner at top
-        cv::rectangle(display_frame, cv::Point(0, 0), cv::Point(display_frame.cols, 40), 
-                     cv::Scalar(0, 0, 0), -1);
-        cv::putText(display_frame, status_text,
-                   cv::Point(10, 25),
-                   cv::FONT_HERSHEY_SIMPLEX, 0.6, status_color, 2);
+        faceid::drawFilledRectangle(display_frame, 0, 0, display_frame.width(), 40, faceid::Color::Black());
+        std::string status_text_reversed = status_text;
+        std::reverse(status_text_reversed.begin(), status_text_reversed.end());
+        int status_width = status_text_reversed.length() * 8;
+        faceid::drawText(display_frame, status_text_reversed, display_frame.width() - 10 - status_width, 10, status_color, 1.0);
         
         // Show progress bar at bottom
-        int progress_width = (display_frame.cols * (i + 1)) / num_samples;
-        cv::rectangle(display_frame, 
-                     cv::Point(0, display_frame.rows - 10), 
-                     cv::Point(progress_width, display_frame.rows),
-                     cv::Scalar(0, 255, 0), -1);
+        int progress_width = (display_frame.width() * (i + 1)) / num_samples;
+        faceid::drawFilledRectangle(display_frame, 0, display_frame.height() - 10, 
+                                   progress_width, 10, faceid::Color::Green());
         
-        // Display the frame
-        cv::imshow(window_name, display_frame);
+        // Display the frame (SDL will flip horizontally)
+        display.show(display_frame);
         
         // Check for quit key (short wait to keep display responsive)
-        int key = cv::waitKey(30);
-        if (key == 'q' || key == 'Q' || key == 27) {  // q or ESC
+        int key = display.waitKey(30);
+        if (key == 'q' || key == 'Q' || key == 27 || !display.isOpen()) {  // q or ESC or window closed
             std::cout << std::endl << "Cancelled by user" << std::endl;
-            cv::destroyWindow(window_name);
             return 1;
         }
         
@@ -198,7 +191,7 @@ int cmd_add(const std::string& username, const std::string& face_id = "default")
         }
         
         // If multiple faces, select the largest one (closest to camera)
-        cv::Rect selected_face;
+        faceid::Rect selected_face;
         if (faces.size() > 1) {
             std::cout << "Multiple faces detected (" << faces.size() << "), selecting largest... " << std::flush;
             
@@ -216,8 +209,8 @@ int cmd_add(const std::string& username, const std::string& face_id = "default")
         }
         
         // Encode the selected face
-        std::vector<cv::Rect> single_face = {selected_face};
-        auto face_encodings = detector.encodeFaces(processed_frame, single_face);
+        std::vector<faceid::Rect> single_face = {selected_face};
+        auto face_encodings = detector.encodeFaces(processed_frame.view(), single_face);
         if (face_encodings.empty()) {
             std::cout << "Failed to encode face, retrying..." << std::endl;
             i--;  // Retry this sample
@@ -231,8 +224,7 @@ int cmd_add(const std::string& username, const std::string& face_id = "default")
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
     
-    // Close preview window
-    cv::destroyWindow(window_name);
+    // Display window will close automatically when display object goes out of scope
     std::cout << std::endl;
     
     if (encodings.empty()) {
@@ -266,9 +258,9 @@ int cmd_add(const std::string& username, const std::string& face_id = "default")
     Json::Value encodings_array(Json::arrayValue);
     for (const auto& encoding : encodings) {
         Json::Value encoding_array(Json::arrayValue);
-        // SFace encoding is cv::Mat (128x1 float matrix)
-        for (int i = 0; i < encoding.rows * encoding.cols; i++) {
-            encoding_array.append(encoding.at<float>(i));
+        // Encoding is std::vector<float> (128D)
+        for (float val : encoding) {
+            encoding_array.append(val);
         }
         encodings_array.append(encoding_array);
     }
@@ -463,6 +455,148 @@ int cmd_list(const std::string& username = "") {
     return 0;
 }
 
+int cmd_show() {
+    std::cout << "Starting live camera preview with face detection..." << std::endl;
+    std::cout << "Press 'q' or ESC to quit" << std::endl << std::endl;
+    
+    // Load configuration
+    faceid::Config& config = faceid::Config::getInstance();
+    std::string config_path = std::string(CONFIG_DIR) + "/faceid.conf";
+    if (!config.load(config_path)) {
+        std::cerr << "Warning: Could not load config, using defaults" << std::endl;
+    }
+    
+    // Get camera settings
+    auto device = config.getString("camera", "device").value_or("/dev/video0");
+    auto width = config.getInt("camera", "width").value_or(640);
+    auto height = config.getInt("camera", "height").value_or(480);
+    int tracking_interval = config.getInt("face_detection", "tracking_interval").value_or(10);
+    
+    std::cout << "Using camera: " << device << " (" << width << "x" << height << ")" << std::endl;
+    
+    // Initialize camera
+    Camera camera(device);
+    if (!camera.open(width, height)) {
+        std::cerr << "Error: Failed to open camera " << device << std::endl;
+        std::cerr << "Available devices:" << std::endl;
+        for (const auto& dev : Camera::listDevices()) {
+            std::cerr << "  " << dev << std::endl;
+        }
+        return 1;
+    }
+    
+    // Initialize face detector
+    faceid::FaceDetector detector;
+    std::string recognition_model = std::string(CONFIG_DIR) + "/models/face_recognition_sface_2021dec.onnx";
+    
+    std::cout << "Loading face detection model..." << std::endl;
+    if (!detector.loadModels(recognition_model)) {
+        std::cerr << "Error: Failed to load face detection model" << std::endl;
+        std::cerr << "Expected file: " << recognition_model << std::endl;
+        std::cerr << "Run: sudo make install-models" << std::endl;
+        return 1;
+    }
+    
+    std::cout << "Models loaded successfully!" << std::endl;
+    
+    // Create preview window
+    faceid::Display display("FaceID - Live Camera View", 800, 600);
+    
+    std::cout << "\nLive preview started. Press 'q' or ESC in the preview window to quit.\n" << std::endl;
+    
+    int frame_count = 0;
+    auto start_time = std::chrono::steady_clock::now();
+    
+    while (display.isOpen()) {
+        faceid::Image frame;
+        if (!camera.read(frame)) {
+            std::cerr << "Failed to read frame from camera" << std::endl;
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            continue;
+        }
+        
+        // Preprocess and detect faces
+        faceid::Image processed_frame = detector.preprocessFrame(frame.view());
+        auto faces = detector.detectOrTrackFaces(processed_frame.view(), tracking_interval);
+        
+        // Clone frame for drawing
+        faceid::Image display_frame = frame.clone();
+        
+        // Draw detected faces (adjust coordinates for SDL's horizontal flip)
+        for (size_t i = 0; i < faces.size(); i++) {
+            const auto& face = faces[i];
+            
+            // Color based on face index (primary face is green, others are yellow)
+            faceid::Color color = (i == 0) 
+                ? faceid::Color::Green()   // Green for primary face
+                : faceid::Color::Yellow(); // Yellow for additional faces
+            
+            // Draw rectangle at ORIGINAL position (SDL will flip it correctly)
+            faceid::drawRectangle(display_frame, face.x, face.y, 
+                                 face.width, face.height, color, 2);
+            
+            // Label faces - reverse text and calculate mirrored position
+            std::string label = (i == 0) ? "Face 1 (Primary)" : "Face " + std::to_string(i + 1);
+            std::reverse(label.begin(), label.end());
+            int text_width = label.length() * 8;
+            // Text position needs to be mirrored: what appears at face.x will show at (width - face.x) after flip
+            int text_x = display_frame.width() - (face.x + text_width);
+            faceid::drawText(display_frame, label, text_x, face.y - 10, color, 1.0);
+        }
+        
+        // Calculate FPS
+        frame_count++;
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count();
+        if (elapsed > 0) {
+            double fps = static_cast<double>(frame_count) / elapsed;
+            
+            // Draw info banner at top
+            faceid::drawFilledRectangle(display_frame, 0, 0, display_frame.width(), 70, faceid::Color::Black());
+            
+            // Face count (reversed text for SDL flip)
+            std::string info_text = "Detected faces: " + std::to_string(faces.size());
+            std::reverse(info_text.begin(), info_text.end());
+            int info_width = info_text.length() * 8;
+            faceid::drawText(display_frame, info_text, display_frame.width() - 10 - info_width, 10, faceid::Color::White(), 1.0);
+            
+            // FPS (reversed text for SDL flip)
+            std::string fps_text = "FPS: " + std::to_string(static_cast<int>(fps));
+            std::reverse(fps_text.begin(), fps_text.end());
+            int fps_width = fps_text.length() * 8;
+            faceid::drawText(display_frame, fps_text, display_frame.width() - 10 - fps_width, 25, faceid::Color::Green(), 1.0);
+            
+            // Resolution (reversed text for SDL flip)
+            std::string res_text = std::to_string(display_frame.width()) + "x" + std::to_string(display_frame.height());
+            std::reverse(res_text.begin(), res_text.end());
+            faceid::drawText(display_frame, res_text, 10, 10, faceid::Color::Gray(), 1.0);
+        }
+        
+        // Draw help text at bottom (reversed text for SDL flip)
+        faceid::drawFilledRectangle(display_frame, 0, display_frame.height() - 30, 
+                                   display_frame.width(), 30, faceid::Color::Black());
+        std::string help_text = "Press 'q' or ESC to quit";
+        std::reverse(help_text.begin(), help_text.end());
+        int help_width = help_text.length() * 8;
+        faceid::drawText(display_frame, help_text, display_frame.width() - 10 - help_width, display_frame.height() - 20, 
+                        faceid::Color::White(), 1.0);
+        
+        // Display the frame (SDL will flip horizontally)
+        display.show(display_frame);
+        
+        // Check for quit key
+        int key = display.waitKey(30);
+        if (key == 'q' || key == 'Q' || key == 27) {  // q or ESC
+            break;
+        }
+    }
+    
+    std::cout << "\nLive preview stopped." << std::endl;
+    std::cout << "Total frames processed: " << frame_count << std::endl;
+    
+    return 0;
+}
+
 int cmd_test(const std::string& username) {
     std::cout << "Testing face recognition for user: " << username << std::endl;
     
@@ -493,9 +627,9 @@ int cmd_test(const std::string& username) {
             const Json::Value& encodings_array = face_data["encodings"];
             
             for (const auto& enc_json : encodings_array) {
-                cv::Mat encoding(128, 1, CV_32F);
+                faceid::FaceEncoding encoding(128);
                 for (int i = 0; i < 128 && i < static_cast<int>(enc_json.size()); i++) {
-                    encoding.at<float>(i) = enc_json[i].asFloat();
+                    encoding[i] = enc_json[i].asFloat();
                 }
                 stored_encodings.push_back(encoding);
             }
@@ -506,9 +640,9 @@ int cmd_test(const std::string& username) {
         // Old single-face format (backward compatibility)
         const Json::Value& encodings_array = model_data["encodings"];
         for (const auto& enc_json : encodings_array) {
-            cv::Mat encoding(128, 1, CV_32F);
+            faceid::FaceEncoding encoding(128);
             for (int i = 0; i < 128 && i < static_cast<int>(enc_json.size()); i++) {
-                encoding.at<float>(i) = enc_json[i].asFloat();
+                encoding[i] = enc_json[i].asFloat();
             }
             stored_encodings.push_back(encoding);
         }
@@ -529,6 +663,7 @@ int cmd_test(const std::string& username) {
     auto width = config.getInt("camera", "width").value_or(640);
     auto height = config.getInt("camera", "height").value_or(480);
     double threshold = config.getDouble("recognition", "threshold").value_or(0.6);
+    int tracking_interval = config.getInt("face_detection", "tracking_interval").value_or(10);
     
     std::cout << "Using camera: " << device << std::endl;
     std::cout << "Recognition threshold: " << threshold << std::endl;
@@ -556,24 +691,33 @@ int cmd_test(const std::string& username) {
     
     auto start = std::chrono::steady_clock::now();
     bool recognized = false;
+    double detection_time_ms = 0.0;
+    double recognition_time_ms = 0.0;
     
     while (std::chrono::duration_cast<std::chrono::seconds>(
            std::chrono::steady_clock::now() - start).count() < 5) {
         
-        cv::Mat frame;
+        faceid::Image frame;
         if (!camera.read(frame)) {
             continue;
         }
         
-        frame = detector.preprocessFrame(frame);
-        auto faces = detector.detectFaces(frame, true);
+        faceid::Image processed_frame = detector.preprocessFrame(frame.view());
+        
+        // Time face detection
+        auto detect_start = std::chrono::high_resolution_clock::now();
+        auto faces = detector.detectOrTrackFaces(processed_frame.view(), tracking_interval);
+        auto detect_end = std::chrono::high_resolution_clock::now();
+        detection_time_ms = std::chrono::duration<double, std::milli>(detect_end - detect_start).count();
         
         if (faces.empty()) {
             std::cout << "." << std::flush;
             continue;
         }
         
-        auto encodings = detector.encodeFaces(frame, faces);
+        // Time face recognition
+        auto recog_start = std::chrono::high_resolution_clock::now();
+        auto encodings = detector.encodeFaces(processed_frame.view(), faces);
         if (encodings.empty()) {
             continue;
         }
@@ -586,12 +730,19 @@ int cmd_test(const std::string& username) {
                 min_distance = distance;
             }
         }
+        auto recog_end = std::chrono::high_resolution_clock::now();
+        recognition_time_ms = std::chrono::duration<double, std::milli>(recog_end - recog_start).count();
         
         std::cout << std::endl;
         std::cout << "Face detected! Distance: " << min_distance;
         
         if (min_distance < threshold) {
             std::cout << " ✓ MATCH" << std::endl;
+            std::cout << std::endl;
+            std::cout << "Performance:" << std::endl;
+            std::cout << "  Detection:    " << std::fixed << std::setprecision(2) << detection_time_ms << " ms" << std::endl;
+            std::cout << "  Recognition:  " << std::fixed << std::setprecision(2) << recognition_time_ms << " ms" << std::endl;
+            std::cout << "  Total:        " << std::fixed << std::setprecision(2) << (detection_time_ms + recognition_time_ms) << " ms" << std::endl;
             recognized = true;
             break;
         } else {
@@ -629,6 +780,10 @@ int main(int argc, char* argv[]) {
     
     if (command == "devices") {
         return cmd_devices();
+    }
+    
+    if (command == "show") {
+        return cmd_show();
     }
     
     if (command == "list") {

@@ -21,6 +21,8 @@
 #include <thread>
 #include <chrono>
 #include <iostream>
+#include <sstream>
+#include <vector>
 #include <getopt.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -214,6 +216,38 @@ int main(int argc, char* argv[]) {
     int shutter_timeout = config.getInt("presence_detection", "shutter_timeout_minutes").value_or(5);
     std::string camera_device = config.getString("camera", "device").value_or("/dev/video0");
     
+    // Read no-peek configuration
+    bool no_peek_enabled = config.getBool("no_peek", "enabled").value_or(false);
+    int min_face_distance = config.getInt("no_peek", "min_face_distance_pixels").value_or(80);
+    double min_face_size = config.getDouble("no_peek", "min_face_size_percent").value_or(0.08);
+    int peek_delay = config.getInt("no_peek", "peek_detection_delay_seconds").value_or(2);
+    int unblank_delay = config.getInt("no_peek", "unblank_delay_seconds").value_or(3);
+    
+    // Read schedule configuration
+    bool schedule_enabled = config.getBool("schedule", "enabled").value_or(false);
+    std::string active_days_str = config.getString("schedule", "active_days").value_or("1,2,3,4,5");
+    int time_start = config.getInt("schedule", "time_start").value_or(0);
+    int time_end = config.getInt("schedule", "time_end").value_or(2359);
+    
+    // Parse active days (comma-separated)
+    std::vector<int> active_days;
+    std::istringstream iss(active_days_str);
+    std::string token;
+    while (std::getline(iss, token, ',')) {
+        try {
+            int day = std::stoi(token);
+            if (day >= 1 && day <= 7) {
+                active_days.push_back(day);
+            }
+        } catch (...) {
+            // Skip invalid values
+        }
+    }
+    if (active_days.empty()) {
+        // Default to weekdays if parsing failed
+        active_days = {1, 2, 3, 4, 5};
+    }
+    
     logger.info("Presence detection configuration:");
     logger.info("  Inactive threshold: " + std::to_string(inactive_threshold) + "s");
     logger.info("  Scan interval: " + std::to_string(scan_interval) + "s");
@@ -224,6 +258,25 @@ int main(int argc, char* argv[]) {
     logger.info("  Shutter variance threshold: " + std::to_string(shutter_variance));
     logger.info("  Shutter timeout: " + std::to_string(shutter_timeout) + " min");
     logger.info("  Camera device: " + camera_device);
+    
+    logger.info("No-peek detection configuration:");
+    logger.info("  Enabled: " + std::string(no_peek_enabled ? "YES" : "NO"));
+    logger.info("  Min face distance: " + std::to_string(min_face_distance) + " pixels");
+    logger.info("  Min face size: " + std::to_string(min_face_size * 100) + "%");
+    logger.info("  Peek detection delay: " + std::to_string(peek_delay) + "s");
+    logger.info("  Unblank delay: " + std::to_string(unblank_delay) + "s");
+    
+    logger.info("Schedule configuration:");
+    logger.info("  Enabled: " + std::string(schedule_enabled ? "YES" : "NO"));
+    if (schedule_enabled) {
+        std::string days_str;
+        for (size_t i = 0; i < active_days.size(); i++) {
+            days_str += std::to_string(active_days[i]);
+            if (i < active_days.size() - 1) days_str += ",";
+        }
+        logger.info("  Active days: " + days_str + " (1=Mon, 7=Sun)");
+        logger.info("  Active time: " + std::to_string(time_start) + "-" + std::to_string(time_end));
+    }
     
     // Setup signal handlers
     setupSignalHandlers();
@@ -245,6 +298,18 @@ int main(int argc, char* argv[]) {
     detector.setShutterBrightnessThreshold(shutter_brightness);
     detector.setShutterVarianceThreshold(shutter_variance);
     detector.setShutterTimeout(shutter_timeout * 60 * 1000);  // Convert minutes to milliseconds
+    
+    // Configure no-peek detection
+    detector.enableNoPeek(no_peek_enabled);
+    detector.setMinFaceDistance(min_face_distance);
+    detector.setMinFaceSizePercent(min_face_size);
+    detector.setPeekDetectionDelay(peek_delay * 1000);  // Convert seconds to milliseconds
+    detector.setUnblankDelay(unblank_delay * 1000);  // Convert seconds to milliseconds
+    
+    // Configure schedule
+    detector.enableSchedule(schedule_enabled);
+    detector.setActiveDays(active_days);
+    detector.setActiveTimeRange(time_start, time_end);
     
     if (!detector.start()) {
         logger.error("Failed to start presence detector");

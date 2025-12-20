@@ -1,14 +1,10 @@
 #ifndef FACEID_CAMERA_H
 #define FACEID_CAMERA_H
 
+#include "image.h"
 #include <string>
 #include <vector>
-
-// Suppress warnings from OpenCV headers
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Woverloaded-virtual"
-#include <opencv2/opencv.hpp>
-#pragma GCC diagnostic pop
+#include <turbojpeg.h>
 
 namespace faceid {
 
@@ -22,7 +18,8 @@ public:
     void close();
     bool isOpened() const;
     
-    bool read(cv::Mat& frame);
+    // Read frame into provided Image buffer (reuses allocation if same size)
+    bool read(Image& frame);
     
     std::string getDevicePath() const { return device_path_; }
     
@@ -30,7 +27,18 @@ public:
 
 private:
     std::string device_path_;
-    cv::VideoCapture capture_;
+    int fd_ = -1;
+    int width_ = 640;
+    int height_ = 480;
+    
+    struct Buffer {
+        void* start = nullptr;
+        size_t length = 0;
+    };
+    std::vector<Buffer> buffers_;
+    
+    tjhandle tjhandle_ = nullptr;
+    bool streaming_ = false;
 };
 
 } // namespace faceid
