@@ -10,6 +10,7 @@
 #include <opencv2/opencv.hpp>
 #include <opencv2/core/ocl.hpp>   // OpenCL support
 #include "presence_guard.h"
+#include "../face_detector.h"  // For face tracking support
 
 namespace faceid {
 
@@ -146,6 +147,10 @@ private:
     std::unique_ptr<cv::VideoCapture> camera_;
     std::mutex camera_mutex_;
     cv::Mat last_captured_frame_;  // Cache for peek detection (avoids reopening camera)
+    
+    // Face detection with tracking support
+    faceid::FaceDetector face_detector_;
+    int tracking_interval_ = 10;  // Track every N frames for better performance
     
     // Detection (YuNet)
     // LibFaceDetection has embedded models - no detector instance needed

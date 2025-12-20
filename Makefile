@@ -68,6 +68,8 @@ check-deps:
 	@printf "$(COLOR_GREEN)✓ ninja$(COLOR_RESET)\n"
 	@pkg-config --exists opencv4 || { printf "$(COLOR_RED)✗ opencv4 not found$(COLOR_RESET)\n"; exit 1; }
 	@printf "$(COLOR_GREEN)✓ opencv4$(COLOR_RESET)\n"
+	@pkg-config --exists ncnn || { printf "$(COLOR_RED)✗ ncnn not found$(COLOR_RESET)\n"; exit 1; }
+	@printf "$(COLOR_GREEN)✓ ncnn$(COLOR_RESET)\n"
 	@pkg-config --exists jsoncpp || { printf "$(COLOR_RED)✗ jsoncpp not found$(COLOR_RESET)\n"; exit 1; }
 	@printf "$(COLOR_GREEN)✓ jsoncpp$(COLOR_RESET)\n"
 	@pkg-config --exists pam || { printf "$(COLOR_YELLOW)⚠ pam not found (optional)$(COLOR_RESET)\n"; }
@@ -79,11 +81,11 @@ check-deps:
 deps:
 	@printf "$(COLOR_BOLD)Installing build dependencies...$(COLOR_RESET)\n"
 	@if command -v pacman >/dev/null 2>&1; then \
-		sudo pacman -S --needed base-devel meson ninja opencv jsoncpp pam; \
+		sudo pacman -S --needed base-devel meson ninja opencv jsoncpp ncnn pam; \
 	elif command -v apt-get >/dev/null 2>&1; then \
-		sudo apt-get install -y build-essential meson ninja-build libopencv-dev libjsoncpp-dev libpam-dev pkg-config; \
+		sudo apt-get install -y build-essential meson ninja-build libopencv-dev libjsoncpp-dev libncnn-dev libpam-dev pkg-config; \
 	elif command -v dnf >/dev/null 2>&1; then \
-		sudo dnf install -y @development-tools meson ninja opencv-devel jsoncpp-devel pam-devel pkg-config; \
+		sudo dnf install -y @development-tools meson ninja opencv-devel jsoncpp-devel ncnn-devel pam-devel pkg-config; \
 	else \
 		printf "$(COLOR_RED)Unsupported package manager. Please install dependencies manually.$(COLOR_RESET)\n"; \
 		exit 1; \
@@ -119,8 +121,12 @@ rebuild: distclean build
 # Install to system
 install: build
 	@printf "$(COLOR_BOLD)Installing $(PROJECT_NAME) to system...$(COLOR_RESET)\n"
-	@if [ "$$(id -u)" != "0" ]; then \
+	@BUILD_USER=$$(stat -c '%U' $(BUILD_DIR) 2>/dev/null || echo ""); \
+	if [ "$$(id -u)" != "0" ]; then \
 		sudo $(MESON) install -C $(BUILD_DIR) --no-rebuild; \
+		if [ -n "$$BUILD_USER" ] && [ "$$BUILD_USER" != "root" ]; then \
+			sudo chown -R $$BUILD_USER:$$BUILD_USER $(BUILD_DIR); \
+		fi; \
 	else \
 		$(MESON) install -C $(BUILD_DIR) --no-rebuild; \
 	fi
@@ -177,8 +183,12 @@ install-debug: setup
 	@printf "$(COLOR_BOLD)Building and installing debug version...$(COLOR_RESET)\n"
 	@$(MESON) setup --reconfigure $(BUILD_DIR) -Dbuildtype=debug
 	@$(MESON) compile -C $(BUILD_DIR)
-	@if [ "$$(id -u)" != "0" ]; then \
+	@BUILD_USER=$$(stat -c '%U' $(BUILD_DIR) 2>/dev/null || echo ""); \
+	if [ "$$(id -u)" != "0" ]; then \
 		sudo $(MESON) install -C $(BUILD_DIR); \
+		if [ -n "$$BUILD_USER" ] && [ "$$BUILD_USER" != "root" ]; then \
+			sudo chown -R $$BUILD_USER:$$BUILD_USER $(BUILD_DIR); \
+		fi; \
 	else \
 		$(MESON) install -C $(BUILD_DIR); \
 	fi

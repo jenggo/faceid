@@ -56,7 +56,7 @@ core_lib = static_library(
     'faceid-core',
     sources: core_sources + libfacedetection_sources,
     include_directories: inc,
-    dependencies: [opencv_dep, gio_dep, glib_dep],
+    dependencies: [opencv_dep, ncnn_dep, turbojpeg_dep, gio_dep, glib_dep],
     cpp_args: libface_cpp_args,
 )
 
@@ -70,7 +70,7 @@ pam_module = shared_module(
     'pam_faceid',
     sources: pam_sources,
     include_directories: inc,
-    dependencies: [pam_dep, opencv_dep, jsoncpp_dep],
+    dependencies: [pam_dep, opencv_dep, ncnn_dep, turbojpeg_dep, jsoncpp_dep],
     link_with: core_lib,
     cpp_args: libface_cpp_args,
     link_args: ['-ldl', '-lpthread'],  # For threading support
@@ -86,7 +86,7 @@ cli_exe = executable(
     'faceid',
     sources: cli_sources,
     include_directories: inc,
-    dependencies: [opencv_dep, jsoncpp_dep],
+    dependencies: [opencv_dep, ncnn_dep, turbojpeg_dep, jsoncpp_dep],
     link_with: core_lib,
     cpp_args: libface_cpp_args,
     install: true,
@@ -99,7 +99,7 @@ presence_daemon_exe = executable(
     'faceid-presence',
     sources: presence_daemon_sources,
     include_directories: inc,
-    dependencies: [opencv_dep],
+    dependencies: [opencv_dep, ncnn_dep, turbojpeg_dep],
     link_with: core_lib,
     cpp_args: libface_cpp_args,
     link_args: ['-lpthread'],

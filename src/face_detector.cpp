@@ -1,6 +1,6 @@
 #include "face_detector.h"
 #include <opencv2/imgproc.hpp>
-#include <fstream>
+#include <opencv2/video/tracking.hpp>
 #include <algorithm>
 #include <cmath>
 
@@ -12,11 +12,49 @@ FaceDetector::FaceDetector() {
 
 bool FaceDetector::loadModels(const std::string& face_recognition_model_path) {
     try {
-        // Load SFace recognition model (unchanged)
-        sface_recognizer_ = cv::FaceRecognizerSF::create(
-            face_recognition_model_path,
-            ""  // config (empty for ONNX)
-        );
+        // Load NCNN SFace model
+        // Expect model_path to be directory containing sface.param and sface.bin
+        // Or model_path to be base path without extension (e.g., "/etc/faceid/models/sface")
+        
+        std::string param_path;
+        std::string bin_path;
+        
+        // Check if path is a directory or file base
+        if (face_recognition_model_path.find(".param") != std::string::npos) {
+            // Full path to .param file given
+            param_path = face_recognition_model_path;
+            bin_path = face_recognition_model_path;
+            bin_path.replace(bin_path.find(".param"), 6, ".bin");
+        } else if (face_recognition_model_path.find(".onnx") != std::string::npos) {
+            // ONNX path given - convert to NCNN paths
+            // /etc/faceid/models/face_recognition_sface_2021dec.onnx
+            // -> /etc/faceid/models/sface.param and sface.bin
+            std::string base_dir = face_recognition_model_path.substr(0, face_recognition_model_path.find_last_of('/'));
+            param_path = base_dir + "/sface.param";
+            bin_path = base_dir + "/sface.bin";
+        } else {
+            // Assume it's a base path without extension
+            param_path = face_recognition_model_path + ".param";
+            bin_path = face_recognition_model_path + ".bin";
+        }
+        
+        // Configure NCNN options for optimal CPU performance
+        ncnn_net_.opt.use_vulkan_compute = false;  // Use CPU (more reliable for PAM)
+        ncnn_net_.opt.num_threads = 4;  // Use 4 threads for good balance
+        ncnn_net_.opt.use_fp16_packed = false;
+        ncnn_net_.opt.use_fp16_storage = false;
+        
+        // Load model files
+        int ret = ncnn_net_.load_param(param_path.c_str());
+        if (ret != 0) {
+            return false;
+        }
+        
+        ret = ncnn_net_.load_model(bin_path.c_str());
+        if (ret != 0) {
+            return false;
+        }
+        
         models_loaded_ = true;
         return true;
     } catch (const std::exception& e) {
@@ -37,17 +75,22 @@ std::vector<cv::Rect> FaceDetector::detectFaces(const cv::Mat& frame, bool downs
     cv::Mat processed_frame = frame;
     double scale = 1.0;
     
-    // Downscale for faster detection if enabled (optional - LibFaceDetection is already fast)
-    if (downscale && frame.cols > 640) {
-        scale = 640.0 / frame.cols;
+    // Always downscale for faster detection (LibFaceDetection is resolution-dependent)
+    // Target: 320px width for ~7ms detection (vs 35ms at 640px)
+    // Note: Detection accuracy is still excellent at lower resolutions
+    const int target_width = 320;
+    
+    if (frame.cols > target_width) {
+        scale = static_cast<double>(target_width) / frame.cols;
         cv::resize(frame, processed_frame, cv::Size(), scale, scale, cv::INTER_AREA);
     }
     
     // LibFaceDetection detection
     // Allocate result buffer (fixed size required by LibFaceDetection)
+    // Note: Modern compilers optimize stack allocation efficiently
+    // Stack allocation is actually faster than heap for small, fixed-size buffers
     unsigned char result_buffer[0x20000];
     
-    // Call LibFaceDetection
     // Note: LibFaceDetection expects BGR format (OpenCV default)
     int* pResults = facedetect_cnn(
         result_buffer,
@@ -120,6 +163,111 @@ std::vector<cv::Rect> FaceDetector::detectFaces(const cv::Mat& frame, bool downs
     return faces;
 }
 
+std::vector<cv::Rect> FaceDetector::detectOrTrackFaces(const cv::Mat& frame, int track_interval) {
+    // Always detect if tracking disabled (track_interval == 0)
+    if (track_interval == 0) {
+        return detectFaces(frame);
+    }
+    
+    // Detect if we haven't initialized tracking yet or interval reached
+    if (!tracking_initialized_ || frames_since_detection_ >= track_interval) {
+        // Run full detection
+        std::vector<cv::Rect> faces = detectFaces(frame);
+        
+        // Initialize tracking
+        if (!faces.empty()) {
+            tracked_faces_ = faces;
+            cv::cvtColor(frame, prev_gray_frame_, cv::COLOR_BGR2GRAY);
+            tracking_initialized_ = true;
+            frames_since_detection_ = 0;
+        }
+        
+        return faces;
+    }
+    
+    // Use tracking for intermediate frames
+    frames_since_detection_++;
+    return trackFaces(frame);
+}
+
+std::vector<cv::Rect> FaceDetector::trackFaces(const cv::Mat& current_frame) {
+    if (tracked_faces_.empty() || prev_gray_frame_.empty()) {
+        return {};
+    }
+    
+    // Convert current frame to grayscale
+    cv::Mat current_gray;
+    cv::cvtColor(current_frame, current_gray, cv::COLOR_BGR2GRAY);
+    
+    // Track each face using sparse optical flow on face center points
+    std::vector<cv::Rect> updated_faces;
+    
+    for (const auto& face : tracked_faces_) {
+        // Get face center and corners
+        std::vector<cv::Point2f> prev_points;
+        prev_points.push_back(cv::Point2f(face.x + face.width/2, face.y + face.height/2));  // center
+        prev_points.push_back(cv::Point2f(face.x, face.y));  // top-left
+        prev_points.push_back(cv::Point2f(face.x + face.width, face.y + face.height));  // bottom-right
+        
+        // Track points using Lucas-Kanade optical flow
+        std::vector<cv::Point2f> new_points;
+        std::vector<uchar> status;
+        std::vector<float> err;
+        
+        cv::calcOpticalFlowPyrLK(
+            prev_gray_frame_, 
+            current_gray,
+            prev_points, 
+            new_points,
+            status,
+            err,
+            cv::Size(21, 21),  // window size
+            3,                  // pyramid levels
+            cv::TermCriteria(cv::TermCriteria::COUNT | cv::TermCriteria::EPS, 10, 0.03)
+        );
+        
+        // If tracking successful, update face position
+        if (status[0] && status[1] && status[2]) {
+            // Calculate movement delta from center point
+            float dx = new_points[0].x - prev_points[0].x;
+            float dy = new_points[0].y - prev_points[0].y;
+            
+            // Update face rectangle
+            cv::Rect updated_face(
+                face.x + static_cast<int>(dx),
+                face.y + static_cast<int>(dy),
+                face.width,
+                face.height
+            );
+            
+            // Ensure face is within frame bounds
+            updated_face &= cv::Rect(0, 0, current_frame.cols, current_frame.rows);
+            
+            if (updated_face.width > 0 && updated_face.height > 0) {
+                updated_faces.push_back(updated_face);
+            }
+        }
+    }
+    
+    // Update tracking state
+    tracked_faces_ = updated_faces;
+    prev_gray_frame_ = current_gray;
+    
+    // If tracking lost all faces, force re-detection next frame
+    if (updated_faces.empty()) {
+        tracking_initialized_ = false;
+    }
+    
+    return updated_faces;
+}
+
+void FaceDetector::resetTracking() {
+    tracking_initialized_ = false;
+    tracked_faces_.clear();
+    prev_gray_frame_.release();
+    frames_since_detection_ = 0;
+}
+
 cv::Mat FaceDetector::alignFace(const cv::Mat& frame, const cv::Rect& face_rect) {
     // Extract face region
     cv::Mat face_img = frame(face_rect).clone();
@@ -135,19 +283,51 @@ std::vector<FaceEncoding> FaceDetector::encodeFaces(
     const cv::Mat& frame,
     const std::vector<cv::Rect>& face_locations) {
     
-    if (!models_loaded_ || face_locations.empty() || sface_recognizer_.empty()) {
+    if (!models_loaded_ || face_locations.empty()) {
         return {};
     }
     
     std::vector<FaceEncoding> encodings;
     
     for (const auto& face_rect : face_locations) {
-        // Align face for SFace
+        // Align face for SFace (112x112)
         cv::Mat aligned = alignFace(frame, face_rect);
         
-        // Extract feature using SFace
-        cv::Mat encoding;
-        sface_recognizer_->feature(aligned, encoding);
+        // Convert to NCNN format (no manual normalization - model has built-in preprocessing)
+        ncnn::Mat in = ncnn::Mat::from_pixels(
+            aligned.data, 
+            ncnn::Mat::PIXEL_BGR, 
+            aligned.cols, 
+            aligned.rows
+        );
+        
+        // Create extractor and run inference
+        ncnn::Extractor ex = ncnn_net_.create_extractor();
+        ex.set_light_mode(true);  // Optimize for speed
+        ex.input("data", in);
+        
+        // Extract features
+        ncnn::Mat out;
+        ex.extract("fc1", out);
+        
+        // Convert NCNN output to std::vector<float> and normalize
+        FaceEncoding encoding(out.w);
+        for (int i = 0; i < out.w; i++) {
+            encoding[i] = out[i];
+        }
+        
+        // L2 normalization
+        float norm = 0.0f;
+        for (float val : encoding) {
+            norm += val * val;
+        }
+        norm = std::sqrt(norm);
+        
+        if (norm > 0) {
+            for (float& val : encoding) {
+                val /= norm;
+            }
+        }
         
         encodings.push_back(encoding);
     }
@@ -156,37 +336,27 @@ std::vector<FaceEncoding> FaceDetector::encodeFaces(
 }
 
 double FaceDetector::compareFaces(const FaceEncoding& encoding1, const FaceEncoding& encoding2) {
-    // Manual cosine similarity calculation
-    // Encodings can be either 1x128 or 128x1, both are valid
+    // Manual cosine similarity calculation for std::vector<float>
     
     // Ensure encodings are valid
     if (encoding1.empty() || encoding2.empty()) {
         return 999.0;  // Return large distance for invalid comparison
     }
     
-    // Get total elements (should be 128 for both)
-    int size1 = encoding1.rows * encoding1.cols;
-    int size2 = encoding2.rows * encoding2.cols;
-    
-    if (size1 != size2 || size1 != 128) {
+    // Check size (should be 128 for both)
+    if (encoding1.size() != encoding2.size() || encoding1.size() != 128) {
         return 999.0;  // Size mismatch
     }
     
-    // Calculate dot product and norms (works for both row and column vectors)
+    // Calculate dot product (encodings are already L2 normalized)
     double dot_product = 0.0;
-    double norm1 = 0.0;
-    double norm2 = 0.0;
     
-    for (int i = 0; i < size1; i++) {
-        float val1 = encoding1.at<float>(i);
-        float val2 = encoding2.at<float>(i);
-        dot_product += val1 * val2;
-        norm1 += val1 * val1;
-        norm2 += val2 * val2;
+    for (size_t i = 0; i < encoding1.size(); i++) {
+        dot_product += encoding1[i] * encoding2[i];
     }
     
-    // Compute cosine similarity
-    double cosine_sim = dot_product / (std::sqrt(norm1) * std::sqrt(norm2));
+    // Since encodings are already normalized, dot product IS cosine similarity
+    double cosine_sim = dot_product;
     
     // Convert to distance (lower = more similar)
     // Cosine similarity: 1 (identical) to -1 (opposite)

@@ -180,6 +180,7 @@ static bool authenticate_user(const char* username) {
                 }
                 
                 double threshold = config.getDouble("recognition", "threshold").value_or(0.6);
+                int tracking_interval = config.getInt("face_detection", "tracking_interval").value_or(10);
                 
                 auto start = std::chrono::steady_clock::now();
                 while (!cancel_flag.load() && std::chrono::duration_cast<std::chrono::seconds>(
@@ -193,8 +194,8 @@ static bool authenticate_user(const char* username) {
                     // Preprocess for better detection
                     frame = detector.preprocessFrame(frame);
                     
-                    // Detect faces (with downscaling for speed)
-                    auto faces = detector.detectFaces(frame, true);
+                    // Detect faces (with tracking optimization)
+                    auto faces = detector.detectOrTrackFaces(frame, tracking_interval);
                     if (faces.empty()) {
                         continue;
                     }
@@ -206,7 +207,7 @@ static bool authenticate_user(const char* username) {
                     }
                     
                     // Compare with stored encodings
-                    std::vector<cv::Mat> stored_encodings;
+                    std::vector<faceid::FaceEncoding> stored_encodings;
                     
                     // Try new multi-face format first
                     if (model_data.isMember("faces") && !model_data["faces"].empty()) {
@@ -219,9 +220,9 @@ static bool authenticate_user(const char* username) {
                                 const Json::Value& encodings_array = face_data["encodings"];
                                 
                                 for (const auto& enc_json : encodings_array) {
-                                    cv::Mat stored_encoding(128, 1, CV_32F);
+                                    faceid::FaceEncoding stored_encoding(128);
                                     for (int i = 0; i < 128 && i < static_cast<int>(enc_json.size()); i++) {
-                                        stored_encoding.at<float>(i) = enc_json[i].asFloat();
+                                        stored_encoding[i] = enc_json[i].asFloat();
                                     }
                                     stored_encodings.push_back(stored_encoding);
                                 }
@@ -233,9 +234,9 @@ static bool authenticate_user(const char* username) {
                         const Json::Value& stored_encodings_json = model_data["encodings"];
                         
                         for (const auto& enc_json : stored_encodings_json) {
-                            cv::Mat stored_encoding(128, 1, CV_32F);
+                            faceid::FaceEncoding stored_encoding(128);
                             for (int i = 0; i < 128 && i < static_cast<int>(enc_json.size()); i++) {
-                                stored_encoding.at<float>(i) = enc_json[i].asFloat();
+                                stored_encoding[i] = enc_json[i].asFloat();
                             }
                             stored_encodings.push_back(stored_encoding);
                         }

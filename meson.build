@@ -14,7 +14,21 @@ project(
 )
 
 # Dependencies
-opencv_dep = dependency('opencv4', required: true)
+# Only link the OpenCV modules we actually use:
+# - core: Basic data structures (Mat, etc.)
+# - imgproc: Image processing (resize, cvtColor, etc.)
+# Note: Removed videoio - we now use raw V4L2 for camera capture (49% faster!)
+# Note: We use NCNN for face recognition (no longer need opencv_dnn)
+# Note: We use LibFaceDetection for detection (no need for objdetect, features2d, calib3d)
+opencv_modules = ['opencv_core', 'opencv_imgproc', 'opencv_imgcodecs']
+opencv_dep = dependency('opencv4', required: true, modules: opencv_modules)
+
+# NCNN for face recognition (SFace model)
+ncnn_dep = dependency('ncnn', required: true)
+
+# TurboJPEG for fast MJPEG decompression (used by V4L2 camera backend)
+turbojpeg_dep = dependency('libturbojpeg', required: true)
+
 pam_dep = dependency('pam', required: false)
 if not pam_dep.found()
     pam_dep = declare_dependency(

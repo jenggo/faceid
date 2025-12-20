@@ -3,6 +3,7 @@
 #include <fstream>
 #include <thread>
 #include <chrono>
+#include <iomanip>
 #include <dirent.h>
 #include <json/json.h>
 #include "config_paths.h"
@@ -69,6 +70,7 @@ int cmd_add(const std::string& username, const std::string& face_id = "default")
     auto device = config.getString("camera", "device").value_or("/dev/video0");
     auto width = config.getInt("camera", "width").value_or(640);
     auto height = config.getInt("camera", "height").value_or(480);
+    int tracking_interval = config.getInt("face_detection", "tracking_interval").value_or(10);
     
     std::cout << "Using camera: " << device << " (" << width << "x" << height << ")" << std::endl;
     
@@ -131,8 +133,8 @@ int cmd_add(const std::string& username, const std::string& face_id = "default")
         // Preprocess frame
         cv::Mat processed_frame = detector.preprocessFrame(frame);
         
-        // Detect faces
-        auto faces = detector.detectFaces(processed_frame, true);
+        // Detect faces (with tracking optimization)
+        auto faces = detector.detectOrTrackFaces(processed_frame, tracking_interval);
         
         // Draw visualization on original frame
         cv::Mat display_frame = frame.clone();
@@ -268,9 +270,9 @@ int cmd_add(const std::string& username, const std::string& face_id = "default")
     Json::Value encodings_array(Json::arrayValue);
     for (const auto& encoding : encodings) {
         Json::Value encoding_array(Json::arrayValue);
-        // SFace encoding is cv::Mat (128x1 float matrix)
-        for (int i = 0; i < encoding.rows * encoding.cols; i++) {
-            encoding_array.append(encoding.at<float>(i));
+        // Encoding is std::vector<float> (128D)
+        for (float val : encoding) {
+            encoding_array.append(val);
         }
         encodings_array.append(encoding_array);
     }
@@ -480,6 +482,7 @@ int cmd_show() {
     auto device = config.getString("camera", "device").value_or("/dev/video0");
     auto width = config.getInt("camera", "width").value_or(640);
     auto height = config.getInt("camera", "height").value_or(480);
+    int tracking_interval = config.getInt("face_detection", "tracking_interval").value_or(10);
     
     std::cout << "Using camera: " << device << " (" << width << "x" << height << ")" << std::endl;
     
@@ -528,7 +531,7 @@ int cmd_show() {
         
         // Preprocess and detect faces
         cv::Mat processed_frame = detector.preprocessFrame(frame);
-        auto faces = detector.detectFaces(processed_frame, true);
+        auto faces = detector.detectOrTrackFaces(processed_frame, tracking_interval);
         
         // Clone frame for display
         cv::Mat display_frame = frame.clone();
@@ -643,9 +646,9 @@ int cmd_test(const std::string& username) {
             const Json::Value& encodings_array = face_data["encodings"];
             
             for (const auto& enc_json : encodings_array) {
-                cv::Mat encoding(128, 1, CV_32F);
+                faceid::FaceEncoding encoding(128);
                 for (int i = 0; i < 128 && i < static_cast<int>(enc_json.size()); i++) {
-                    encoding.at<float>(i) = enc_json[i].asFloat();
+                    encoding[i] = enc_json[i].asFloat();
                 }
                 stored_encodings.push_back(encoding);
             }
@@ -656,9 +659,9 @@ int cmd_test(const std::string& username) {
         // Old single-face format (backward compatibility)
         const Json::Value& encodings_array = model_data["encodings"];
         for (const auto& enc_json : encodings_array) {
-            cv::Mat encoding(128, 1, CV_32F);
+            faceid::FaceEncoding encoding(128);
             for (int i = 0; i < 128 && i < static_cast<int>(enc_json.size()); i++) {
-                encoding.at<float>(i) = enc_json[i].asFloat();
+                encoding[i] = enc_json[i].asFloat();
             }
             stored_encodings.push_back(encoding);
         }
@@ -679,6 +682,7 @@ int cmd_test(const std::string& username) {
     auto width = config.getInt("camera", "width").value_or(640);
     auto height = config.getInt("camera", "height").value_or(480);
     double threshold = config.getDouble("recognition", "threshold").value_or(0.6);
+    int tracking_interval = config.getInt("face_detection", "tracking_interval").value_or(10);
     
     std::cout << "Using camera: " << device << std::endl;
     std::cout << "Recognition threshold: " << threshold << std::endl;
@@ -706,6 +710,8 @@ int cmd_test(const std::string& username) {
     
     auto start = std::chrono::steady_clock::now();
     bool recognized = false;
+    double detection_time_ms = 0.0;
+    double recognition_time_ms = 0.0;
     
     while (std::chrono::duration_cast<std::chrono::seconds>(
            std::chrono::steady_clock::now() - start).count() < 5) {
@@ -716,13 +722,20 @@ int cmd_test(const std::string& username) {
         }
         
         frame = detector.preprocessFrame(frame);
-        auto faces = detector.detectFaces(frame, true);
+        
+        // Time face detection
+        auto detect_start = std::chrono::high_resolution_clock::now();
+        auto faces = detector.detectOrTrackFaces(frame, tracking_interval);
+        auto detect_end = std::chrono::high_resolution_clock::now();
+        detection_time_ms = std::chrono::duration<double, std::milli>(detect_end - detect_start).count();
         
         if (faces.empty()) {
             std::cout << "." << std::flush;
             continue;
         }
         
+        // Time face recognition
+        auto recog_start = std::chrono::high_resolution_clock::now();
         auto encodings = detector.encodeFaces(frame, faces);
         if (encodings.empty()) {
             continue;
@@ -736,12 +749,19 @@ int cmd_test(const std::string& username) {
                 min_distance = distance;
             }
         }
+        auto recog_end = std::chrono::high_resolution_clock::now();
+        recognition_time_ms = std::chrono::duration<double, std::milli>(recog_end - recog_start).count();
         
         std::cout << std::endl;
         std::cout << "Face detected! Distance: " << min_distance;
         
         if (min_distance < threshold) {
             std::cout << " ✓ MATCH" << std::endl;
+            std::cout << std::endl;
+            std::cout << "Performance:" << std::endl;
+            std::cout << "  Detection:    " << std::fixed << std::setprecision(2) << detection_time_ms << " ms" << std::endl;
+            std::cout << "  Recognition:  " << std::fixed << std::setprecision(2) << recognition_time_ms << " ms" << std::endl;
+            std::cout << "  Total:        " << std::fixed << std::setprecision(2) << (detection_time_ms + recognition_time_ms) << " ms" << std::endl;
             recognized = true;
             break;
         } else {

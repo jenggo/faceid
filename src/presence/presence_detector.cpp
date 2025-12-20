@@ -392,49 +392,31 @@ bool PresenceDetector::detectFace() {
         }
         last_shutter_state_ = shutter;
         
-        // LibFaceDetection detection
-        unsigned char result_buffer[0x20000];
-        int* pResults = facedetect_cnn(
-            result_buffer,
-            (unsigned char*)frame.data,
-            frame.cols, frame.rows,
-            (int)frame.step[0]
-        );
-        
-        bool detected = false;
-        if (pResults) {
-            int face_count = *pResults;
-            
-            // IMPORTANT: facedetect_cnn returns data as short integers, not FaceRect structs!
-            // Format: [score(short), x(short), y(short), w(short), h(short), landmarks(10 shorts)]
-            short* face_data = (short*)(pResults + 1);
-            
-            // Confidence threshold - score is 0-100 range (stored as short)
-            const int min_confidence_score = 60;  // 60/100 = 0.6
-            
-            // Check if any face meets confidence threshold
-            for (int i = 0; i < face_count; i++) {
-                short* p = face_data + 16 * i;  // Each face is 16 shorts
-                int score = p[0];  // Score is in 0-100 range
-                
-                if (score >= min_confidence_score) {
-                    detected = true;
-                    Logger::getInstance().debug("Face detected with confidence: " + 
-                                              std::to_string(score / 100.0));
-                    // Cache frame for peek detection
-                    last_captured_frame_ = frame.clone();
-                    break;
-                }
-            }
-            
-            if (!detected && face_count > 0) {
-                short* p = face_data;
-                int best_score = p[0];
-                Logger::getInstance().debug("Faces detected but below confidence threshold (best: " + 
-                                          std::to_string(best_score / 100.0) + ")");
-            }
+        // Use FaceDetector with tracking for better performance
+        // Convert frame to BGR if needed (presence capture might be different format)
+        cv::Mat bgr_frame = frame;
+        if (frame.channels() != 3) {
+            cv::cvtColor(frame, bgr_frame, cv::COLOR_GRAY2BGR);
         }
         
+        // Detect faces with tracking optimization
+        auto faces = face_detector_.detectOrTrackFaces(bgr_frame, tracking_interval_);
+        
+        bool detected = !faces.empty();
+        
+        if (detected) {
+            Logger::getInstance().debug("Face detected in presence check");
+            // Cache frame for peek detection
+            last_captured_frame_ = frame.clone();
+        }
+        
+        if (detected) {
+            successful_detections_++;
+        } else {
+            failed_detections_++;
+        }
+        
+        total_scans_++;
         return detected;
         
     } catch (const std::exception& e) {
@@ -872,56 +854,36 @@ bool PresenceDetector::detectPeek(const cv::Mat& frame) {
     Logger& logger = Logger::getInstance();
     
     try {
-        // LibFaceDetection detection
-        unsigned char result_buffer[0x20000];
-        int* pResults = facedetect_cnn(
-            result_buffer,
-            (unsigned char*)frame.data,
-            frame.cols, frame.rows,
-            (int)frame.step[0]
-        );
+        // Use FaceDetector with tracking for peek detection
+        cv::Mat bgr_frame = frame;
+        if (frame.channels() != 3) {
+            cv::cvtColor(frame, bgr_frame, cv::COLOR_GRAY2BGR);
+        }
         
-        if (!pResults || *pResults == 0) {
+        // Detect faces with tracking
+        auto face_rects = face_detector_.detectOrTrackFaces(bgr_frame, tracking_interval_);
+        
+        if (face_rects.empty()) {
             return false;  // No faces at all
         }
         
-        int face_count = *pResults;
-        
-        // IMPORTANT: facedetect_cnn returns data as short integers, not FaceRect structs!
-        short* face_data = (short*)(pResults + 1);
-        
-        // Convert to cv::Rect for analysis
-        std::vector<cv::Rect> face_rects;
-        
-        for (int i = 0; i < face_count; i++) {
-            short* p = face_data + 16 * i;  // Each face is 16 shorts
-            
-            int score = p[0];  // Score in 0-100 range
-            int x = p[1];
-            int y = p[2];
-            int w = p[3];
-            int h = p[4];
-            
-            // Only count faces with reasonable confidence (60/100 = 0.6)
-            if (score > 60) {
-                cv::Rect face(x, y, w, h);
-                
-                // Filter out faces that are too small (too far away to see screen)
-                double face_size_percent = static_cast<double>(w) / frame.cols;
-                if (face_size_percent >= min_face_size_percent_) {
-                    face_rects.push_back(face);
-                }
+        // Filter out faces that are too small (too far away to see screen)
+        std::vector<cv::Rect> filtered_faces;
+        for (const auto& face : face_rects) {
+            double face_size_percent = static_cast<double>(face.width) / frame.cols;
+            if (face_size_percent >= min_face_size_percent_) {
+                filtered_faces.push_back(face);
             }
         }
         
         // Check if we have multiple distinct faces
-        if (face_rects.size() < 2) {
+        if (filtered_faces.size() < 2) {
             return false;  // Only one person (or none after filtering)
         }
         
         // Use FaceDetector helper to count distinct faces
         // (This filters out same person detected multiple times due to movement)
-        int distinct_count = FaceDetector::countDistinctFaces(face_rects, min_face_distance_pixels_);
+        int distinct_count = FaceDetector::countDistinctFaces(filtered_faces, min_face_distance_pixels_);
         
         bool peek = (distinct_count >= 2);
         
