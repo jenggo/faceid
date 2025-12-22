@@ -39,16 +39,8 @@ the use of this software, even if advised of the possibility of such damage.
 
 #include "facedetectcnn.h"
 
-
-#if 0
-#include <opencv2/opencv.hpp>
-cv::TickMeter cvtm;
-#define TIME_START cvtm.reset();cvtm.start();
-#define TIME_END(FUNCNAME) cvtm.stop(); printf(FUNCNAME);printf("=%g\n", cvtm.getTimeMilli());
-#else
 #define TIME_START
 #define TIME_END(FUNCNAME)
-#endif
 
 
 #define NUM_CONV_LAYER 53

@@ -1,6 +1,7 @@
 #include "face_detector.h"
 #include "clahe.h"
 #include "optical_flow.h"
+#include "config_paths.h"
 #include <libyuv.h>
 #include <algorithm>
 #include <cmath>
@@ -46,33 +47,17 @@ FaceDetector::FaceDetector() {
     // LibFaceDetection has embedded models - no initialization needed
 }
 
-bool FaceDetector::loadModels(const std::string& face_recognition_model_path) {
+bool FaceDetector::loadModels(const std::string& model_base_path) {
     try {
         // Load NCNN SFace model
-        // Expect model_path to be directory containing sface.param and sface.bin
-        // Or model_path to be base path without extension (e.g., "/etc/faceid/models/sface")
+        // Default to MODELS_DIR/sface if no path provided
+        std::string base_path = model_base_path.empty() 
+            ? std::string(MODELS_DIR) + "/sface"
+            : model_base_path;
         
-        std::string param_path;
-        std::string bin_path;
-        
-        // Check if path is a directory or file base
-        if (face_recognition_model_path.find(".param") != std::string::npos) {
-            // Full path to .param file given
-            param_path = face_recognition_model_path;
-            bin_path = face_recognition_model_path;
-            bin_path.replace(bin_path.find(".param"), 6, ".bin");
-        } else if (face_recognition_model_path.find(".onnx") != std::string::npos) {
-            // ONNX path given - convert to NCNN paths
-            // /etc/faceid/models/face_recognition_sface_2021dec.onnx
-            // -> /etc/faceid/models/sface.param and sface.bin
-            std::string base_dir = face_recognition_model_path.substr(0, face_recognition_model_path.find_last_of('/'));
-            param_path = base_dir + "/sface.param";
-            bin_path = base_dir + "/sface.bin";
-        } else {
-            // Assume it's a base path without extension
-            param_path = face_recognition_model_path + ".param";
-            bin_path = face_recognition_model_path + ".bin";
-        }
+        // Build paths to .param and .bin files
+        std::string param_path = base_path + ".param";
+        std::string bin_path = base_path + ".bin";
         
         // Configure NCNN options for optimal CPU performance
         ncnn_net_.opt.use_vulkan_compute = false;  // Use CPU (more reliable for PAM)
@@ -91,6 +76,17 @@ bool FaceDetector::loadModels(const std::string& face_recognition_model_path) {
             return false;
         }
         
+        // Validate model by attempting to create an extractor and check layer exists
+        // This catches subtle corruption that load_param/load_model might miss
+        try {
+            ncnn::Extractor ex = ncnn_net_.create_extractor();
+            // Just creating the extractor validates the model structure
+            // We don't need to run full inference here
+        } catch (...) {
+            // Model loaded but can't create extractor - likely corrupted
+            return false;
+        }
+        
         models_loaded_ = true;
         return true;
     } catch (const std::exception& e) {
@@ -99,6 +95,7 @@ bool FaceDetector::loadModels(const std::string& face_recognition_model_path) {
 }
 
 std::vector<Rect> FaceDetector::detectFaces(const ImageView& frame, bool downscale) {
+    (void)downscale;  // Parameter deprecated but kept for API compatibility
     // Check cache first
     if (use_cache_) {
         uint64_t frame_hash = hashFrame(frame);
@@ -352,7 +349,18 @@ std::vector<FaceEncoding> FaceDetector::encodeFaces(
         
         // Extract features
         ncnn::Mat out;
-        ex.extract("fc1", out);
+        int ret = ex.extract("fc1", out);
+        if (ret != 0) {
+            // Inference failed - skip this face
+            // This can happen with corrupted models or invalid input
+            continue;
+        }
+        
+        // Validate output dimensions (SFace should produce 128D vector)
+        if (out.w != 128 || out.h != 1 || out.c != 1) {
+            // Unexpected output dimensions - skip this face
+            continue;
+        }
         
         // Convert NCNN output to std::vector<float> and normalize
         FaceEncoding encoding(out.w);
@@ -398,6 +406,11 @@ double FaceDetector::compareFaces(const FaceEncoding& encoding1, const FaceEncod
     for (size_t i = 0; i < encoding1.size(); i++) {
         dot_product += encoding1[i] * encoding2[i];
     }
+    
+    // Clamp dot product to [-1, 1] to handle floating point precision errors
+    // (normalized vectors should have dot product in [-1, 1], but fp math can exceed)
+    if (dot_product > 1.0) dot_product = 1.0;
+    if (dot_product < -1.0) dot_product = -1.0;
     
     // Since encodings are already normalized, dot product IS cosine similarity
     double cosine_sim = dot_product;

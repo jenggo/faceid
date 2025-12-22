@@ -86,7 +86,7 @@ bool PresenceGuard::checkScreenLock() {
                     cached_session_id_.pop_back();
                 }
             }
-            pclose(pipe);
+            pclose(pipe);  // Always close pipe
         }
         last_session_check_ = now;
     }
@@ -99,7 +99,6 @@ bool PresenceGuard::checkScreenLock() {
         if (pipe) {
             char buffer[16];
             if (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
-                pclose(pipe);
                 std::string result(buffer);
                 // Remove whitespace/newline
                 result.erase(result.find_last_not_of(" \n\r\t") + 1);
@@ -111,12 +110,14 @@ bool PresenceGuard::checkScreenLock() {
                     is_unlocked = true;
                 }
                 
+                pclose(pipe);  // Close before return
+                
                 // Update cache and return
                 cached_lock_state_ = is_unlocked;
                 last_lock_state_check_ = now;
                 return cached_lock_state_;
             }
-            pclose(pipe);
+            pclose(pipe);  // Close if fgets failed
         }
     }
     

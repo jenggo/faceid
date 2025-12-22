@@ -39,10 +39,6 @@ private:
     bool is_wayland_;
     
     // Detection methods
-    bool checkWaylandDisplay();
-    bool checkX11Display();
-    bool checkSystemdSession();
-    bool checkDPMS();
     bool checkKDELockScreen();
     bool checkGNOMELockScreen();
 };

@@ -17,7 +17,13 @@ namespace faceid {
 class CLAHE {
 public:
     CLAHE(double clipLimit = 2.0, int tilesX = 8, int tilesY = 8);
-    ~CLAHE();  // Destructor to free buffers
+    ~CLAHE();
+    
+    // Delete copy/move to ensure single ownership of buffers
+    CLAHE(const CLAHE&) = delete;
+    CLAHE& operator=(const CLAHE&) = delete;
+    CLAHE(CLAHE&&) = delete;
+    CLAHE& operator=(CLAHE&&) = delete;
     
     // Apply CLAHE to grayscale image
     // Input: src_data (width x height, stride = width)

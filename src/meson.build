@@ -51,6 +51,8 @@ core_sources = files(
     'display_detector.cpp',
     'presence/presence_guard.cpp',
     'presence/presence_detector.cpp',
+    'models/binary_model.cpp',
+    'models/model_cache.cpp',
 )
 
 core_lib = static_library(
@@ -61,9 +63,6 @@ core_lib = static_library(
     cpp_args: libface_cpp_args,
 )
 
-# Dependencies
-jsoncpp_dep = dependency('jsoncpp', required: true)
-
 # PAM module
 pam_sources = files('pam/pam_faceid.cpp')
 
@@ -71,7 +70,7 @@ pam_module = shared_module(
     'pam_faceid',
     sources: pam_sources,
     include_directories: inc,
-    dependencies: [pam_dep, ncnn_dep, turbojpeg_dep, libyuv_dep, jsoncpp_dep, gio_dep, glib_dep],
+    dependencies: [pam_dep, ncnn_dep, turbojpeg_dep, libyuv_dep, gio_dep, glib_dep],
     link_with: core_lib,
     cpp_args: libface_cpp_args,
     link_args: ['-ldl', '-lpthread'],  # For threading support
@@ -83,6 +82,13 @@ pam_module = shared_module(
 # CLI tool
 cli_sources = files(
     'cli/main.cpp',
+    'cli/cmd_devices.cpp',
+    'cli/cmd_add.cpp',
+    'cli/cmd_remove.cpp',
+    'cli/cmd_list.cpp',
+    'cli/cmd_show.cpp',
+    'cli/cmd_test.cpp',
+    'cli/cmd_help.cpp',
     'display.cpp'
 )
 
@@ -90,7 +96,7 @@ cli_exe = executable(
     'faceid',
     sources: cli_sources,
     include_directories: inc,
-    dependencies: [ncnn_dep, turbojpeg_dep, libyuv_dep, jsoncpp_dep, sdl2_dep],
+    dependencies: [ncnn_dep, turbojpeg_dep, libyuv_dep, sdl2_dep],
     link_with: core_lib,
     cpp_args: libface_cpp_args,
     install: true,
@@ -119,4 +125,14 @@ config_merge_exe = executable(
     cpp_args: cpp_args,
     install: true,
     install_dir: get_option('bindir'),
+)
+
+# Test encoding integrity
+test_encoding_integrity_exe = executable(
+    'test-encoding-integrity',
+    sources: files('models/test_encoding_integrity.cpp'),
+    include_directories: inc,
+    link_with: core_lib,
+    cpp_args: cpp_args,
+    install: false,
 )

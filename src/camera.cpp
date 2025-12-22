@@ -1,6 +1,4 @@
 #include "camera.h"
-#include <sys/types.h>
-#include <sys/stat.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <fcntl.h>
