@@ -17,8 +17,10 @@ class FaceDetector {
 public:
     FaceDetector();
     
-    // Only need recognition model path (no detection model needed - embedded in LibFaceDetection)
-    bool loadModels(const std::string& face_recognition_model_path);
+    // Load NCNN models from base path (defaults to CONFIG_DIR/models/sface)
+    // Pass empty string or full path without extension (e.g., "/etc/faceid/models/sface")
+    // Will load .param and .bin files automatically
+    bool loadModels(const std::string& model_base_path = "");
     
     // Detect faces in frame using LibFaceDetection
     std::vector<Rect> detectFaces(const ImageView& frame, bool downscale = false);

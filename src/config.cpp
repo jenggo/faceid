@@ -1,6 +1,5 @@
 #include "config.h"
 #include <fstream>
-#include <sstream>
 #include <algorithm>
 
 namespace faceid {

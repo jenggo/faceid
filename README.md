@@ -23,18 +23,18 @@ Tested in my T14 Gen4 Ryzen (Manjaro Plasma Wayland).
 
 **Arch Linux:**
 ```bash
-sudo pacman -S base-devel meson ninja jsoncpp ncnn pam libjpeg-turbo sdl2 libyuv glib2 fprintd
+sudo pacman -S base-devel meson ninja ncnn pam libjpeg-turbo sdl2 libyuv glib2 fprintd
 ```
 
 **Debian/Ubuntu:**
 ```bash
-sudo apt-get install build-essential meson ninja-build libjsoncpp-dev libncnn-dev \
+sudo apt-get install build-essential meson ninja-build libncnn-dev \
     libpam0g-dev libturbojpeg0-dev libsdl2-dev libyuv-dev libglib2.0-dev fprintd pkg-config
 ```
 
 **Fedora:**
 ```bash
-sudo dnf install gcc-c++ meson ninja-build jsoncpp-devel ncnn-devel \
+sudo dnf install gcc-c++ meson ninja-build ncnn-devel \
     pam-devel turbojpeg-devel SDL2-devel libyuv-devel glib2-devel fprintd pkgconfig
 ```
 
@@ -50,15 +50,48 @@ Or use Makefile: `make build && sudo make install`
 
 ### 3. Download Face Recognition Model
 
-```bash
-# Create directories
-sudo mkdir -p /etc/faceid/models && cd /etc/faceid/models
+FaceID uses **NCNN format** models (`.param` + `.bin` files) for face recognition. Face detection uses LibFaceDetection with embedded model weights - no download needed!
 
-# Download SFace face recognition model (37MB)
-# NOTE: Face detection uses LibFaceDetection with embedded model weights - no download needed!
+**Note:** Pre-converted NCNN models for SFace are not officially available. You must convert the ONNX model yourself using the instructions below.
+
+#### Convert ONNX to NCNN Format
+
+```bash
+# 1. Install NCNN tools (includes onnx2ncnn converter)
+# Arch Linux:
+sudo pacman -S ncnn
+
+# Debian/Ubuntu (build from source):
+git clone https://github.com/Tencent/ncnn.git
+cd ncnn
+mkdir build && cd build
+cmake -DCMAKE_BUILD_TYPE=Release -DNCNN_BUILD_TOOLS=ON ..
+make -j$(nproc)
+sudo make install
+
+# 2. Download ONNX model from OpenCV Model Zoo
+cd /etc/faceid/models
 sudo wget -O face_recognition_sface_2021dec.onnx \
     https://github.com/opencv/opencv_zoo/raw/main/models/face_recognition_sface/face_recognition_sface_2021dec.onnx
+
+# 3. Convert ONNX to NCNN format
+onnx2ncnn face_recognition_sface_2021dec.onnx sface.param sface.bin
+
+# 4. Verify the files exist
+ls -lh sface.param sface.bin
+# Expected output:
+#   sface.param (~9KB)   - NCNN model architecture
+#   sface.bin (~37MB)    - NCNN model weights
+
+# 5. Remove ONNX file (optional, saves 37MB)
+sudo rm face_recognition_sface_2021dec.onnx
 ```
+
+**Required Files:**
+- `/etc/faceid/models/sface.param` (9KB) - Model architecture
+- `/etc/faceid/models/sface.bin` (37MB) - Model weights
+
+**Note:** The system will automatically load these files from `/etc/faceid/models/sface.{param,bin}` by default.
 
 ### 4. Enroll
 
@@ -150,10 +183,16 @@ faceid devices              # List cameras
 faceid show                 # Live camera preview with face detection
 sudo faceid add <user>      # Enroll face
 sudo faceid remove <user>   # Remove face model
-sudo faceid test <user>     # Test recognition
+sudo faceid test <user>     # Test recognition (includes integrity checks)
 sudo faceid list            # List enrolled users
 tail -f /var/log/faceid.log # View auth logs
 ```
+
+**Note:** `faceid test` automatically performs encoding integrity checks before the live camera test, verifying:
+- Proper normalization of face encodings
+- No NaN or Inf values in the data
+- Correct dimensions (128D vectors)
+- Self-similarity validation
 
 ## PAM Configuration Examples
 
@@ -184,6 +223,23 @@ sudo usermod -aG video $USER  # Add to video group
 - Ensure good lighting, look directly at camera
 - Try re-enrolling: `sudo faceid add username`
 - Adjust threshold in config (higher = more lenient)
+
+### Model Loading Failed
+```bash
+# Check if NCNN model files exist
+ls -lh /etc/faceid/models/sface.{param,bin}
+
+# If missing, you need to convert ONNX to NCNN format (see installation step 3)
+# Or download pre-converted models
+
+# Check file permissions
+sudo chmod 644 /etc/faceid/models/sface.{param,bin}
+```
+
+**Error: "Failed to load face recognition model"**
+- Ensure both `sface.param` (9KB) and `sface.bin` (37MB) exist in `/etc/faceid/models/`
+- If you have the ONNX file instead, convert it using `onnx2ncnn` (see installation instructions)
+- The system uses NCNN format, not ONNX format directly
 
 ### Fingerprint Not Working
 ```bash
@@ -226,6 +282,15 @@ A: No camera/sensor over SSH. Password will be used automatically.
 **Q: What is shoulder surfing detection?**  
 A: The "no peek" feature detects multiple faces in the camera frame and blanks the screen if someone stands behind you. Adjustable via `min_face_distance_pixels` and `min_face_size_percent` in the `[no_peek]` config section.
 
+**Q: What model format does FaceID use?**  
+A: FaceID uses **NCNN format** (`.param` + `.bin` files) for face recognition. If you have an ONNX model, convert it using the `onnx2ncnn` tool (see installation step 3). Face detection uses LibFaceDetection with embedded weights, so no external model file is needed.
+
+**Q: Can I use the ONNX model directly?**  
+A: No. FaceID requires NCNN format for optimal performance. NCNN is specifically optimized for mobile/embedded devices and offers better speed than ONNX runtime on CPU. Use `onnx2ncnn` to convert your model.
+
+**Q: Where can I get pre-converted NCNN models?**  
+A: The SFace model can be converted from the [OpenCV Model Zoo](https://github.com/opencv/opencv_zoo/tree/main/models/face_recognition_sface). Follow the conversion instructions in installation step 3.
+
 **Q: How do I preview the camera and see face detection?**  
 A: Run `faceid show` for a live camera feed with real-time face detection rectangles (green for primary face, yellow for additional faces). Shows FPS, face count, and resolution.
 
@@ -257,7 +322,7 @@ sudo rm -rf /etc/faceid
 
 **Face Detection Pipeline:**
 - **Detection**: LibFaceDetection CNN (embedded 436KB model weights, ~2.5ms with AVX512, 6x faster than OpenCV)
-- **Recognition**: NCNN SFace/MobileFaceNet (ONNX model, 37MB, ~13ms, 128D encodings)
+- **Recognition**: NCNN SFace/MobileFaceNet (NCNN format: `sface.param` + `sface.bin`, ~13ms, 128D encodings)
 - **Preprocessing**: Custom CLAHE implementation (0.77ms, 6.6x faster than OpenCV)
 - **Advantages**: Embedded model (no external files), SIMD optimized (AVX512/AVX2/NEON), zero OpenCV dependencies
 - **Multi-face Analysis**: Calculates center-to-center distances and face sizes to distinguish multiple people
@@ -285,7 +350,8 @@ sudo rm -rf /etc/faceid
 - Logging: `/var/log/faceid.log` with timestamps, durations, methods
 
 **Storage:**
-- Face models: `/etc/faceid/models/<user>.json` (128D SFace encodings)
+- Face models: `/etc/faceid/models/<user>.bin` or `/etc/faceid/models/<user>.<location>.bin` (binary format with 128D SFace encodings)
+- Recognition model: `/etc/faceid/models/sface.param` + `/etc/faceid/models/sface.bin` (NCNN format)
 - Fingerprints: fprintd database (`/var/lib/fprint/`, managed via D-Bus)
 
 **Live Camera Preview (`faceid show`):**
@@ -313,11 +379,10 @@ FaceID has completely eliminated OpenCV in favor of specialized, faster librarie
 | Data types | `cv::Mat`, `cv::Rect` | Custom `Image`/`ImageView` | Type-safe, move-only |
 
 **Dependencies:**
-- **NCNN**: Face recognition inference engine
+- **NCNN**: Face recognition inference engine (optimized neural network framework)
 - **TurboJPEG**: Fast MJPEG decompression for V4L2 camera
 - **libyuv**: Hardware-accelerated image resizing and color conversion
 - **SDL2**: Hardware-accelerated display rendering
-- **jsoncpp**: Face model storage
 - **GLib/GIO**: D-Bus communication for fingerprint
 - **PAM**: Linux authentication framework
 

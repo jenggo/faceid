@@ -445,8 +445,10 @@ bool PresenceDetector::detectFace() {
         
         if (detected) {
             Logger::getInstance().debug("Face detected in presence check");
-            // Cache frame for peek detection
-            last_captured_frame_ = bgr_frame.clone();
+            // Cache frame for peek detection (only if peek enabled)
+            if (no_peek_enabled_) {
+                last_captured_frame_ = bgr_frame.clone();
+            }
         }
         
         if (detected) {
@@ -455,7 +457,6 @@ bool PresenceDetector::detectFace() {
             failed_detections_++;
         }
         
-        total_scans_++;
         return detected;
         
     } catch (const std::exception& e) {
@@ -668,8 +669,7 @@ time_t PresenceDetector::getLastInputDeviceActivity() const {
     }
     
     unsigned long long total_count = 0;
-    static std::string line;  // Static to avoid reallocation
-    line.clear();
+    std::string line;
     line.reserve(256);  // Pre-allocate to reduce reallocations
     
     while (std::getline(interrupts, line)) {

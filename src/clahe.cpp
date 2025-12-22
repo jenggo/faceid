@@ -182,8 +182,8 @@ void CLAHE::apply(const uint8_t* src_data, uint8_t* dst_data,
 }
 
 CLAHE::~CLAHE() {
-    if (lut_) delete[] lut_;
-    if (srcExt_) delete[] srcExt_;
+    delete[] lut_;
+    delete[] srcExt_;
 }
 
 } // namespace faceid

@@ -135,7 +135,37 @@ int main(int argc, char* argv[]) {
     
     std::cout << "Found " << user_values.size() << " existing user settings" << std::endl;
     
-    // Create backup
+    // First pass: Check if there are any changes (new keys or different values)
+    bool has_changes = false;
+    int potential_new_keys = 0;
+    current_section = "";
+    
+    std::ifstream source_precheck(source_path);
+    while (std::getline(source_precheck, line)) {
+        ConfigLine parsed = parseLine(line);
+        
+        if (parsed.type == ConfigLine::SECTION) {
+            current_section = parsed.section;
+        } else if (parsed.type == ConfigLine::KEYVALUE) {
+            std::string lookup_key = current_section + "|" + parsed.key;
+            if (user_values.find(lookup_key) == user_values.end()) {
+                has_changes = true;
+                potential_new_keys++;
+            }
+        }
+    }
+    source_precheck.close();
+    
+    // If no changes, just report and exit
+    if (!has_changes) {
+        std::cout << "No configuration changes detected - backup skipped" << std::endl;
+        std::cout << "Config already up-to-date: " << dest_path << std::endl;
+        return 0;
+    }
+    
+    std::cout << "Detected " << potential_new_keys << " new configuration keys" << std::endl;
+    
+    // Create backup only if there are changes
     std::time_t now = std::time(nullptr);
     char timestamp[32];
     std::strftime(timestamp, sizeof(timestamp), "%Y%m%d-%H%M%S", std::localtime(&now));

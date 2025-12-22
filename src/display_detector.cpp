@@ -52,19 +52,14 @@ DisplayState DisplayDetector::getDisplayState() {
 }
 
 bool DisplayDetector::isScreenLocked() {
-    // Try multiple methods to detect screen lock
-    
-    // Method 1: Check systemd session LockedHint (most reliable)
+    // Check systemd session LockedHint (most reliable)
     FILE* pipe = popen("loginctl show-session $(loginctl | grep $(whoami) | awk '{print $1}') -p LockedHint --value 2>/dev/null", "r");
     if (pipe) {
         char buffer[128];
         if (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
             pclose(pipe);
             std::string result(buffer);
-            // Remove trailing newline
-            if (!result.empty() && result.back() == '\n') {
-                result.pop_back();
-            }
+            result.erase(result.find_last_not_of(" \t\n\r") + 1);  // Trim trailing whitespace
             if (result == "yes" || result == "true" || result == "1") {
                 return true;
             }
@@ -73,9 +68,7 @@ bool DisplayDetector::isScreenLocked() {
         }
     }
     
-    // Method 2: Check for KDE lock screen GREETER (not daemon!)
-    // The greeter only runs when actually locked, daemon is always running
-    // Use ps to get exact process name to avoid false positives from daemon
+    // Check for KDE lock screen GREETER (not daemon)
     pipe = popen("ps aux | grep -w '[k]screenlocker_greet' 2>/dev/null", "r");
     if (pipe) {
         char buffer[128];
@@ -86,13 +79,27 @@ bool DisplayDetector::isScreenLocked() {
         }
     }
     
-    // Method 3: Check for screensaver/lock processes (GNOME)
-    // REMOVED: pgrep -f gnome-screensav matches background daemons that always run
-    // Use D-Bus check in checkGNOMELockScreen() instead
+    return false;
+}
+
+bool DisplayDetector::isLockScreenGreeter() {
+    // Check environment variables that indicate we're running from a lock screen greeter
+    const char* pam_service = getenv("PAM_SERVICE");
+    if (pam_service) {
+        // Common lock screen greeter service names
+        if (strcmp(pam_service, "kde") == 0 ||
+            strcmp(pam_service, "kde-fingerprint") == 0 ||
+            strcmp(pam_service, "sddm") == 0 ||
+            strcmp(pam_service, "lightdm") == 0 ||
+            strcmp(pam_service, "gdm-password") == 0) {
+            return true;
+        }
+    }
     
-    // Method 4: Check XDG screensaver status (works on many DEs)
-    // REMOVED: xdg-screensaver "enabled" means "can be activated", NOT "currently locked"
-    // This method causes false positives and should not be used
+    // Check if called from known lock screen processes
+    if (checkKDELockScreen() || checkGNOMELockScreen()) {
+        return true;
+    }
     
     return false;
 }
@@ -101,44 +108,25 @@ bool DisplayDetector::isDisplayBlanked() {
     // Method 1: Check DRM power state for laptop's built-in display (eDP) FIRST
     // This is the MOST RELIABLE method on KDE Plasma and modern Linux systems
     // NOTE: Only check eDP specifically - external DP/HDMI ports may be "Off" when disconnected
-    // which would cause false positives if we check all displays with wildcards
-    FILE* pipe = popen("cat /sys/class/drm/card*/card*-eDP-*/dpms 2>/dev/null | head -1", "r");
-    if (pipe) {
-        char buffer[128];
-        if (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
-            pclose(pipe);
-            std::string result(buffer);
-            if (result.find("Off") != std::string::npos || 
-                result.find("off") != std::string::npos) {
-                return true;
-            }
-            // eDP is On, screen is definitely on
-            return false;
-        } else {
-            pclose(pipe);
+    std::ifstream drm_state("/sys/class/drm/card0/card0-eDP-1/dpms");
+    if (drm_state.is_open()) {
+        std::string state;
+        std::getline(drm_state, state);
+        if (state.find("Off") != std::string::npos || state.find("off") != std::string::npos) {
+            return true;
         }
+        // eDP is On, screen is definitely on
+        return false;
     }
     
     // Method 2: Check backlight state as fallback
     // Note: On some systems (KDE Plasma), backlight may not go to 0 even when display is "Off"
-    // so we use this as secondary check only
-    pipe = popen("cat /sys/class/backlight/*/actual_brightness 2>/dev/null | head -1", "r");
-    if (pipe) {
-        char buffer[128];
-        if (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
-            pclose(pipe);
-            try {
-                int brightness = std::stoi(buffer);
-                if (brightness == 0) {
-                    return true;  // Screen is definitely off
-                }
-                // Brightness > 0, but we already checked DRM above
-                // Don't return false here - continue to other methods
-            } catch (...) {
-                // Ignore parse errors, try other methods
-            }
-        } else {
-            pclose(pipe);
+    std::ifstream backlight("/sys/class/backlight/intel_backlight/actual_brightness");
+    if (backlight.is_open()) {
+        int brightness = 0;
+        backlight >> brightness;
+        if (brightness == 0) {
+            return true;  // Screen is definitely off
         }
     }
     
@@ -150,14 +138,12 @@ bool DisplayDetector::isDisplayBlanked() {
             if (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
                 pclose(pipe);
                 std::string result(buffer);
-                if (result.find("Off") != std::string::npos || 
-                    result.find("off") != std::string::npos) {
+                if (result.find("Off") != std::string::npos || result.find("off") != std::string::npos) {
                     return true;
                 }
                 return false;
-            } else {
-                pclose(pipe);
             }
+            pclose(pipe);
         }
     }
     
@@ -165,121 +151,17 @@ bool DisplayDetector::isDisplayBlanked() {
     return false;
 }
 
-bool DisplayDetector::checkWaylandDisplay() {
-    // For Wayland, we need to check compositor-specific methods
-    // This is more complex and compositor-dependent
-    return false; // TODO: Implement Wayland-specific checks
-}
-
-bool DisplayDetector::checkX11Display() {
-    // Check DPMS state
-    return isDisplayBlanked();
-}
-
-bool DisplayDetector::checkSystemdSession() {
-    // Check if session is active
-    FILE* pipe = popen("loginctl show-session $(loginctl | grep $(whoami) | awk '{print $1}') -p Active --value 2>/dev/null", "r");
-    if (pipe) {
-        char buffer[128];
-        if (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
-            pclose(pipe);
-            std::string result(buffer);
-            if (!result.empty() && result.back() == '\n') {
-                result.pop_back();
-            }
-            return (result == "yes" || result == "true" || result == "1");
-        }
-        pclose(pipe);
-    }
-    return false;
-}
-
-bool DisplayDetector::checkDPMS() {
-    return isDisplayBlanked();
-}
-
-bool DisplayDetector::isLockScreenGreeter() {
-    // Check if we're being called from a lock screen greeter process
-    // This helps us differentiate between:
-    // 1. Lock screen authentication (greeter process)
-    // 2. Sudo/su authentication while screen is locked
-    
-    // Method 1: Check if KDE lock screen greeter is in our process tree
-    if (checkKDELockScreen()) {
-        return true;
-    }
-    
-    // Method 2: Check if GNOME lock screen is in our process tree
-    if (checkGNOMELockScreen()) {
-        return true;
-    }
-    
-    // Method 3: Check PAM_SERVICE environment variable
-    const char* pam_service = getenv("PAM_SERVICE");
-    if (pam_service) {
-        std::string service(pam_service);
-        // Common lock screen PAM services
-        if (service.find("kde-screen-locker") != std::string::npos ||
-            service.find("kscreenlocker") != std::string::npos ||
-            service.find("gnome-screensaver") != std::string::npos ||
-            service.find("lightdm") != std::string::npos ||
-            service.find("gdm-password") != std::string::npos) {
-            return true;
-        }
-    }
-    
-    // Method 4: Check PAM_TTY for typical lock screen patterns
-    const char* pam_tty = getenv("PAM_TTY");
-    if (pam_tty) {
-        std::string tty(pam_tty);
-        if (tty == ":0" || tty.find("login") != std::string::npos) {
-            // Might be a lock screen, but not definitive
-            // Additional check: is screen actually locked?
-            return isScreenLocked();
-        }
-    }
-    
-    return false;
-}
-
 bool DisplayDetector::checkKDELockScreen() {
     // Check if kscreenlocker_greet process exists (the actual lock screen UI)
     // NOT kscreenlocker (which is a daemon that runs all the time)
-    
-    // Method 1: Check for the greeter process specifically
-    // Use ps with grep to get exact binary name, avoiding daemon false positives
     FILE* pipe = popen("ps aux | grep -w '[k]screenlocker_greet' 2>/dev/null", "r");
     if (pipe) {
         char buffer[128];
         bool has_output = (fgets(buffer, sizeof(buffer), pipe) != nullptr);
         pclose(pipe);
-        if (has_output) {
-            // KDE lock screen UI is active
-            return true;
-        }
+        return has_output;
     }
     
-    // Method 3: Check DRM power state for laptop's built-in display (eDP) only
-    // BUG FIX: Don't check all displays - disconnected DP/HDMI ports report "Off"
-    // which causes false positives. Only check the eDP (laptop screen).
-    pipe = popen("cat /sys/class/drm/card*/card*-eDP-*/dpms 2>/dev/null | head -1", "r");
-    if (pipe) {
-        char buffer[128];
-        if (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
-            pclose(pipe);
-            std::string result(buffer);
-            if (result.find("Off") != std::string::npos || 
-                result.find("off") != std::string::npos) {
-                return true;
-            }
-            // eDP display is On
-            return false;
-        } else {
-            pclose(pipe);
-        }
-    }
-    
-    // If we can't determine, assume display is on (conservative approach)
     return false;
 }
 
@@ -290,13 +172,9 @@ bool DisplayDetector::checkGNOMELockScreen() {
         char buffer[128];
         if (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
             pclose(pipe);
-            std::string result(buffer);
-            if (result.find("true") != std::string::npos) {
-                return true;
-            }
-        } else {
-            pclose(pipe);
+            return std::string(buffer).find("true") != std::string::npos;
         }
+        pclose(pipe);
     }
     
     // Check if gnome-screensaver is running
@@ -305,9 +183,7 @@ bool DisplayDetector::checkGNOMELockScreen() {
         char buffer[128];
         bool has_output = (fgets(buffer, sizeof(buffer), pipe) != nullptr);
         pclose(pipe);
-        if (has_output) {
-            return true;
-        }
+        return has_output;
     }
     
     return false;

@@ -68,8 +68,6 @@ check-deps:
 	@printf "$(COLOR_GREEN)✓ ninja$(COLOR_RESET)\n"
 	@pkg-config --exists ncnn || { printf "$(COLOR_RED)✗ ncnn not found$(COLOR_RESET)\n"; exit 1; }
 	@printf "$(COLOR_GREEN)✓ ncnn$(COLOR_RESET)\n"
-	@pkg-config --exists jsoncpp || { printf "$(COLOR_RED)✗ jsoncpp not found$(COLOR_RESET)\n"; exit 1; }
-	@printf "$(COLOR_GREEN)✓ jsoncpp$(COLOR_RESET)\n"
 	@pkg-config --exists libturbojpeg || { printf "$(COLOR_RED)✗ libturbojpeg not found$(COLOR_RESET)\n"; exit 1; }
 	@printf "$(COLOR_GREEN)✓ libturbojpeg$(COLOR_RESET)\n"
 	@pkg-config --exists sdl2 || { printf "$(COLOR_RED)✗ sdl2 not found$(COLOR_RESET)\n"; exit 1; }
@@ -83,11 +81,11 @@ check-deps:
 deps:
 	@printf "$(COLOR_BOLD)Installing build dependencies...$(COLOR_RESET)\n"
 	@if command -v pacman >/dev/null 2>&1; then \
-		sudo pacman -S --needed base-devel meson ninja jsoncpp ncnn pam libjpeg-turbo sdl2 libyuv; \
+		sudo pacman -S --needed base-devel meson ninja ncnn pam libjpeg-turbo sdl2 libyuv; \
 	elif command -v apt-get >/dev/null 2>&1; then \
-		sudo apt-get install -y build-essential meson ninja-build libjsoncpp-dev libncnn-dev libpam-dev libturbojpeg0-dev libsdl2-dev libyuv-dev pkg-config; \
+		sudo apt-get install -y build-essential meson ninja-build libncnn-dev libpam-dev libturbojpeg0-dev libsdl2-dev libyuv-dev pkg-config; \
 	elif command -v dnf >/dev/null 2>&1; then \
-		sudo dnf install -y @development-tools meson ninja jsoncpp-devel ncnn-devel pam-devel turbojpeg-devel SDL2-devel libyuv-devel pkg-config; \
+		sudo dnf install -y @development-tools meson ninja ncnn-devel pam-devel turbojpeg-devel SDL2-devel libyuv-devel pkg-config; \
 	else \
 		printf "$(COLOR_RED)Unsupported package manager. Please install dependencies manually.$(COLOR_RESET)\n"; \
 		exit 1; \
