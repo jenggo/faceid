@@ -3,6 +3,7 @@
 
 #define CONFIG_DIR "@CONFIG_DIR@"
 #define MODELS_DIR "@MODELS_DIR@"
+#define FACES_DIR "@FACES_DIR@"
 #define LOG_DIR "@LOG_DIR@"
 #define VERSION "@VERSION@"
 

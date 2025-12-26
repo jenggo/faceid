@@ -45,11 +45,13 @@ endif
 # Configuration variables
 config_dir = get_option('sysconfdir') / 'faceid'
 models_dir = config_dir / 'models'
+faces_dir = config_dir / 'faces'
 log_dir = get_option('localstatedir') / 'log' / 'faceid'
 
 conf_data = configuration_data()
 conf_data.set('CONFIG_DIR', config_dir)
 conf_data.set('MODELS_DIR', models_dir)
+conf_data.set('FACES_DIR', faces_dir)
 conf_data.set('LOG_DIR', log_dir)
 conf_data.set('VERSION', meson.project_version())
 
@@ -68,6 +70,7 @@ subdir('src')
 # Install empty directories
 install_emptydir(config_dir)
 install_emptydir(models_dir)
+install_emptydir(faces_dir)
 install_emptydir(log_dir)
 
 # Config installation handled by Makefile using faceid-config-merge utility

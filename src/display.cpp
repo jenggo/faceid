@@ -213,11 +213,11 @@ void Display::createWindow(int width, int height) {
     width_ = width;
     height_ = height;
     
-    // Create window
+    // Create window on display 0 (primary display)
     window_ = SDL_CreateWindow(
         window_name_.c_str(),
-        SDL_WINDOWPOS_CENTERED,
-        SDL_WINDOWPOS_CENTERED,
+        SDL_WINDOWPOS_CENTERED_DISPLAY(0),
+        SDL_WINDOWPOS_CENTERED_DISPLAY(0),
         width,
         height,
         SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE
@@ -228,14 +228,17 @@ void Display::createWindow(int width, int height) {
         return;
     }
     
-    // Create renderer with hardware acceleration
-    renderer_ = SDL_CreateRenderer(window_, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+    // Create renderer with software rendering for better compatibility
+    renderer_ = SDL_CreateRenderer(window_, -1, SDL_RENDERER_SOFTWARE);
     if (!renderer_) {
         std::cerr << "Failed to create renderer: " << SDL_GetError() << std::endl;
         SDL_DestroyWindow(window_);
         window_ = nullptr;
         return;
     }
+    
+    // Set logical size to match window size (prevents stretching)
+    SDL_RenderSetLogicalSize(renderer_, width, height);
     
     is_open_ = true;
 }
@@ -247,7 +250,7 @@ void Display::createTexture(int width, int height) {
         SDL_DestroyTexture(texture_);
     }
     
-    // Create texture for BGR24 format (we'll convert to RGB during upload)
+    // Create texture for RGB24 format
     texture_ = SDL_CreateTexture(
         renderer_,
         SDL_PIXELFORMAT_RGB24,
@@ -270,7 +273,10 @@ void Display::updateTexture(const uint8_t* data, int width, int height, int stri
         createTexture(width, height);
     }
     
-    if (!texture_) return;
+    if (!texture_) {
+        std::cerr << "ERROR: texture_ is null after createTexture!" << std::endl;
+        return;
+    }
     
     // Lock texture for update
     void* pixels;
@@ -282,15 +288,16 @@ void Display::updateTexture(const uint8_t* data, int width, int height, int stri
     
     // Convert BGR to RGB and copy to texture
     uint8_t* dst = static_cast<uint8_t*>(pixels);
+    
     for (int y = 0; y < height; y++) {
         const uint8_t* src_row = data + y * stride;
         uint8_t* dst_row = dst + y * pitch;
         
         for (int x = 0; x < width; x++) {
             // BGR -> RGB conversion
-            dst_row[x * 3 + 0] = src_row[x * 3 + 2];  // R
-            dst_row[x * 3 + 1] = src_row[x * 3 + 1];  // G
-            dst_row[x * 3 + 2] = src_row[x * 3 + 0];  // B
+            dst_row[x * 3 + 0] = src_row[x * 3 + 2];  // R from B
+            dst_row[x * 3 + 1] = src_row[x * 3 + 1];  // G stays
+            dst_row[x * 3 + 2] = src_row[x * 3 + 0];  // B from R
         }
     }
     
@@ -300,16 +307,25 @@ void Display::updateTexture(const uint8_t* data, int width, int height, int stri
 void Display::render() {
     // Must be called with mutex_ locked
     
-    if (!renderer_ || !texture_) return;
+    if (!renderer_ || !texture_) {
+        std::cerr << "ERROR: render() called with null renderer or texture!" << std::endl;
+        std::cerr << "  renderer_: " << (renderer_ ? "OK" : "NULL") << std::endl;
+        std::cerr << "  texture_: " << (texture_ ? "OK" : "NULL") << std::endl;
+        return;
+    }
     
-    // Clear screen
+    // Clear screen to BLACK
     SDL_SetRenderDrawColor(renderer_, 0, 0, 0, 255);
     SDL_RenderClear(renderer_);
     
-    // Render texture with horizontal flip for mirror mode
-    // Text will be backwards, but this is handled by drawing text in reverse
-    SDL_RenderCopyEx(renderer_, texture_, nullptr, nullptr, 
-                     0.0, nullptr, SDL_FLIP_HORIZONTAL);
+    // Render texture with horizontal flip for mirror mode (selfie view)
+    // Text must be drawn in reverse to appear correct after flip
+    int result = SDL_RenderCopyEx(renderer_, texture_, nullptr, nullptr, 
+                                   0.0, nullptr, SDL_FLIP_HORIZONTAL);
+    
+    if (result != 0) {
+        std::cerr << "SDL_RenderCopyEx failed: " << SDL_GetError() << std::endl;
+    }
     
     // Present
     SDL_RenderPresent(renderer_);

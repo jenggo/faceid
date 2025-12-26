@@ -7,10 +7,16 @@
 #include <fstream>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/file.h>
+#include <unistd.h>
+#include <fcntl.h>
 #include <dirent.h>
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+
+// Lock file path for detecting PAM authentication
+static const char* PAM_LOCK_FILE = "/run/lock/pam_faceid.lock";
 
 namespace faceid {
 
@@ -161,7 +167,11 @@ void PresenceDetector::pauseForAuthentication() {
         std::lock_guard<std::mutex> cam_lock(camera_mutex_);
         if (camera_ && camera_->isOpened()) {
             camera_->close();
+            camera_.reset();  // Free camera object memory
         }
+        
+        // Also clear cached frame to free memory
+        last_captured_frame_ = Image();
     }
 }
 
@@ -175,18 +185,56 @@ void PresenceDetector::resumeAfterAuthentication() {
     }
 }
 
+// Check if PAM authentication is in progress by testing if lock file is locked
+bool PresenceDetector::checkPAMLockFile() {
+    int fd = open(PAM_LOCK_FILE, O_RDONLY);
+    if (fd == -1) {
+        // Lock file doesn't exist, no PAM auth in progress
+        return false;
+    }
+    
+    // Try to acquire shared lock (non-blocking)
+    // If PAM has exclusive lock, this will fail with EWOULDBLOCK
+    int result = flock(fd, LOCK_SH | LOCK_NB);
+    bool is_locked = false;
+    
+    if (result == -1) {
+        if (errno == EWOULDBLOCK) {
+            // PAM holds exclusive lock, authentication in progress
+            is_locked = true;
+        }
+        // Other errors mean no lock
+    } else {
+        // We got the shared lock successfully, meaning no exclusive lock exists
+        // Release our shared lock immediately
+        flock(fd, LOCK_UN);
+        is_locked = false;
+    }
+    
+    close(fd);
+    return is_locked;
+}
+
 void PresenceDetector::detectionLoop() {
     guard_.updateState();
     
     while (running_.load()) {
+        // Check if PAM authentication is in progress by checking lock file
+        bool pam_lock_exists = checkPAMLockFile();
+        if (pam_lock_exists && !paused_for_auth_.load()) {
+            Logger::getInstance().debug("PAM authentication lock detected, pausing presence detection");
+            pauseForAuthentication();
+        } else if (!pam_lock_exists && paused_for_auth_.load() && pause_count_ == 1) {
+            // Only auto-resume if we were auto-paused (pause_count == 1)
+            Logger::getInstance().debug("PAM authentication lock released, resuming presence detection");
+            resumeAfterAuthentication();
+        }
+        
         // Check if paused for authentication
         if (paused_for_auth_.load()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
             continue;
         }
-        
-        // Update guard conditions
-        guard_.updateState();
         
         // Check schedule first
         if (!isWithinSchedule()) {
@@ -197,9 +245,15 @@ void PresenceDetector::detectionLoop() {
                 Logger::getInstance().info("Outside schedule - pausing presence detection");
                 transitionTo(State::ACTIVELY_PRESENT);
             }
-            std::this_thread::sleep_for(std::chrono::seconds(60));  // Check every minute
+            // Sleep in short intervals to allow quick shutdown
+            for (int i = 0; i < 60 && running_.load(); i++) {
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+            }
             continue;
         }
+        
+        // Update guard conditions
+        guard_.updateState();
         
         if (!guard_.shouldRunPresenceDetection()) {
             // Guard conditions not met, pause detection
@@ -215,8 +269,8 @@ void PresenceDetector::detectionLoop() {
             std::this_thread::sleep_for(std::chrono::milliseconds(scan_interval_ms_));
         } else {
             // Not scanning, just monitoring activity
-            // Use longer interval to reduce memory churn from /proc/interrupts reads
-            std::this_thread::sleep_for(std::chrono::seconds(2));
+            // Use 1 second interval for better responsiveness
+            std::this_thread::sleep_for(std::chrono::seconds(1));
         }
     }
 }
@@ -399,13 +453,24 @@ void PresenceDetector::transitionTo(State new_state) {
 }
 
 bool PresenceDetector::ensureDetectorInitialized() {
-    // LibFaceDetection has embedded models - no initialization needed
+    // Lazy-load FaceDetector to save memory when outside schedule
+    if (!face_detector_) {
+        face_detector_ = std::make_unique<faceid::FaceDetector>();
+        Logger::getInstance().info("Face detector initialized (lazy load)");
+    }
+    // LibFaceDetection has embedded models - no explicit model loading needed
     return true;
 }
 
 bool PresenceDetector::detectFace() {
     try {
         total_scans_++;
+        
+        // Ensure detector is initialized before use
+        if (!ensureDetectorInitialized()) {
+            failed_detections_++;
+            return false;
+        }
         
         Image frame = captureFrame();
         if (frame.empty()) {
@@ -439,7 +504,7 @@ bool PresenceDetector::detectFace() {
          }
          
          // Detect faces with tracking optimization
-         auto faces = face_detector_.detectOrTrackFaces(bgr_frame.view(), tracking_interval_);
+         auto faces = face_detector_->detectOrTrackFaces(bgr_frame.view(), tracking_interval_);
         
         bool detected = !faces.empty();
         
@@ -642,7 +707,7 @@ PresenceDetector::Statistics PresenceDetector::getStatistics() const {
     };
 }
 
-// NEW: Input device detection using /dev/input mtime
+// NEW: Input device detection using /dev/input mtime and interrupts
 time_t PresenceDetector::getLastInputDeviceActivity() const {
     // Cache activity checks to reduce /proc/interrupts reads and memory churn
     auto now = std::chrono::steady_clock::now();
@@ -657,76 +722,90 @@ time_t PresenceDetector::getLastInputDeviceActivity() const {
     // Time to perform actual check
     last_activity_check_ = now;
     
-    // Use /proc/interrupts to track input activity
-    // This works for PS/2 (i8042), USB, and Bluetooth (xhci_hcd) input devices
-    
     Logger& logger = Logger::getInstance();
     
-    std::ifstream interrupts("/proc/interrupts");
-    if (!interrupts.is_open()) {
-        logger.debug("Failed to open /proc/interrupts");
-        return cached_last_activity_;  // Return cached value on error
-    }
-    
-    unsigned long long total_count = 0;
-    std::string line;
-    line.reserve(256);  // Pre-allocate to reduce reallocations
-    
-    while (std::getline(interrupts, line)) {
-        // Look for input-related interrupts:
-        // - i8042: PS/2 keyboard/mouse controller (laptop built-in keyboard/touchpad)
-        // - amd_gpio: GPIO-based i2c devices (modern touchscreens/touchpads)
-        // NOTE: Removed xhci_hcd and usb because they include camera and other non-input USB devices
-        // which cause false positive activity detection
-        if (line.find("i8042") != std::string::npos ||
-            line.find("amd_gpio") != std::string::npos) {
-            
-            // Parse interrupt counts from all CPUs and sum them
-            // Use C-style parsing to avoid istringstream allocation overhead
-            const char* ptr = line.c_str();
-            
-            // Skip IRQ number (everything before first colon)
-            while (*ptr && *ptr != ':') ptr++;
-            if (*ptr == ':') ptr++;
-            
-            // Sum all CPU interrupt counts
-            unsigned long long count;
-            while (*ptr) {
-                while (*ptr == ' ' || *ptr == '\t') ptr++;  // Skip whitespace
-                if (*ptr >= '0' && *ptr <= '9') {
-                    char* end;
-                    count = strtoull(ptr, &end, 10);
-                    total_count += count;
-                    ptr = end;
-                } else {
-                    break;  // Reached device name part
+    // Method 1: Use /proc/interrupts (most reliable for built-in keyboard/touchpad)
+    // This works for PS/2 devices (i8042) and GPIO-based devices (touchpads/touchscreens)
+    time_t latest_input_time = 0;
+    {
+        std::ifstream interrupts("/proc/interrupts");
+        if (!interrupts.is_open()) {
+            logger.debug("Failed to open /proc/interrupts");
+            return cached_last_activity_;  // Return cached value on error
+        }
+        
+        unsigned long long total_count = 0;
+        std::string line;
+        line.reserve(256);  // Pre-allocate to reduce reallocations
+        
+        while (std::getline(interrupts, line)) {
+            // Look for input-related interrupts:
+            // - i8042: PS/2 keyboard/mouse controller (laptop built-in keyboard/touchpad)
+            // - amd_gpio: GPIO-based i2c devices (modern touchscreens/touchpads)
+            if (line.find("i8042") != std::string::npos ||
+                line.find("amd_gpio") != std::string::npos) {
+                
+                // Parse interrupt counts from all CPUs and sum them
+                // Use C-style parsing to avoid istringstream allocation overhead
+                const char* ptr = line.c_str();
+                
+                // Skip IRQ number (everything before first colon)
+                while (*ptr && *ptr != ':') ptr++;
+                if (*ptr == ':') ptr++;
+                
+                // Sum all CPU interrupt counts
+                unsigned long long count;
+                while (*ptr) {
+                    while (*ptr == ' ' || *ptr == '\t') ptr++;  // Skip whitespace
+                    if (*ptr >= '0' && *ptr <= '9') {
+                        char* end;
+                        count = strtoull(ptr, &end, 10);
+                        total_count += count;
+                        ptr = end;
+                    } else {
+                        break;  // Reached device name part
+                    }
                 }
             }
         }
+        
+        interrupts.close();  // Explicit close to free resources immediately
+        
+        // Store the interrupt count (static for persistence across calls)
+        static unsigned long long last_interrupt_count = 0;
+        static time_t last_interrupt_time = time(nullptr);
+        
+        // Debug logging
+        char log_buf[256];
+        snprintf(log_buf, sizeof(log_buf), 
+                "Interrupt check: total_count=%llu, last_count=%llu, delta=%lld",
+                total_count, last_interrupt_count, 
+                (long long)(total_count - last_interrupt_count));
+        logger.debug(log_buf);
+        
+        // If interrupt count increased, update timestamp  
+        if (total_count > last_interrupt_count && total_count > 0) {
+            last_interrupt_count = total_count;
+            last_interrupt_time = time(nullptr);
+            logger.debug("ACTIVITY DETECTED: Interrupt count increased!");
+        }
+        
+        // Use interrupt time if available
+        if (last_interrupt_time > 0) {
+            latest_input_time = last_interrupt_time;
+        }
     }
     
-    interrupts.close();  // Explicit close to free resources immediately
-    
-    // If no interrupts found or count is 0, return cached value
-    if (total_count == 0) {
-        logger.debug("No input interrupts found in /proc/interrupts");
+    // If no activity detected anywhere, return cached value
+    if (latest_input_time == 0) {
+        logger.debug("No input activity detected");
         return cached_last_activity_;
     }
     
-    // Store the interrupt count (static for persistence across calls)
-    static unsigned long long last_interrupt_count = 0;
-    static time_t last_update_time = time(nullptr);
-    
-    // If interrupt count increased, update timestamp  
-    if (total_count > last_interrupt_count) {
-        last_interrupt_count = total_count;
-        last_update_time = time(nullptr);
-    }
-    
     // Update cache
-    cached_last_activity_ = last_update_time;
+    cached_last_activity_ = latest_input_time;
     
-    return last_update_time;
+    return latest_input_time;
 }
 
 // NEW: Schedule checking
@@ -893,10 +972,10 @@ bool PresenceDetector::detectPeek(const ImageView& frame) {
          if (frame.channels() != 3) {
              // Convert grayscale to BGR if needed
              Image bgr_frame = convertGrayToBGRLibyuv(frame);
-             face_rects = face_detector_.detectOrTrackFaces(bgr_frame.view(), tracking_interval_);
+             face_rects = face_detector_->detectOrTrackFaces(bgr_frame.view(), tracking_interval_);
          } else {
              // Already BGR, just use the frame directly
-             face_rects = face_detector_.detectOrTrackFaces(frame, tracking_interval_);
+             face_rects = face_detector_->detectOrTrackFaces(frame, tracking_interval_);
          }
          
          if (face_rects.empty()) {

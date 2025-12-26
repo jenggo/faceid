@@ -4,6 +4,7 @@
 #include <vector>
 #include <string>
 #include <cmath>
+#include <algorithm>
 #include <dirent.h>
 #include <fnmatch.h>
 #include "../models/binary_model.h"
@@ -92,7 +93,7 @@ static bool checkEncodingIntegrity(const BinaryFaceModel& model, bool verbose = 
     // Check 3: Size validation
     bool all_valid_size = true;
     for (const auto& enc : model.encodings) {
-        if (enc.size() != 128) {
+        if (enc.size() != FACE_ENCODING_DIM) {
             all_valid_size = false;
             break;
         }
@@ -100,11 +101,11 @@ static bool checkEncodingIntegrity(const BinaryFaceModel& model, bool verbose = 
     
     if (!all_valid_size) {
         std::cout << "✗ CRITICAL: Some encodings have incorrect dimensions" << std::endl;
-        std::cout << "  Expected: 128D vectors" << std::endl;
+        std::cout << "  Expected: " << FACE_ENCODING_DIM << "D vectors (current model)" << std::endl;
         std::cout << "  Solution: Re-enroll with 'sudo faceid add " << model.username << "'" << std::endl;
         has_issues = true;
     } else if (verbose) {
-        std::cout << "✓ All encodings have correct dimensions (128D)" << std::endl;
+        std::cout << "✓ All encodings have correct dimensions (" << FACE_ENCODING_DIM << "D)" << std::endl;
     }
     
     // Check 4: Self-similarity (optional, detailed check)
@@ -128,32 +129,32 @@ static bool checkEncodingIntegrity(const BinaryFaceModel& model, bool verbose = 
 }
 
 int cmd_test(const std::string& username) {
-    std::cout << "Testing face recognition for user: " << username << std::endl;
-    
-    // Load all face models for this user using ModelCache
-    std::string models_dir = MODELS_DIR;
-    
+    std::cout << "Testing face recognition..." << std::endl;
+
+    // Load ALL users for face matching (not just the specified user)
     auto& cache = ModelCache::getInstance();
-    BinaryFaceModel model;
-    if (!cache.loadUserModel(username, model)) {
-        std::cerr << "Error: No face models found for user: " << username << std::endl;
-        std::cerr << "Run: sudo faceid add " << username << std::endl;
+    std::vector<BinaryFaceModel> all_models = cache.loadAllUsersParallel(4);
+
+    if (all_models.empty()) {
+        std::cerr << "Error: No face models found for any user" << std::endl;
+        std::cerr << "Run: sudo faceid add <username>" << std::endl;
         return 1;
     }
-    
-    std::vector<faceid::FaceEncoding> stored_encodings = model.encodings;
-    
-    if (stored_encodings.empty()) {
-        std::cerr << "Error: No face encodings found" << std::endl;
-        return 1;
-    }
-    
-    std::cout << "Found " << stored_encodings.size() << " face encoding(s)" << std::endl;
-    
-    // Run integrity checks
-    bool integrity_ok = checkEncodingIntegrity(model, true);
-    if (!integrity_ok) {
-        std::cout << "\n⚠ Continuing with live test despite integrity issues..." << std::endl;
+
+    std::cout << "Loaded " << all_models.size() << " enrolled user(s)" << std::endl;
+
+    // If username specified, run integrity checks for that user
+    if (!username.empty()) {
+        for (const auto& model : all_models) {
+            if (model.username == username) {
+                std::cout << "\nRunning integrity checks for user: " << username << std::endl;
+                bool integrity_ok = checkEncodingIntegrity(model, true);
+                if (!integrity_ok) {
+                    std::cout << "\n⚠ Continuing with live test despite integrity issues..." << std::endl;
+                }
+                break;
+            }
+        }
     }
     
     // Load configuration
@@ -167,98 +168,197 @@ int cmd_test(const std::string& username) {
     double threshold = config.getDouble("recognition", "threshold").value_or(0.6);
     int tracking_interval = config.getInt("face_detection", "tracking_interval").value_or(10);
     
-    std::cout << "Using camera: " << device << std::endl;
+    std::cout << "Using camera: " << device << " (" << width << "x" << height << ")" << std::endl;
     std::cout << "Recognition threshold: " << threshold << std::endl;
-    std::cout << std::endl;
     
+    // Display unique usernames (models can have duplicate usernames from multiple files)
+    std::vector<std::string> unique_usernames;
+    for (const auto& model : all_models) {
+        if (std::find(unique_usernames.begin(), unique_usernames.end(), model.username) == unique_usernames.end()) {
+            unique_usernames.push_back(model.username);
+        }
+    }
+    
+    std::cout << "Enrolled users: ";
+    for (size_t i = 0; i < unique_usernames.size(); i++) {
+        std::cout << unique_usernames[i];
+        if (i < unique_usernames.size() - 1) std::cout << ", ";
+    }
+    std::cout << std::endl << std::endl;
+
     // Initialize camera
     Camera camera(device);
     if (!camera.open(width, height)) {
         std::cerr << "Error: Failed to open camera" << std::endl;
         return 1;
     }
-    
+
     // Initialize face detector
     faceid::FaceDetector detector;
-    
+
     if (!detector.loadModels()) {  // Use default MODELS_DIR/sface path
         std::cerr << "Error: Failed to load face recognition model" << std::endl;
         std::cerr << "Expected files: " << MODELS_DIR << "/sface.param and sface.bin" << std::endl;
         return 1;
     }
-    
-    std::cout << "Please look at the camera..." << std::endl;
-    std::cout << "Testing for 5 seconds..." << std::endl;
-    
-    auto start = std::chrono::steady_clock::now();
-    bool recognized = false;
-    double detection_time_ms = 0.0;
-    double recognition_time_ms = 0.0;
-    
-    while (std::chrono::duration_cast<std::chrono::seconds>(
-           std::chrono::steady_clock::now() - start).count() < 5) {
-        
+
+    // Create preview window
+    faceid::Display display("FaceID - Face Recognition Test", width, height);
+
+    std::cout << "Live preview started. Press 'q' or ESC to quit.\n" << std::endl;
+
+    int frame_count = 0;
+    auto start_time = std::chrono::steady_clock::now();
+    bool timing_displayed = false;  // Track if we've shown timing info
+
+    while (display.isOpen()) {
         faceid::Image frame;
         if (!camera.read(frame)) {
+            std::cerr << "Failed to read frame from camera" << std::endl;
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
             continue;
         }
-        
-        faceid::Image processed_frame = detector.preprocessFrame(frame.view());
-        
-        // Time face detection
+
+        // Preprocess and detect faces
         auto detect_start = std::chrono::high_resolution_clock::now();
+        faceid::Image processed_frame = detector.preprocessFrame(frame.view());
         auto faces = detector.detectOrTrackFaces(processed_frame.view(), tracking_interval);
         auto detect_end = std::chrono::high_resolution_clock::now();
-        detection_time_ms = std::chrono::duration<double, std::milli>(detect_end - detect_start).count();
-        
-        if (faces.empty()) {
-            std::cout << "." << std::flush;
-            continue;
-        }
-        
-        // Time face recognition
-        auto recog_start = std::chrono::high_resolution_clock::now();
-        auto encodings = detector.encodeFaces(processed_frame.view(), faces);
-        if (encodings.empty()) {
-            continue;
-        }
-        
-        // Compare with all stored encodings
-        double min_distance = 999.0;
-        for (const auto& stored : stored_encodings) {
-            double distance = detector.compareFaces(stored, encodings[0]);
-            if (distance < min_distance) {
-                min_distance = distance;
+        double detection_time = std::chrono::duration<double, std::milli>(detect_end - detect_start).count();
+
+        // Clone frame for drawing
+        faceid::Image display_frame = frame.clone();
+
+        // Process each detected face
+        std::vector<std::string> matched_names(faces.size(), "");
+        std::vector<double> matched_distances(faces.size(), 999.0);
+        double recognition_time = 0.0;
+
+        if (!faces.empty()) {
+            auto recog_start = std::chrono::high_resolution_clock::now();
+            auto encodings = detector.encodeFaces(processed_frame.view(), faces);
+
+            // Match each face against all enrolled users
+            for (size_t i = 0; i < encodings.size() && i < faces.size(); i++) {
+                double best_distance = 999.0;
+                std::string best_match = "";
+
+                // Compare with all users
+                for (const auto& model : all_models) {
+                    for (const auto& stored_encoding : model.encodings) {
+                        double distance = detector.compareFaces(stored_encoding, encodings[i]);
+                        if (distance < best_distance) {
+                            best_distance = distance;
+                            best_match = model.username;
+                        }
+                    }
+                }
+
+                matched_distances[i] = best_distance;
+                if (best_distance < threshold) {
+                    matched_names[i] = best_match;
+                }
+            }
+            auto recog_end = std::chrono::high_resolution_clock::now();
+            recognition_time = std::chrono::duration<double, std::milli>(recog_end - recog_start).count();
+            
+            // Display timing info on first successful match
+            if (!timing_displayed && !matched_names.empty() && !matched_names[0].empty()) {
+                std::cout << "\n=== Performance Timing (First Match) ===" << std::endl;
+                std::cout << "Face detection time:    " << std::fixed << std::setprecision(2) 
+                         << detection_time << " ms" << std::endl;
+                std::cout << "Face recognition time:  " << recognition_time << " ms" << std::endl;
+                std::cout << "Total time:             " << (detection_time + recognition_time) << " ms" << std::endl;
+                std::cout << "========================================\n" << std::endl;
+                timing_displayed = true;
             }
         }
-        auto recog_end = std::chrono::high_resolution_clock::now();
-        recognition_time_ms = std::chrono::duration<double, std::milli>(recog_end - recog_start).count();
-        
-        std::cout << std::endl;
-        std::cout << "Face detected! Distance: " << min_distance;
-        
-        if (min_distance < threshold) {
-            std::cout << " ✓ MATCH" << std::endl;
-            std::cout << std::endl;
-            std::cout << "Performance:" << std::endl;
-            std::cout << "  Detection:    " << std::fixed << std::setprecision(2) << detection_time_ms << " ms" << std::endl;
-            std::cout << "  Recognition:  " << std::fixed << std::setprecision(2) << recognition_time_ms << " ms" << std::endl;
-            std::cout << "  Total:        " << std::fixed << std::setprecision(2) << (detection_time_ms + recognition_time_ms) << " ms" << std::endl;
-            recognized = true;
+
+        // Draw detected faces with identity
+        for (size_t i = 0; i < faces.size(); i++) {
+            const auto& face = faces[i];
+            
+            // Debug: print coordinates for first face on first frame
+            if (frame_count == 0 && i == 0) {
+                std::cout << "DEBUG: Face bbox - x=" << face.x << " y=" << face.y 
+                         << " w=" << face.width << " h=" << face.height 
+                         << " (frame: " << display_frame.width() << "x" << display_frame.height() << ")" << std::endl;
+            }
+
+            // Color and label based on match status
+            faceid::Color color = !matched_names[i].empty()
+                ? faceid::Color::Green()  // Matched - green
+                : faceid::Color::Red();   // No match - red
+
+            std::string label = !matched_names[i].empty()
+                ? matched_names[i] + " (" + std::to_string(static_cast<int>(matched_distances[i] * 100)) + "%)"
+                : "Unknown (" + std::to_string(static_cast<int>(matched_distances[i] * 100)) + "%)";
+
+            // Draw rectangle at ORIGINAL position (SDL will flip it correctly)
+            faceid::drawRectangle(display_frame, face.x, face.y,
+                                 face.width, face.height, color, 2);
+
+            // Reverse text for SDL horizontal flip and position it above the box
+            std::reverse(label.begin(), label.end());
+            int text_width = label.length() * 8;
+            // Position text: align with right edge of box before flip = left edge after flip
+            int text_x = face.x + face.width - text_width;
+            faceid::drawText(display_frame, label, text_x, face.y - 10, color, 1.0);
+        }
+
+        // Calculate FPS
+        frame_count++;
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count();
+
+        if (elapsed > 0) {
+            double fps = static_cast<double>(frame_count) / elapsed;
+
+            // Draw info banner at top
+            faceid::drawFilledRectangle(display_frame, 0, 0, display_frame.width(), 70, faceid::Color::Black());
+
+            // Face count
+            std::string info_text = "Detected faces: " + std::to_string(faces.size());
+            std::reverse(info_text.begin(), info_text.end());
+            int info_width = info_text.length() * 8;
+            faceid::drawText(display_frame, info_text, display_frame.width() - 10 - info_width, 10, faceid::Color::White(), 1.0);
+
+            // FPS
+            std::string fps_text = "FPS: " + std::to_string(static_cast<int>(fps));
+            std::reverse(fps_text.begin(), fps_text.end());
+            int fps_width = fps_text.length() * 8;
+            faceid::drawText(display_frame, fps_text, display_frame.width() - 10 - fps_width, 25, faceid::Color::Green(), 1.0);
+
+            // Threshold info
+            std::string thresh_text = "Threshold: " + std::to_string(static_cast<int>(threshold * 100)) + "%";
+            std::reverse(thresh_text.begin(), thresh_text.end());
+            int thresh_width = thresh_text.length() * 8;
+            faceid::drawText(display_frame, thresh_text, display_frame.width() - 10 - thresh_width, 45, faceid::Color::Gray(), 1.0);
+        }
+
+        // Draw help text at bottom
+        faceid::drawFilledRectangle(display_frame, 0, display_frame.height() - 30,
+                                   display_frame.width(), 30, faceid::Color::Black());
+        std::string help_text = "Press 'q' or ESC to quit";
+        std::reverse(help_text.begin(), help_text.end());
+        int help_width = help_text.length() * 8;
+        faceid::drawText(display_frame, help_text, display_frame.width() - 10 - help_width, display_frame.height() - 20,
+                        faceid::Color::White(), 1.0);
+
+        // Display the frame (SDL will flip horizontally)
+        display.show(display_frame);
+
+        // Check for quit key
+        int key = display.waitKey(30);
+        if (key == 'q' || key == 'Q' || key == 27) {  // q or ESC
             break;
-        } else {
-            std::cout << " ✗ NO MATCH" << std::endl;
         }
     }
-    
-    std::cout << std::endl;
-    if (recognized) {
-        std::cout << "✓ Face recognition successful for user: " << username << std::endl;
-        return 0;
-    } else {
-        std::cout << "✗ Face recognition failed" << std::endl;
-        return 1;
-    }
+
+    std::cout << "\nTest completed." << std::endl;
+    std::cout << "Total frames processed: " << frame_count << std::endl;
+
+    return 0;
 }
 
 } // namespace faceid

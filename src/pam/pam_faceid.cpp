@@ -5,6 +5,11 @@
 #include <thread>
 #include <atomic>
 #include <future>
+#include <mutex>
+#include <sys/file.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <fcntl.h>
 #include "../config.h"
 #include "../logger.h"
 #include "../fingerprint_auth.h"
@@ -22,6 +27,29 @@
 #include "config_paths.h"
 
 using namespace faceid;
+
+// Lock file path for system-wide singleton
+// DISABLED: File-based lock caused permission issues
+// Commenting out the lock mechanism - returning to pre-lock behavior
+// static const char* LOCK_FILE_PATH = "/run/lock/pam_faceid.lock";
+
+// No-op lock class - authentication proceeds without locking
+// DISABLED: File-based lock caused permission issues with polkit
+// This restores the behavior before lock implementation was added
+class SystemWideLock {
+public:
+    SystemWideLock() {}
+    ~SystemWideLock() {}
+    
+    // Always return true - no actual locking performed
+    bool tryAcquire() { return true; }
+    bool acquireWithTimeout(int timeout_seconds = 10) { 
+        (void)timeout_seconds; // Unused parameter
+        return true; 
+    }
+    void release() {}
+    bool isLocked() const { return true; }
+};
 
 static bool authenticate_user(const char* username) {
     const auto auth_start = std::chrono::steady_clock::now();
@@ -78,6 +106,16 @@ static bool authenticate_user(const char* username) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
                 display_state = display_detector.getDisplayState();
             }
+        }
+        
+        // Check if using external monitor only (laptop screen off, external on)
+        const bool skip_external_only = config.getBool("authentication", "skip_external_monitor_only").value_or(true);
+        if (skip_external_only && display_detector.isExternalMonitorOnly()) {
+            logger.info(std::string("External monitor only detected (laptop screen off), skipping biometric authentication for user ") + username);
+            logger.auditAuthFailure(username, "biometric", "external_monitor_only");
+            syslog(LOG_INFO, "External monitor only, skipping biometric auth for user %s", username);
+            closelog();
+            return false;
         }
         
         if (display_state == DisplayState::OFF) {
@@ -297,8 +335,23 @@ static bool authenticate_user(const char* username) {
         return true;
     }
     
-    syslog(LOG_WARNING, "Face+fingerprint authentication failed for user %s", username);
-    logger.auditAuthFailure(username, "face+fingerprint", "timeout_or_no_match");
+    // Provide detailed failure reason
+    std::string failure_reason;
+    if (!face_enrolled && !fingerprint_enabled) {
+        failure_reason = "no_methods_available";
+        syslog(LOG_WARNING, "Authentication failed for user %s: no face or fingerprint enrolled", username);
+    } else if (face_enrolled && !fingerprint_enabled) {
+        failure_reason = "face_timeout_or_no_match";
+        syslog(LOG_WARNING, "Face authentication failed for user %s: timeout or no match", username);
+    } else if (!face_enrolled && fingerprint_enabled) {
+        failure_reason = "fingerprint_timeout_or_no_match";
+        syslog(LOG_WARNING, "Fingerprint authentication failed for user %s: timeout or no match", username);
+    } else {
+        failure_reason = "both_timeout_or_no_match";
+        syslog(LOG_WARNING, "Face+fingerprint authentication failed for user %s: timeout or no match", username);
+    }
+    
+    logger.auditAuthFailure(username, "face+fingerprint", failure_reason);
     closelog();
     return false;
 }
@@ -314,17 +367,50 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags,
     
     // Debug: Log that PAM module was called
     openlog("pam_faceid", LOG_PID, LOG_AUTH);
-    syslog(LOG_INFO, "pam_faceid: authenticate called");
-    closelog();
+    syslog(LOG_INFO, "pam_faceid: authenticate called (PID: %d)", getpid());
+    
+    // Try to acquire system-wide lock with timeout
+    SystemWideLock lock;
+    if (!lock.acquireWithTimeout(10)) {
+        syslog(LOG_WARNING, "pam_faceid: failed to acquire lock - another authentication may be in progress or timed out");
+        
+        // Send message to user via PAM conversation
+        struct pam_conv *conv;
+        if (pam_get_item(pamh, PAM_CONV, (const void **)&conv) == PAM_SUCCESS && conv && conv->conv) {
+            struct pam_message msg;
+            const struct pam_message *msgp = &msg;
+            struct pam_response *resp = nullptr;
+            
+            msg.msg_style = PAM_ERROR_MSG;
+            msg.msg = const_cast<char*>("FaceID: Another authentication is in progress. Please wait and try again.");
+            
+            conv->conv(1, &msgp, &resp, conv->appdata_ptr);
+            if (resp) {
+                free(resp);
+            }
+        }
+        
+        closelog();
+        return PAM_AUTH_ERR;
+    }
+    
+    // Don't close syslog yet - authenticate_user() needs it
     
     const char* username = nullptr;
     int ret = pam_get_user(pamh, &username, nullptr);
     
     if (ret != PAM_SUCCESS || username == nullptr) {
+        closelog();
         return PAM_USER_UNKNOWN;
     }
     
-    if (authenticate_user(username)) {
+    bool success = authenticate_user(username);
+    
+    // Lock will be automatically released by RAII destructor
+    
+    closelog();
+    
+    if (success) {
         return PAM_SUCCESS;
     }
     

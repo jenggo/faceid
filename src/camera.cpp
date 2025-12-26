@@ -242,7 +242,7 @@ bool Camera::read(Image& frame) {
         frame = Image(jpeg_width, jpeg_height, 3);  // BGR = 3 channels
     }
     
-    // Decompress to BGR directly into our aligned Image buffer
+    // Decompress to RGB directly into our aligned Image buffer
     if (tjDecompress2(tjhandle_,
                      (unsigned char*)buffers_[buf.index].start,
                      buf.bytesused,

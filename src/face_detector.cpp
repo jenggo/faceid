@@ -8,6 +8,166 @@
 
 namespace faceid {
 
+// ===== RetinaFace Detection Helper Structures and Functions =====
+
+struct FaceObject {
+    Rect rect;
+    float prob;
+};
+
+static inline float intersection_area(const FaceObject& a, const FaceObject& b) {
+    int x1 = std::max(a.rect.x, b.rect.x);
+    int y1 = std::max(a.rect.y, b.rect.y);
+    int x2 = std::min(a.rect.x + a.rect.width, b.rect.x + b.rect.width);
+    int y2 = std::min(a.rect.y + a.rect.height, b.rect.y + b.rect.height);
+    
+    if (x2 < x1 || y2 < y1) return 0.0f;
+    return (x2 - x1) * (y2 - y1);
+}
+
+static void qsort_descent_inplace(std::vector<FaceObject>& faceobjects, int left, int right) {
+    int i = left;
+    int j = right;
+    float p = faceobjects[(left + right) / 2].prob;
+    
+    while (i <= j) {
+        while (faceobjects[i].prob > p) i++;
+        while (faceobjects[j].prob < p) j--;
+        
+        if (i <= j) {
+            std::swap(faceobjects[i], faceobjects[j]);
+            i++;
+            j--;
+        }
+    }
+    
+    if (left < j) qsort_descent_inplace(faceobjects, left, j);
+    if (i < right) qsort_descent_inplace(faceobjects, i, right);
+}
+
+static void qsort_descent_inplace(std::vector<FaceObject>& faceobjects) {
+    if (faceobjects.empty()) return;
+    qsort_descent_inplace(faceobjects, 0, faceobjects.size() - 1);
+}
+
+static void nms_sorted_bboxes(const std::vector<FaceObject>& faceobjects, std::vector<int>& picked, float nms_threshold) {
+    picked.clear();
+    const int n = faceobjects.size();
+    
+    std::vector<float> areas(n);
+    for (int i = 0; i < n; i++) {
+        areas[i] = faceobjects[i].rect.width * faceobjects[i].rect.height;
+    }
+    
+    for (int i = 0; i < n; i++) {
+        const FaceObject& a = faceobjects[i];
+        
+        int keep = 1;
+        for (int j = 0; j < (int)picked.size(); j++) {
+            const FaceObject& b = faceobjects[picked[j]];
+            float inter_area = intersection_area(a, b);
+            float union_area = areas[i] + areas[picked[j]] - inter_area;
+            if (inter_area / union_area > nms_threshold)
+                keep = 0;
+        }
+        
+        if (keep) picked.push_back(i);
+    }
+}
+
+static ncnn::Mat generate_anchors(int base_size, const ncnn::Mat& ratios, const ncnn::Mat& scales) {
+    int num_ratio = ratios.w;
+    int num_scale = scales.w;
+    
+    ncnn::Mat anchors;
+    anchors.create(4, num_ratio * num_scale);
+    
+    const float cx = base_size * 0.5f;
+    const float cy = base_size * 0.5f;
+    
+    for (int i = 0; i < num_ratio; i++) {
+        float ar = ratios[i];
+        int r_w = round(base_size / sqrt(ar));
+        int r_h = round(r_w * ar);
+        
+        for (int j = 0; j < num_scale; j++) {
+            float scale = scales[j];
+            float rs_w = r_w * scale;
+            float rs_h = r_h * scale;
+            
+            float* anchor = anchors.row(i * num_scale + j);
+            anchor[0] = cx - rs_w * 0.5f;
+            anchor[1] = cy - rs_h * 0.5f;
+            anchor[2] = cx + rs_w * 0.5f;
+            anchor[3] = cy + rs_h * 0.5f;
+        }
+    }
+    
+    return anchors;
+}
+
+static void generate_proposals(const ncnn::Mat& anchors, int feat_stride, const ncnn::Mat& score_blob, 
+                               const ncnn::Mat& bbox_blob, float prob_threshold, std::vector<FaceObject>& faceobjects) {
+    int w = score_blob.w;
+    int h = score_blob.h;
+    const int num_anchors = anchors.h;
+    
+    for (int q = 0; q < num_anchors; q++) {
+        const float* anchor = anchors.row(q);
+        const ncnn::Mat score = score_blob.channel(q + num_anchors);
+        const ncnn::Mat bbox = bbox_blob.channel_range(q * 4, 4);
+        
+        float anchor_y = anchor[1];
+        float anchor_w = anchor[2] - anchor[0];
+        float anchor_h = anchor[3] - anchor[1];
+        
+        for (int i = 0; i < h; i++) {
+            float anchor_x = anchor[0];
+            
+            for (int j = 0; j < w; j++) {
+                int index = i * w + j;
+                float prob = score[index];
+                
+                if (prob >= prob_threshold) {
+                    float dx = bbox.channel(0)[index];
+                    float dy = bbox.channel(1)[index];
+                    float dw = bbox.channel(2)[index];
+                    float dh = bbox.channel(3)[index];
+                    
+                    float cx = anchor_x + anchor_w * 0.5f;
+                    float cy = anchor_y + anchor_h * 0.5f;
+                    
+                    float pb_cx = cx + anchor_w * dx;
+                    float pb_cy = cy + anchor_h * dy;
+                    float pb_w = anchor_w * exp(dw);
+                    float pb_h = anchor_h * exp(dh);
+                    
+                    float x0 = pb_cx - pb_w * 0.5f;
+                    float y0 = pb_cy - pb_h * 0.5f;
+                    float x1 = pb_cx + pb_w * 0.5f;
+                    float y1 = pb_cy + pb_h * 0.5f;
+                    
+                    FaceObject obj;
+                    obj.rect.x = (int)x0;
+                    obj.rect.y = (int)y0;
+                    obj.rect.width = (int)(x1 - x0 + 1);
+                    obj.rect.height = (int)(y1 - y0 + 1);
+                    obj.prob = prob;
+                    
+                    faceobjects.push_back(obj);
+                }
+                
+                anchor_x += feat_stride;
+            }
+            
+            anchor_y += feat_stride;
+        }
+    }
+}
+
+// ===== End RetinaFace Helper Functions =====
+
+
 // Helper function: Fast image resize using libyuv (3-5x faster than OpenCV)
 // Supports BGR24 format
 static Image resizeImage(const uint8_t* src_data, int src_width, int src_height, int src_stride, int dst_width, int dst_height) {
@@ -44,28 +204,25 @@ static Image toGrayscale(const uint8_t* src_data, int src_width, int src_height,
 }
 
 FaceDetector::FaceDetector() {
-    // LibFaceDetection has embedded models - no initialization needed
+    // RetinaFace and SFace models loaded separately via loadModels()
 }
 
 bool FaceDetector::loadModels(const std::string& model_base_path) {
     try {
-        // Load NCNN SFace model
-        // Default to MODELS_DIR/sface if no path provided
+        // Load NCNN SFace model for recognition
         std::string base_path = model_base_path.empty() 
             ? std::string(MODELS_DIR) + "/sface"
             : model_base_path;
         
-        // Build paths to .param and .bin files
         std::string param_path = base_path + ".param";
         std::string bin_path = base_path + ".bin";
         
         // Configure NCNN options for optimal CPU performance
-        ncnn_net_.opt.use_vulkan_compute = false;  // Use CPU (more reliable for PAM)
-        ncnn_net_.opt.num_threads = 4;  // Use 4 threads for good balance
+        ncnn_net_.opt.use_vulkan_compute = false;
+        ncnn_net_.opt.num_threads = 4;
         ncnn_net_.opt.use_fp16_packed = false;
         ncnn_net_.opt.use_fp16_storage = false;
         
-        // Load model files
         int ret = ncnn_net_.load_param(param_path.c_str());
         if (ret != 0) {
             return false;
@@ -76,18 +233,37 @@ bool FaceDetector::loadModels(const std::string& model_base_path) {
             return false;
         }
         
-        // Validate model by attempting to create an extractor and check layer exists
-        // This catches subtle corruption that load_param/load_model might miss
         try {
             ncnn::Extractor ex = ncnn_net_.create_extractor();
-            // Just creating the extractor validates the model structure
-            // We don't need to run full inference here
         } catch (...) {
-            // Model loaded but can't create extractor - likely corrupted
             return false;
         }
         
         models_loaded_ = true;
+        
+        // Load RetinaFace detection model
+        std::string retinaface_base = std::string(MODELS_DIR) + "/mnet.25-opt";
+        std::string retinaface_param = retinaface_base + ".param";
+        std::string retinaface_bin = retinaface_base + ".bin";
+        
+        retinaface_net_.opt.use_vulkan_compute = false;
+        retinaface_net_.opt.num_threads = 4;
+        retinaface_net_.opt.use_fp16_packed = false;
+        retinaface_net_.opt.use_fp16_storage = false;
+        
+        ret = retinaface_net_.load_param(retinaface_param.c_str());
+        if (ret != 0) {
+            // RetinaFace model not found - this is OK, will fall back if needed
+            detection_model_loaded_ = false;
+        } else {
+            ret = retinaface_net_.load_model(retinaface_bin.c_str());
+            if (ret != 0) {
+                detection_model_loaded_ = false;
+            } else {
+                detection_model_loaded_ = true;
+            }
+        }
+        
         return true;
     } catch (const std::exception& e) {
         return false;
@@ -95,7 +271,14 @@ bool FaceDetector::loadModels(const std::string& model_base_path) {
 }
 
 std::vector<Rect> FaceDetector::detectFaces(const ImageView& frame, bool downscale) {
-    (void)downscale;  // Parameter deprecated but kept for API compatibility
+    (void)downscale;  // Parameter kept for API compatibility
+    
+    // Check if RetinaFace model is loaded
+    if (!detection_model_loaded_) {
+        // RetinaFace not available, return empty
+        return {};
+    }
+    
     // Check cache first
     if (use_cache_) {
         uint64_t frame_hash = hashFrame(frame);
@@ -105,90 +288,111 @@ std::vector<Rect> FaceDetector::detectFaces(const ImageView& frame, bool downsca
         }
     }
     
-    Image processed_frame_owned;
-    const uint8_t* detect_data = frame.data();
-    int detect_width = frame.width();
-    int detect_height = frame.height();
-    int detect_stride = frame.stride();
-    double scale = 1.0;
+    int img_w = frame.width();
+    int img_h = frame.height();
     
-    // Always downscale for faster detection (LibFaceDetection is resolution-dependent)
-    // Target: 320px width for ~7ms detection (vs 35ms at 640px)
-    // Note: Detection accuracy is still excellent at lower resolutions
-    const int target_width = 320;
+    // Convert BGR to RGB for RetinaFace
+    ncnn::Mat in = ncnn::Mat::from_pixels(frame.data(), ncnn::Mat::PIXEL_BGR2RGB, img_w, img_h);
     
-    if (frame.width() > target_width) {
-        scale = static_cast<double>(target_width) / frame.width();
-        int new_width = target_width;
-        int new_height = static_cast<int>(frame.height() * scale);
-        processed_frame_owned = resizeImage(frame.data(), frame.width(), frame.height(), frame.stride(), new_width, new_height);
-        detect_data = processed_frame_owned.data();
-        detect_width = processed_frame_owned.width();
-        detect_height = processed_frame_owned.height();
-        detect_stride = processed_frame_owned.stride();
+    ncnn::Extractor ex = retinaface_net_.create_extractor();
+    ex.set_light_mode(true);  // Optimize for speed
+    ex.input("data", in);
+    
+    std::vector<FaceObject> faceproposals;
+    
+    const float prob_threshold = 0.8f;
+    const float nms_threshold = 0.4f;
+    
+    // stride 32
+    {
+        ncnn::Mat score_blob, bbox_blob;
+        ex.extract("face_rpn_cls_prob_reshape_stride32", score_blob);
+        ex.extract("face_rpn_bbox_pred_stride32", bbox_blob);
+        
+        const int base_size = 16;
+        const int feat_stride = 32;
+        ncnn::Mat ratios(1);
+        ratios[0] = 1.f;
+        ncnn::Mat scales(2);
+        scales[0] = 32.f;
+        scales[1] = 16.f;
+        ncnn::Mat anchors = generate_anchors(base_size, ratios, scales);
+        
+        std::vector<FaceObject> faceobjects32;
+        generate_proposals(anchors, feat_stride, score_blob, bbox_blob, prob_threshold, faceobjects32);
+        faceproposals.insert(faceproposals.end(), faceobjects32.begin(), faceobjects32.end());
     }
     
-    // LibFaceDetection detection
-    // Allocate result buffer (fixed size required by LibFaceDetection)
-    // Note: Modern compilers optimize stack allocation efficiently
-    // Stack allocation is actually faster than heap for small, fixed-size buffers
-    unsigned char result_buffer[0x20000];
+    // stride 16
+    {
+        ncnn::Mat score_blob, bbox_blob;
+        ex.extract("face_rpn_cls_prob_reshape_stride16", score_blob);
+        ex.extract("face_rpn_bbox_pred_stride16", bbox_blob);
+        
+        const int base_size = 16;
+        const int feat_stride = 16;
+        ncnn::Mat ratios(1);
+        ratios[0] = 1.f;
+        ncnn::Mat scales(2);
+        scales[0] = 8.f;
+        scales[1] = 4.f;
+        ncnn::Mat anchors = generate_anchors(base_size, ratios, scales);
+        
+        std::vector<FaceObject> faceobjects16;
+        generate_proposals(anchors, feat_stride, score_blob, bbox_blob, prob_threshold, faceobjects16);
+        faceproposals.insert(faceproposals.end(), faceobjects16.begin(), faceobjects16.end());
+    }
     
-    // Note: LibFaceDetection expects BGR format (OpenCV default)
-    int* pResults = facedetect_cnn(
-        result_buffer,
-        (unsigned char*)detect_data,
-        detect_width,
-        detect_height,
-        (int)detect_stride
-    );
+    // stride 8
+    {
+        ncnn::Mat score_blob, bbox_blob;
+        ex.extract("face_rpn_cls_prob_reshape_stride8", score_blob);
+        ex.extract("face_rpn_bbox_pred_stride8", bbox_blob);
+        
+        const int base_size = 16;
+        const int feat_stride = 8;
+        ncnn::Mat ratios(1);
+        ratios[0] = 1.f;
+        ncnn::Mat scales(2);
+        scales[0] = 2.f;
+        scales[1] = 1.f;
+        ncnn::Mat anchors = generate_anchors(base_size, ratios, scales);
+        
+        std::vector<FaceObject> faceobjects8;
+        generate_proposals(anchors, feat_stride, score_blob, bbox_blob, prob_threshold, faceobjects8);
+        faceproposals.insert(faceproposals.end(), faceobjects8.begin(), faceobjects8.end());
+    }
     
-    // Extract results
+    // Sort and apply NMS
+    qsort_descent_inplace(faceproposals);
+    
+    std::vector<int> picked;
+    nms_sorted_bboxes(faceproposals, picked, nms_threshold);
+    
+    // Convert to Rect and clip to image bounds
     std::vector<Rect> faces;
-    
-    if (pResults) {
-        int face_count = *pResults;  // First element is the count
+    for (int idx : picked) {
+        FaceObject& obj = faceproposals[idx];
         
-        // IMPORTANT: facedetect_cnn returns data as short integers, not FaceRect structs!
-        // Format: [count(int)] + N * [score(short), x(short), y(short), w(short), h(short), landmarks(10 shorts)]
-        short* face_data = (short*)(pResults + 1);
+        // Clip to image size
+        float x0 = obj.rect.x;
+        float y0 = obj.rect.y;
+        float x1 = x0 + obj.rect.width;
+        float y1 = y0 + obj.rect.height;
         
-        // Confidence threshold (score is stored as short, 0-100 scale)
-        const int min_confidence_score = 60;  // 60/100 = 0.6
+        x0 = std::max(std::min(x0, (float)img_w - 1), 0.f);
+        y0 = std::max(std::min(y0, (float)img_h - 1), 0.f);
+        x1 = std::max(std::min(x1, (float)img_w - 1), 0.f);
+        y1 = std::max(std::min(y1, (float)img_h - 1), 0.f);
         
-        for (int i = 0; i < face_count; i++) {
-            // Each face has 16 shorts: score(1) + bbox(4) + landmarks(10) + padding(1)
-            short* p = face_data + 16 * i;
-            
-            // Parse data (see facedetectcnn-model.cpp lines 228-239)
-            int score = p[0];           // Score * 100 (0-100 range)
-            int x = p[1];
-            int y = p[2];
-            int w = p[3];
-            int h = p[4];
-            // landmarks at p[5] through p[14]
-            
-            // Check confidence score
-            if (score < min_confidence_score) {
-                continue;  // Skip low confidence detections
-            }
-            
-            // Scale back to original frame size if we downscaled
-            if (scale != 1.0) {
-                x = static_cast<int>(x / scale);
-                y = static_cast<int>(y / scale);
-                w = static_cast<int>(w / scale);
-                h = static_cast<int>(h / scale);
-            }
-            
-            // Convert to Rect
-            Rect face(x, y, w, h);
-            
-            // Ensure rect is within frame bounds
-            face &= Rect(0, 0, frame.width(), frame.height());
-            if (face.width > 0 && face.height > 0) {
-                faces.push_back(face);
-            }
+        obj.rect.x = (int)x0;
+        obj.rect.y = (int)y0;
+        obj.rect.width = (int)(x1 - x0);
+        obj.rect.height = (int)(y1 - y0);
+        
+        // Filter out invalid boxes
+        if (obj.rect.width > 0 && obj.rect.height > 0) {
+            faces.push_back(obj.rect);
         }
     }
     
@@ -345,19 +549,19 @@ std::vector<FaceEncoding> FaceDetector::encodeFaces(
         // Create extractor and run inference
         ncnn::Extractor ex = ncnn_net_.create_extractor();
         ex.set_light_mode(true);  // Optimize for speed
-        ex.input("data", in);
+        ex.input("in0", in);  // SFace model uses "in0" as input layer
         
         // Extract features
         ncnn::Mat out;
-        int ret = ex.extract("fc1", out);
+        int ret = ex.extract("out0", out);  // SFace model uses "out0" as output layer
         if (ret != 0) {
             // Inference failed - skip this face
             // This can happen with corrupted models or invalid input
             continue;
         }
         
-        // Validate output dimensions (SFace should produce 128D vector)
-        if (out.w != 128 || out.h != 1 || out.c != 1) {
+        // Validate output dimensions (SFace produces 512D vector)
+        if (out.w != static_cast<int>(FACE_ENCODING_DIM) || out.h != 1 || out.c != 1) {
             // Unexpected output dimensions - skip this face
             continue;
         }
@@ -395,8 +599,8 @@ double FaceDetector::compareFaces(const FaceEncoding& encoding1, const FaceEncod
         return 999.0;  // Return large distance for invalid comparison
     }
     
-    // Check size (should be 128 for both)
-    if (encoding1.size() != encoding2.size() || encoding1.size() != 128) {
+    // Check size (should match FACE_ENCODING_DIM for current model)
+    if (encoding1.size() != encoding2.size() || encoding1.size() != FACE_ENCODING_DIM) {
         return 999.0;  // Size mismatch
     }
     

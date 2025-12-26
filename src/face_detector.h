@@ -1,28 +1,30 @@
 #ifndef FACEID_FACE_DETECTOR_H
 #define FACEID_FACE_DETECTOR_H
 
+#include "encoding_config.h"  // FACE_ENCODING_DIM constant
 #include "image.h"
 #include <string>
 #include <vector>
 #include <unordered_map>
-#include <ncnn/net.h>             // NCNN for face recognition
-#include "libfacedetection/facedetectcnn.h"  // LibFaceDetection
+#include <ncnn/net.h>             // NCNN for face recognition and detection
 
 namespace faceid {
 
-// Face encodings are 128D float vectors stored in std::vector for NCNN
+// Face encodings are stored as std::vector<float> for NCNN compatibility
 using FaceEncoding = std::vector<float>;
 
 class FaceDetector {
 public:
     FaceDetector();
     
-    // Load NCNN models from base path (defaults to CONFIG_DIR/models/sface)
-    // Pass empty string or full path without extension (e.g., "/etc/faceid/models/sface")
+    // Load models from base path
+    // - Recognition model (SFace): defaults to CONFIG_DIR/models/sface
+    // - Detection model (RetinaFace): defaults to CONFIG_DIR/models/mnet.25-opt
+    // Pass empty string to use defaults, or full path without extension
     // Will load .param and .bin files automatically
     bool loadModels(const std::string& model_base_path = "");
     
-    // Detect faces in frame using LibFaceDetection
+    // Detect faces in frame using RetinaFace
     std::vector<Rect> detectFaces(const ImageView& frame, bool downscale = false);
     
     // Detect or track faces (automatically uses tracking when possible)
@@ -62,10 +64,12 @@ public:
     static int countDistinctFaces(const std::vector<Rect>& faces, int min_distance);
 
 private:
-    // NCNN face recognition network (SFace model)
-    ncnn::Net ncnn_net_;
+    // NCNN networks
+    ncnn::Net ncnn_net_;          // SFace face recognition model
+    ncnn::Net retinaface_net_;    // RetinaFace face detection model
     
     bool models_loaded_ = false;
+    bool detection_model_loaded_ = false;
     
     // Performance optimizations
     bool use_cache_ = true;

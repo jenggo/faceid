@@ -215,8 +215,8 @@ int cmd_add(const std::string& username, const std::string& face_id) {
     
     std::cout << "Successfully captured " << encodings.size() << " samples!" << std::endl;
     
-    // Create model for this face
-    std::string model_path = std::string(MODELS_DIR) + "/" + username + "." + face_id + ".bin";
+    // Create model for this face (save to FACES_DIR)
+    std::string model_path = std::string(FACES_DIR) + "/" + username + "." + face_id + ".bin";
     BinaryFaceModel model_data;
     model_data.username = username;
     model_data.face_ids.push_back(face_id);
