@@ -85,12 +85,12 @@ int cmd_show() {
             faceid::drawRectangle(display_frame, face.x, face.y, 
                                  face.width, face.height, color, 2);
             
-            // Label faces - reverse text and calculate mirrored position
+            // Label faces - reverse text and calculate position
             std::string label = (i == 0) ? "Face 1 (Primary)" : "Face " + std::to_string(i + 1);
             std::reverse(label.begin(), label.end());
             int text_width = label.length() * 8;
-            // Text position needs to be mirrored: what appears at face.x will show at (width - face.x) after flip
-            int text_x = display_frame.width() - (face.x + text_width);
+            // Position text: align with right edge of box before flip = left edge after flip
+            int text_x = face.x + face.width - text_width;
             faceid::drawText(display_frame, label, text_x, face.y - 10, color, 1.0);
         }
         

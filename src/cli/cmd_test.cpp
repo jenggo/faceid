@@ -209,6 +209,7 @@ int cmd_test(const std::string& username) {
 
     int frame_count = 0;
     auto start_time = std::chrono::steady_clock::now();
+    bool timing_displayed = false;  // Track if we've shown timing info
 
     while (display.isOpen()) {
         faceid::Image frame;
@@ -219,8 +220,11 @@ int cmd_test(const std::string& username) {
         }
 
         // Preprocess and detect faces
+        auto detect_start = std::chrono::high_resolution_clock::now();
         faceid::Image processed_frame = detector.preprocessFrame(frame.view());
         auto faces = detector.detectOrTrackFaces(processed_frame.view(), tracking_interval);
+        auto detect_end = std::chrono::high_resolution_clock::now();
+        double detection_time = std::chrono::duration<double, std::milli>(detect_end - detect_start).count();
 
         // Clone frame for drawing
         faceid::Image display_frame = frame.clone();
@@ -228,8 +232,10 @@ int cmd_test(const std::string& username) {
         // Process each detected face
         std::vector<std::string> matched_names(faces.size(), "");
         std::vector<double> matched_distances(faces.size(), 999.0);
+        double recognition_time = 0.0;
 
         if (!faces.empty()) {
+            auto recog_start = std::chrono::high_resolution_clock::now();
             auto encodings = detector.encodeFaces(processed_frame.view(), faces);
 
             // Match each face against all enrolled users
@@ -253,11 +259,31 @@ int cmd_test(const std::string& username) {
                     matched_names[i] = best_match;
                 }
             }
+            auto recog_end = std::chrono::high_resolution_clock::now();
+            recognition_time = std::chrono::duration<double, std::milli>(recog_end - recog_start).count();
+            
+            // Display timing info on first successful match
+            if (!timing_displayed && !matched_names.empty() && !matched_names[0].empty()) {
+                std::cout << "\n=== Performance Timing (First Match) ===" << std::endl;
+                std::cout << "Face detection time:    " << std::fixed << std::setprecision(2) 
+                         << detection_time << " ms" << std::endl;
+                std::cout << "Face recognition time:  " << recognition_time << " ms" << std::endl;
+                std::cout << "Total time:             " << (detection_time + recognition_time) << " ms" << std::endl;
+                std::cout << "========================================\n" << std::endl;
+                timing_displayed = true;
+            }
         }
 
         // Draw detected faces with identity
         for (size_t i = 0; i < faces.size(); i++) {
             const auto& face = faces[i];
+            
+            // Debug: print coordinates for first face on first frame
+            if (frame_count == 0 && i == 0) {
+                std::cout << "DEBUG: Face bbox - x=" << face.x << " y=" << face.y 
+                         << " w=" << face.width << " h=" << face.height 
+                         << " (frame: " << display_frame.width() << "x" << display_frame.height() << ")" << std::endl;
+            }
 
             // Color and label based on match status
             faceid::Color color = !matched_names[i].empty()
@@ -268,14 +294,15 @@ int cmd_test(const std::string& username) {
                 ? matched_names[i] + " (" + std::to_string(static_cast<int>(matched_distances[i] * 100)) + "%)"
                 : "Unknown (" + std::to_string(static_cast<int>(matched_distances[i] * 100)) + "%)";
 
-            // Draw rectangle
+            // Draw rectangle at ORIGINAL position (SDL will flip it correctly)
             faceid::drawRectangle(display_frame, face.x, face.y,
                                  face.width, face.height, color, 2);
 
-            // Reverse text for SDL horizontal flip
+            // Reverse text for SDL horizontal flip and position it above the box
             std::reverse(label.begin(), label.end());
             int text_width = label.length() * 8;
-            int text_x = display_frame.width() - (face.x + text_width);
+            // Position text: align with right edge of box before flip = left edge after flip
+            int text_x = face.x + face.width - text_width;
             faceid::drawText(display_frame, label, text_x, face.y - 10, color, 1.0);
         }
 
