@@ -27,6 +27,9 @@ public:
     // Check if being called from lock screen greeter (KDE/GNOME)
     bool isLockScreenGreeter();
     
+    // Check if only external monitors are active (laptop display off)
+    bool isExternalMonitorOnly();
+    
     // Get the detection method used
     std::string getDetectionMethod() const { return detection_method_; }
     

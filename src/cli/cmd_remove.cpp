@@ -10,7 +10,7 @@ using namespace faceid;
 using namespace faceid::cli;
 
 int cmd_remove(const std::string& username, const std::string& face_id) {
-    std::string models_dir = MODELS_DIR;
+    std::string faces_dir = FACES_DIR;
     
     // If no face_id specified, remove entire user model
     if (face_id.empty()) {
@@ -19,7 +19,7 @@ int cmd_remove(const std::string& username, const std::string& face_id) {
         
         if (files.empty()) {
             std::cerr << "✗ No face model files found for user: " << username << std::endl;
-            std::cerr << "  Looked in: " << models_dir << std::endl;
+            std::cerr << "  Looked in: " << faces_dir << std::endl;
             return 1;
         }
         
@@ -48,7 +48,7 @@ int cmd_remove(const std::string& username, const std::string& face_id) {
     }
     
     // Remove specific face_id
-    std::string model_path = models_dir + "/" + username + "." + face_id + ".bin";
+    std::string model_path = faces_dir + "/" + username + "." + face_id + ".bin";
     BinaryFaceModel model;
     
     if (!BinaryModelLoader::loadUserModel(model_path, model)) {

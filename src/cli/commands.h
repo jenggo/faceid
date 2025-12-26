@@ -60,12 +60,14 @@ int cmd_list(const std::string& username = "");
 int cmd_show();
 
 /**
- * Test face recognition for a specific user
- * 
- * Attempts to match the user's face from the camera against stored models
- * 
- * @param username The username to test recognition for
- * @return 0 if face recognized, 1 if not recognized or error
+ * Test face recognition with live visual display
+ *
+ * Shows a live camera preview with face detection and recognition.
+ * Compares detected faces against ALL enrolled users and displays the matched username.
+ * Green box = Match found, Red box = Unknown face
+ *
+ * @param username Optional username for running integrity checks (can be empty)
+ * @return 0 on success, 1 on error
  */
 int cmd_test(const std::string& username);
 

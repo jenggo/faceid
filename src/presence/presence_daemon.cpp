@@ -349,7 +349,7 @@ int main(int argc, char* argv[]) {
             auto stats = detector.getStatistics();
             logger.info("Presence detection statistics:");
             logger.info("  Total scans: " + std::to_string(stats.totalScans));
-            logger.info("  Faces detected: " + std::to_string(stats.facesDetected));
+            logger.info("  Successful detections: " + std::to_string(stats.facesDetected));
             logger.info("  Failed scans: " + std::to_string(stats.failedScans));
             logger.info("  State transitions: " + std::to_string(stats.stateTransitions));
             logger.info("  Uptime: " + std::to_string(stats.uptimeSeconds / 3600) + "h " + 

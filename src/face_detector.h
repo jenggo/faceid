@@ -1,6 +1,7 @@
 #ifndef FACEID_FACE_DETECTOR_H
 #define FACEID_FACE_DETECTOR_H
 
+#include "encoding_config.h"  // FACE_ENCODING_DIM constant
 #include "image.h"
 #include <string>
 #include <vector>
@@ -10,7 +11,7 @@
 
 namespace faceid {
 
-// Face encodings are 128D float vectors stored in std::vector for NCNN
+// Face encodings are stored as std::vector<float> for NCNN compatibility
 using FaceEncoding = std::vector<float>;
 
 class FaceDetector {

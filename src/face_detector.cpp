@@ -345,19 +345,19 @@ std::vector<FaceEncoding> FaceDetector::encodeFaces(
         // Create extractor and run inference
         ncnn::Extractor ex = ncnn_net_.create_extractor();
         ex.set_light_mode(true);  // Optimize for speed
-        ex.input("data", in);
+        ex.input("in0", in);  // SFace model uses "in0" as input layer
         
         // Extract features
         ncnn::Mat out;
-        int ret = ex.extract("fc1", out);
+        int ret = ex.extract("out0", out);  // SFace model uses "out0" as output layer
         if (ret != 0) {
             // Inference failed - skip this face
             // This can happen with corrupted models or invalid input
             continue;
         }
         
-        // Validate output dimensions (SFace should produce 128D vector)
-        if (out.w != 128 || out.h != 1 || out.c != 1) {
+        // Validate output dimensions (SFace produces 512D vector)
+        if (out.w != static_cast<int>(FACE_ENCODING_DIM) || out.h != 1 || out.c != 1) {
             // Unexpected output dimensions - skip this face
             continue;
         }
@@ -395,8 +395,8 @@ double FaceDetector::compareFaces(const FaceEncoding& encoding1, const FaceEncod
         return 999.0;  // Return large distance for invalid comparison
     }
     
-    // Check size (should be 128 for both)
-    if (encoding1.size() != encoding2.size() || encoding1.size() != 128) {
+    // Check size (should match FACE_ENCODING_DIM for current model)
+    if (encoding1.size() != encoding2.size() || encoding1.size() != FACE_ENCODING_DIM) {
         return 999.0;  // Size mismatch
     }
     

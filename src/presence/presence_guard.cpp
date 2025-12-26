@@ -93,9 +93,10 @@ bool PresenceGuard::checkScreenLock() {
     
     // Fast check: Use cached session ID with loginctl (Wayland-compatible)
     if (!cached_session_id_.empty()) {
-        std::string cmd = "loginctl show-session " + cached_session_id_ + 
-                         " -p LockedHint --value 2>/dev/null";
-        FILE* pipe = popen(cmd.c_str(), "r");
+        char cmd_buffer[256];
+        snprintf(cmd_buffer, sizeof(cmd_buffer), "loginctl show-session %s -p LockedHint --value 2>/dev/null", cached_session_id_.c_str());
+        const char* cmd = cmd_buffer;
+        FILE* pipe = popen(cmd, "r");
         if (pipe) {
             char buffer[16];
             if (fgets(buffer, sizeof(buffer), pipe) != nullptr) {

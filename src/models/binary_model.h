@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 #include <cstdint>
+#include "../encoding_config.h"  // FACE_ENCODING_DIM constant
 #include "../face_detector.h"
 
 namespace faceid {
@@ -12,7 +13,7 @@ namespace faceid {
 struct BinaryFaceModel {
     std::string username;
     std::vector<std::string> face_ids;  // Face ID labels (typically one per model)
-    std::vector<FaceEncoding> encodings;  // Face encodings (128D float vectors)
+    std::vector<FaceEncoding> encodings;  // Face encodings (dimension set by FACE_ENCODING_DIM)
     uint32_t timestamp;
     bool valid;
 };
@@ -21,8 +22,9 @@ struct BinaryFaceModel {
 class BinaryModelLoader {
 public:
     static constexpr size_t HEADER_SIZE = 120;  // 0x78
-    static constexpr size_t ENCODING_DIM = 128;
-    static constexpr size_t ENCODING_SIZE = ENCODING_DIM * sizeof(float);  // 512 bytes
+    // Use the global encoding dimension constant from encoding_config.h
+    static constexpr size_t ENCODING_DIM = FACE_ENCODING_DIM;
+    static constexpr size_t ENCODING_SIZE = ENCODING_DIM * sizeof(float);
     static constexpr size_t FACE_ID_LABEL_SIZE = 36;
 
     // Load user model from binary file

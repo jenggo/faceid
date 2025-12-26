@@ -99,12 +99,21 @@ inline faceid::Config& loadDefaultConfig() {
 }
 
 /**
- * Get the models directory path
+ * Get the models directory path (for NCNN models like sface, RFB-320)
  * 
  * @return Full path to models directory
  */
 inline std::string getModelsDir() {
     return std::string(MODELS_DIR);
+}
+
+/**
+ * Get the faces directory path (for user enrollment data)
+ * 
+ * @return Full path to faces directory
+ */
+inline std::string getFacesDir() {
+    return std::string(FACES_DIR);
 }
 
 /**
@@ -196,9 +205,9 @@ inline bool isValidUsername(const std::string& username) {
  */
 inline std::vector<std::string> findUserModelFiles(const std::string& username) {
     std::vector<std::string> files;
-    std::string models_dir = getModelsDir();
+    std::string faces_dir = getFacesDir();
     
-    DIR* dir = opendir(models_dir.c_str());
+    DIR* dir = opendir(faces_dir.c_str());
     if (!dir) {
         return files;  // Return empty vector if can't open directory
     }
@@ -216,7 +225,7 @@ inline std::vector<std::string> findUserModelFiles(const std::string& username) 
         // Check if filename matches any pattern
         for (const auto& pattern : patterns) {
             if (fnmatch(pattern.c_str(), filename.c_str(), 0) == 0) {
-                files.push_back(models_dir + "/" + filename);
+                files.push_back(faces_dir + "/" + filename);
                 break;  // Don't check other patterns for this file
             }
         }
@@ -238,8 +247,8 @@ inline std::vector<std::string> findUserModelFiles(const std::string& username) 
  * @return Full path to model file, or empty string if not found
  */
 inline std::string getUserModelFile(const std::string& username) {
-    std::string models_dir = getModelsDir();
-    std::string primary = models_dir + "/" + username + ".bin";
+    std::string faces_dir = getFacesDir();
+    std::string primary = faces_dir + "/" + username + ".bin";
     
     // Check primary file first
     if (fileExists(primary)) {
@@ -254,15 +263,15 @@ inline std::string getUserModelFile(const std::string& username) {
 /**
  * Get all enrolled usernames
  * 
- * Scans the models directory for all .bin files and extracts usernames
+ * Scans the faces directory for all .bin files and extracts usernames
  * 
  * @return Vector of unique usernames
  */
 inline std::vector<std::string> getEnrolledUsers() {
     std::vector<std::string> users;
-    std::string models_dir = getModelsDir();
+    std::string faces_dir = getFacesDir();
     
-    DIR* dir = opendir(models_dir.c_str());
+    DIR* dir = opendir(faces_dir.c_str());
     if (!dir) {
         return users;
     }

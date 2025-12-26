@@ -19,9 +19,9 @@ ModelCache& ModelCache::getInstance() {
 // Helper function to find user model files (both username.bin and username.*.bin)
 static std::vector<std::string> findUserModelFiles(const std::string& username) {
     std::vector<std::string> files;
-    std::string models_dir = MODELS_DIR;
+    std::string faces_dir = FACES_DIR;
     
-    DIR* dir = opendir(models_dir.c_str());
+    DIR* dir = opendir(faces_dir.c_str());
     if (!dir) {
         return files;
     }
@@ -38,7 +38,7 @@ static std::vector<std::string> findUserModelFiles(const std::string& username) 
         
         for (const auto& pattern : patterns) {
             if (fnmatch(pattern.c_str(), filename.c_str(), 0) == 0) {
-                files.push_back(models_dir + std::string("/") + filename);
+                files.push_back(faces_dir + std::string("/") + filename);
                 break;
             }
         }
@@ -156,10 +156,10 @@ std::vector<BinaryFaceModel> ModelCache::loadUsersParallel(
 std::vector<BinaryFaceModel> ModelCache::loadAllUsersParallel(int num_threads) {
     std::vector<std::string> usernames;
     
-    // Scan MODELS_DIR for *.bin files
-    DIR* dir = opendir(MODELS_DIR);
+    // Scan FACES_DIR for *.bin files (user face data only)
+    DIR* dir = opendir(FACES_DIR);
     if (!dir) {
-        std::cerr << "Failed to open models directory: " << MODELS_DIR << std::endl;
+        std::cerr << "Failed to open faces directory: " << FACES_DIR << std::endl;
         return {};
     }
     

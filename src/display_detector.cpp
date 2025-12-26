@@ -189,4 +189,69 @@ bool DisplayDetector::checkGNOMELockScreen() {
     return false;
 }
 
+bool DisplayDetector::isExternalMonitorOnly() {
+    // Check if laptop's built-in eDP display is off but external monitors are connected and on
+    
+    // First, check if eDP (laptop screen) is off
+    bool edp_off = false;
+    std::ifstream drm_state("/sys/class/drm/card0/card0-eDP-1/dpms");
+    if (drm_state.is_open()) {
+        std::string state;
+        std::getline(drm_state, state);
+        if (state.find("Off") != std::string::npos || state.find("off") != std::string::npos) {
+            edp_off = true;
+        }
+    } else {
+        // If we can't detect eDP state, assume it's on (safe default)
+        return false;
+    }
+    
+    // If eDP is still on, we're not in external-only mode
+    if (!edp_off) {
+        return false;
+    }
+    
+    // eDP is off - now check if any external monitors (DP/HDMI) are connected and on
+    // Check common DRM connector types for external displays
+    const char* external_connectors[] = {
+        "/sys/class/drm/card0/card0-DP-",     // DisplayPort
+        "/sys/class/drm/card0/card0-HDMI-",   // HDMI
+        "/sys/class/drm/card0/card0-DVI-",    // DVI
+        nullptr
+    };
+    
+    for (int connector_idx = 0; external_connectors[connector_idx] != nullptr; connector_idx++) {
+        // Check up to 8 ports of each type (DP-1, DP-2, ..., DP-8)
+        for (int port = 1; port <= 8; port++) {
+            std::string connector_base = std::string(external_connectors[connector_idx]) + std::to_string(port);
+            
+            // Check if connector is connected
+            std::ifstream status_file(connector_base + "/status");
+            if (status_file.is_open()) {
+                std::string status;
+                std::getline(status_file, status);
+                
+                // If connected, check if it's powered on
+                if (status.find("connected") != std::string::npos) {
+                    std::ifstream dpms_file(connector_base + "/dpms");
+                    if (dpms_file.is_open()) {
+                        std::string dpms_state;
+                        std::getline(dpms_file, dpms_state);
+                        
+                        // If this external monitor is On, we're in external-only mode
+                        if (dpms_state.find("On") != std::string::npos || 
+                            dpms_state.find("on") != std::string::npos) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    // eDP is off but no active external monitors found
+    // This means all displays are off
+    return false;
+}
+
 } // namespace faceid

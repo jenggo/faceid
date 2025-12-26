@@ -1,7 +1,7 @@
 .ignore
 .cache/
 docs/
-test/
+tests/
 *.*backup
 *.md
 !README.md

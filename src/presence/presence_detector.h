@@ -109,6 +109,7 @@ public:
 private:
     // Main detection thread
     void detectionLoop();
+    bool checkPAMLockFile();  // Check if PAM authentication is in progress
     
     // State machine updates
     void updateStateMachine();
@@ -148,8 +149,8 @@ private:
     std::mutex camera_mutex_;
     Image last_captured_frame_;  // Cache for peek detection (avoids reopening camera)
     
-    // Face detection with tracking support
-    faceid::FaceDetector face_detector_;
+    // Face detection with tracking support (lazy-loaded to save memory when not needed)
+    std::unique_ptr<faceid::FaceDetector> face_detector_;
     int tracking_interval_ = 10;  // Track every N frames for better performance
     
     // Detection (YuNet)
@@ -200,7 +201,7 @@ private:
     // Activity detection caching (to reduce /proc/interrupts reads)
     mutable time_t cached_last_activity_ = 0;
     mutable std::chrono::steady_clock::time_point last_activity_check_;
-    mutable std::chrono::seconds activity_cache_duration_{2};  // Cache for 2 seconds
+    mutable std::chrono::seconds activity_cache_duration_{1};  // Cache for 1 second (reduced for better responsiveness)
     
     // Statistics
     std::atomic<int> total_scans_{0};

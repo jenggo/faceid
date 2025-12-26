@@ -1,5 +1,6 @@
 #include "commands.h"
 #include "cli_common.h"
+#include <algorithm>  // for std::reverse
 
 namespace faceid {
 
@@ -48,8 +49,8 @@ int cmd_show() {
     
     std::cout << "Models loaded successfully!" << std::endl;
     
-    // Create preview window
-    faceid::Display display("FaceID - Live Camera View", 800, 600);
+    // Create preview window with camera resolution (no scaling)
+    faceid::Display display("FaceID - Live Camera View", width, height);
     
     std::cout << "\nLive preview started. Press 'q' or ESC in the preview window to quit.\n" << std::endl;
     
@@ -97,6 +98,7 @@ int cmd_show() {
         frame_count++;
         auto now = std::chrono::steady_clock::now();
         auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count();
+        
         if (elapsed > 0) {
             double fps = static_cast<double>(frame_count) / elapsed;
             
@@ -118,7 +120,8 @@ int cmd_show() {
             // Resolution (reversed text for SDL flip)
             std::string res_text = std::to_string(display_frame.width()) + "x" + std::to_string(display_frame.height());
             std::reverse(res_text.begin(), res_text.end());
-            faceid::drawText(display_frame, res_text, 10, 10, faceid::Color::Gray(), 1.0);
+            int res_width = res_text.length() * 8;
+            faceid::drawText(display_frame, res_text, display_frame.width() - 10 - res_width, 45, faceid::Color::Gray(), 1.0);
         }
         
         // Draw help text at bottom (reversed text for SDL flip)
