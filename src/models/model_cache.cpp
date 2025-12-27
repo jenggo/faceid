@@ -1,14 +1,13 @@
 #include "model_cache.h"
 #include "binary_model.h"
+#include "../logger.h"
 #include <thread>
 #include <mutex>
 #include <dirent.h>
 #include <fnmatch.h>
 #include <vector>
 #include <algorithm>
-#include <iostream>
 #include "config_paths.h"
-
 namespace faceid {
 
 ModelCache& ModelCache::getInstance() {
@@ -159,7 +158,7 @@ std::vector<BinaryFaceModel> ModelCache::loadAllUsersParallel(int num_threads) {
     // Scan FACES_DIR for *.bin files (user face data only)
     DIR* dir = opendir(FACES_DIR);
     if (!dir) {
-        std::cerr << "Failed to open faces directory: " << FACES_DIR << std::endl;
+        faceid::Logger::getInstance().error("Failed to open faces directory: " + std::string(FACES_DIR));
         return {};
     }
     

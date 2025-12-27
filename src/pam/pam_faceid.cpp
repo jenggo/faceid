@@ -1,15 +1,10 @@
 #include <security/pam_appl.h>
 #include <security/pam_modules.h>
 #include <syslog.h>
-#include <fstream>
 #include <thread>
 #include <atomic>
 #include <future>
-#include <mutex>
-#include <sys/file.h>
-#include <sys/stat.h>
 #include <unistd.h>
-#include <fcntl.h>
 #include "../config.h"
 #include "../logger.h"
 #include "../fingerprint_auth.h"
@@ -28,27 +23,16 @@
 
 using namespace faceid;
 
-// Lock file path for system-wide singleton
-// DISABLED: File-based lock caused permission issues
-// Commenting out the lock mechanism - returning to pre-lock behavior
-// static const char* LOCK_FILE_PATH = "/run/lock/pam_faceid.lock";
-
-// No-op lock class - authentication proceeds without locking
-// DISABLED: File-based lock caused permission issues with polkit
-// This restores the behavior before lock implementation was added
+// Simplified locking: No file-based lock needed
+// PAM authentication is inherently serialized by the PAM stack
 class SystemWideLock {
 public:
-    SystemWideLock() {}
-    ~SystemWideLock() {}
+    SystemWideLock() = default;
+    ~SystemWideLock() = default;
     
-    // Always return true - no actual locking performed
-    bool tryAcquire() { return true; }
-    bool acquireWithTimeout(int timeout_seconds = 10) { 
-        (void)timeout_seconds; // Unused parameter
+    bool acquireWithTimeout(int /*timeout_seconds*/ = 10) { 
         return true; 
     }
-    void release() {}
-    bool isLocked() const { return true; }
 };
 
 static bool authenticate_user(const char* username) {

@@ -1,6 +1,8 @@
 #include "presence_guard.h"
+#include "../systemd_helper.h"
 #include "../lid_detector.h"
 #include <unistd.h>
+#include <mutex>
 
 namespace faceid {
 
@@ -58,8 +60,11 @@ bool PresenceGuard::checkCameraShutter() {
 }
 
 bool PresenceGuard::checkScreenLock() {
+    // Lock mutex to protect cache access
+    std::lock_guard<std::mutex> lock(cache_mutex_);
+    
     // Return cached state if checked recently (every 2 seconds max)
-    // This prevents spawning loginctl processes 10 times per second
+    // This prevents querying D-Bus 10 times per second
     auto now = std::chrono::steady_clock::now();
     auto time_since_lock_check = std::chrono::duration_cast<std::chrono::seconds>(
         now - last_lock_state_check_).count();
@@ -76,62 +81,40 @@ bool PresenceGuard::checkScreenLock() {
         now - last_session_check_).count();
     
     if (cached_session_id_.empty() || time_since_session_check > 30) {
-        FILE* pipe = popen("loginctl list-sessions --no-legend 2>/dev/null | awk '{print $1}' | head -1", "r");
-        if (pipe) {
-            char buffer[128];
-            if (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
-                cached_session_id_ = buffer;
-                // Remove newline
-                if (!cached_session_id_.empty() && cached_session_id_.back() == '\n') {
-                    cached_session_id_.pop_back();
-                }
-            }
-            pclose(pipe);  // Always close pipe
+        auto session_id = SystemdHelper::getActiveSessionId();
+        if (session_id.has_value()) {
+            cached_session_id_ = *session_id;
         }
         last_session_check_ = now;
     }
     
-    // Fast check: Use cached session ID with loginctl (Wayland-compatible)
+    // Fast check: Use cached session ID with D-Bus (Wayland-compatible)
     if (!cached_session_id_.empty()) {
-        char cmd_buffer[256];
-        snprintf(cmd_buffer, sizeof(cmd_buffer), "loginctl show-session %s -p LockedHint --value 2>/dev/null", cached_session_id_.c_str());
-        const char* cmd = cmd_buffer;
-        FILE* pipe = popen(cmd, "r");
-        if (pipe) {
-            char buffer[16];
-            if (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
-                std::string result(buffer);
-                // Remove whitespace/newline
-                result.erase(result.find_last_not_of(" \n\r\t") + 1);
-                if (result == "yes") {
-                    // Session is locked
-                    is_unlocked = false;
-                } else {
-                    // "no" or empty means unlocked
-                    is_unlocked = true;
-                }
-                
-                pclose(pipe);  // Close before return
-                
-                // Update cache and return
-                cached_lock_state_ = is_unlocked;
-                last_lock_state_check_ = now;
-                return cached_lock_state_;
-            }
-            pclose(pipe);  // Close if fgets failed
+        if (SystemdHelper::isSessionLocked(cached_session_id_)) {
+            // Session is locked
+            is_unlocked = false;
+            
+            // Update cache and return
+            cached_lock_state_ = is_unlocked;
+            last_lock_state_check_ = now;
+            return cached_lock_state_;
+        } else {
+            // Session is unlocked
+            is_unlocked = true;
+            
+            // Update cache and return
+            cached_lock_state_ = is_unlocked;
+            last_lock_state_check_ = now;
+            return cached_lock_state_;
         }
     }
     
     // Fallback: KDE-specific check (for older systems without loginctl LockedHint)
     // NOTE: kscreenlocker_daemon is ALWAYS running in KDE, even when unlocked!
     // We must check for kscreenlocker_greet which only runs when the lock screen is active
-    FILE* pipe = popen("pgrep -x kscreenlocker_greet >/dev/null 2>&1", "r");
-    if (pipe) {
-        int status = pclose(pipe);
-        if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
-            // kscreenlocker_greet is running = screen is locked
-            is_unlocked = false;
-        }
+    if (SystemdHelper::isProcessRunning("kscreenlocker_greet")) {
+        // kscreenlocker_greet is running = screen is locked
+        is_unlocked = false;
     }
     
     // Update cache and return

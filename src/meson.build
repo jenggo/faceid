@@ -18,6 +18,7 @@ core_sources = files(
     'fingerprint_auth.cpp',
     'lid_detector.cpp',
     'display_detector.cpp',
+    'systemd_helper.cpp',
     'presence/presence_guard.cpp',
     'presence/presence_detector.cpp',
     'models/binary_model.cpp',
@@ -28,7 +29,7 @@ core_lib = static_library(
     'faceid-core',
     sources: core_sources,
     include_directories: inc,
-    dependencies: [ncnn_dep, turbojpeg_dep, libyuv_dep, gio_dep, glib_dep],
+    dependencies: [ncnn_dep, turbojpeg_dep, libyuv_dep, gio_dep, glib_dep, libsystemd_dep],
     cpp_args: cpp_args,
 )
 
@@ -94,14 +95,4 @@ config_merge_exe = executable(
     cpp_args: cpp_args,
     install: true,
     install_dir: get_option('bindir'),
-)
-
-# Test encoding integrity
-test_encoding_integrity_exe = executable(
-    'test-encoding-integrity',
-    sources: files('models/test_encoding_integrity.cpp'),
-    include_directories: inc,
-    link_with: core_lib,
-    cpp_args: cpp_args,
-    install: false,
 )

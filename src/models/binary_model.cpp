@@ -1,6 +1,6 @@
 #include "binary_model.h"
+#include "../logger.h"
 #include <fstream>
-#include <iostream>
 #include <cstring>
 #include <algorithm>
 
@@ -9,7 +9,7 @@ namespace faceid {
 bool BinaryModelLoader::loadUserModel(const std::string& path, BinaryFaceModel& model) {
     std::ifstream file(path, std::ios::binary);
     if (!file) {
-        std::cerr << "Failed to open file: " << path << std::endl;
+        faceid::Logger::getInstance().error("Failed to open model file: " + path);
         return false;
     }
 
@@ -18,7 +18,7 @@ bool BinaryModelLoader::loadUserModel(const std::string& path, BinaryFaceModel& 
     // Read username (16 bytes, null-padded)
     model.username = readNullPaddedString(file, 16);
     if (model.username.empty()) {
-        std::cerr << "Invalid username in file" << std::endl;
+        faceid::Logger::getInstance().error("Invalid username in model file: " + path);
         return false;
     }
 
@@ -37,14 +37,14 @@ bool BinaryModelLoader::loadUserModel(const std::string& path, BinaryFaceModel& 
     // Read face count
     uint32_t face_count = readUint32LE(file);
     if (!file || face_count == 0) {
-        std::cerr << "Invalid face count" << std::endl;
+        faceid::Logger::getInstance().error("Invalid face count in model file: " + path);
         return false;
     }
 
     // Read face ID label (36 bytes, null-terminated)
     std::string face_id_label = readNullPaddedString(file, FACE_ID_LABEL_SIZE);
     if (face_id_label.empty()) {
-        std::cerr << "Invalid face ID label" << std::endl;
+        faceid::Logger::getInstance().error("Invalid face ID label in model file: " + path);
         return false;
     }
     model.face_ids.push_back(face_id_label);
@@ -80,13 +80,13 @@ bool BinaryModelLoader::loadUserModel(const std::string& path, BinaryFaceModel& 
 
 bool BinaryModelLoader::saveUserModel(const std::string& path, const BinaryFaceModel& model) {
     if (!model.valid || model.encodings.empty() || model.face_ids.empty()) {
-        std::cerr << "Invalid model data" << std::endl;
+        faceid::Logger::getInstance().error("Invalid model data - cannot save to: " + path);
         return false;
     }
 
     std::ofstream file(path, std::ios::binary);
     if (!file) {
-        std::cerr << "Failed to open file for writing: " << path << std::endl;
+        faceid::Logger::getInstance().error("Failed to open file for writing: " + path);
         return false;
     }
 
@@ -116,7 +116,7 @@ bool BinaryModelLoader::saveUserModel(const std::string& path, const BinaryFaceM
     // Write encodings
     for (const auto& encoding : model.encodings) {
         if (encoding.size() != ENCODING_DIM) {
-            std::cerr << "Invalid encoding dimension" << std::endl;
+            faceid::Logger::getInstance().error("Invalid encoding dimension in model: " + path);
             return false;
         }
         file.write(reinterpret_cast<const char*>(encoding.data()), ENCODING_SIZE);

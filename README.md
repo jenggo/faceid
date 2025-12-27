@@ -22,9 +22,9 @@ Tested on T14 Gen4 Ryzen (Manjaro Plasma Wayland)
 
 ### Dependencies
 
-**Arch**: `sudo pacman -S base-devel meson ninja ncnn pam libjpeg-turbo sdl2 libyuv glib2 fprintd`  
-**Debian/Ubuntu**: `sudo apt install build-essential meson ninja-build libncnn-dev libpam0g-dev libturbojpeg0-dev libsdl2-dev libyuv-dev libglib2.0-dev fprintd pkg-config`  
-**Fedora**: `sudo dnf install gcc-c++ meson ninja-build ncnn-devel pam-devel turbojpeg-devel SDL2-devel libyuv-devel glib2-devel fprintd pkgconfig`
+**Arch**: `sudo pacman -S base-devel meson ninja ncnn pam libjpeg-turbo sdl2 libyuv glib2 fprintd systemd`  
+**Debian/Ubuntu**: `sudo apt install build-essential meson ninja-build libncnn-dev libpam0g-dev libturbojpeg0-dev libsdl2-dev libyuv-dev libglib2.0-dev fprintd libsystemd-dev pkg-config`  
+**Fedora**: `sudo dnf install gcc-c++ meson ninja-build ncnn-devel pam-devel turbojpeg-devel SDL2-devel libyuv-devel glib2-devel fprintd systemd-devel pkgconfig`
 
 ### Build
 
@@ -114,7 +114,7 @@ Edit `/etc/faceid/faceid.conf`:
 - Display: SDL2 (hardware accelerated)
 - Result: 83% smaller binary (3.3MB vs 20MB)
 
-**Dependencies**: NCNN (inference), TurboJPEG (MJPEG), libyuv (SIMD ops), SDL2 (display), GLib (D-Bus), PAM
+**Dependencies**: NCNN (inference), TurboJPEG (MJPEG), libyuv (SIMD ops), SDL2 (display), GLib (D-Bus), libsystemd (session management), PAM
 
 ---
 

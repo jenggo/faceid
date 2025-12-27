@@ -1,4 +1,5 @@
 #include "lid_detector.h"
+#include "systemd_helper.h"
 #include "logger.h"
 #include <fstream>
 #include <cstring>
@@ -163,38 +164,20 @@ LidState LidDetector::detectViaSysfs() const {
 }
 
 LidState LidDetector::detectViaSystemdLogind() const {
-    // Use busctl to query systemd-logind for lid state
-    // This is more reliable but requires spawning a process
+    // Use D-Bus API to query systemd-logind for lid state
+    auto lid_closed = SystemdHelper::getLidClosed();
     
-    FILE* pipe = popen("busctl get-property org.freedesktop.login1 "
-                      "/org/freedesktop/login1 org.freedesktop.login1.Manager "
-                      "LidClosed 2>/dev/null", "r");
-    
-    if (!pipe) {
+    if (!lid_closed.has_value()) {
         return LidState::UNKNOWN;
     }
     
-    char buffer[256];
-    std::string result;
-    
-    while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
-        result += buffer;
+    if (*lid_closed) {
+        Logger::getInstance().debug("Lid detected as CLOSED via systemd-logind D-Bus");
+        return LidState::CLOSED;
+    } else {
+        Logger::getInstance().debug("Lid detected as OPEN via systemd-logind D-Bus");
+        return LidState::OPEN;
     }
-    
-    int status = pclose(pipe);
-    
-    if (status == 0 && !result.empty()) {
-        // Output format: "b true" or "b false"
-        if (result.find("true") != std::string::npos) {
-            Logger::getInstance().debug("Lid detected as CLOSED via systemd-logind");
-            return LidState::CLOSED;
-        } else if (result.find("false") != std::string::npos) {
-            Logger::getInstance().debug("Lid detected as OPEN via systemd-logind");
-            return LidState::OPEN;
-        }
-    }
-    
-    return LidState::UNKNOWN;
 }
 
 } // namespace faceid
