@@ -3,6 +3,7 @@
 
 #include <chrono>
 #include <string>
+#include <mutex>
 
 namespace faceid {
 
@@ -37,14 +38,17 @@ private:
     bool screen_unlocked_;
     std::chrono::steady_clock::time_point last_update_;
     
-    // Cache for screen lock check (avoid spawning processes constantly)
+    // Cache for screen lock check (avoid calling D-Bus constantly)
     std::string cached_session_id_;
     std::chrono::steady_clock::time_point last_session_check_;
     
-    // Cache the actual lock state result to avoid excessive process spawning
+    // Cache the actual lock state result to avoid excessive D-Bus calls
     bool cached_lock_state_;
     std::chrono::steady_clock::time_point last_lock_state_check_;
     static constexpr int LOCK_STATE_CACHE_SECONDS = 2;  // Check lock state every 2 seconds max
+    
+    // Mutex to protect cache access from multiple threads
+    mutable std::mutex cache_mutex_;
     
     // Individual check implementations
     bool checkLidState();

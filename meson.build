@@ -42,6 +42,10 @@ if not pam_dep.found()
     )
 endif
 
+# libsystemd for D-Bus communication with systemd-logind
+# Requires version >= 232 for sd_bus_* API support
+libsystemd_dep = dependency('libsystemd', required: true, version: '>=232')
+
 # Configuration variables
 config_dir = get_option('sysconfdir') / 'faceid'
 models_dir = config_dir / 'models'

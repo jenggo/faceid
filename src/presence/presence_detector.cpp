@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <atomic>
 
 // Lock file path for detecting PAM authentication
 static const char* PAM_LOCK_FILE = "/run/lock/pam_faceid.lock";
@@ -772,27 +773,30 @@ time_t PresenceDetector::getLastInputDeviceActivity() const {
         interrupts.close();  // Explicit close to free resources immediately
         
         // Store the interrupt count (static for persistence across calls)
-        static unsigned long long last_interrupt_count = 0;
-        static time_t last_interrupt_time = time(nullptr);
+        // Use atomics for thread safety
+        static std::atomic<unsigned long long> last_interrupt_count{0};
+        static std::atomic<time_t> last_interrupt_time{time(nullptr)};
         
         // Debug logging
+        unsigned long long prev_count = last_interrupt_count.load();
         char log_buf[256];
         snprintf(log_buf, sizeof(log_buf), 
                 "Interrupt check: total_count=%llu, last_count=%llu, delta=%lld",
-                total_count, last_interrupt_count, 
-                (long long)(total_count - last_interrupt_count));
+                total_count, prev_count, 
+                (long long)(total_count - prev_count));
         logger.debug(log_buf);
         
         // If interrupt count increased, update timestamp  
-        if (total_count > last_interrupt_count && total_count > 0) {
-            last_interrupt_count = total_count;
-            last_interrupt_time = time(nullptr);
+        if (total_count > prev_count && total_count > 0) {
+            last_interrupt_count.store(total_count);
+            last_interrupt_time.store(time(nullptr));
             logger.debug("ACTIVITY DETECTED: Interrupt count increased!");
         }
         
         // Use interrupt time if available
-        if (last_interrupt_time > 0) {
-            latest_input_time = last_interrupt_time;
+        time_t stored_time = last_interrupt_time.load();
+        if (stored_time > 0) {
+            latest_input_time = stored_time;
         }
     }
     

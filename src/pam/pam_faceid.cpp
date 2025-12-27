@@ -1,15 +1,12 @@
 #include <security/pam_appl.h>
 #include <security/pam_modules.h>
 #include <syslog.h>
-#include <fstream>
 #include <thread>
 #include <atomic>
 #include <future>
-#include <mutex>
-#include <sys/file.h>
-#include <sys/stat.h>
 #include <unistd.h>
-#include <fcntl.h>
+#include <systemd/sd-login.h>
+#include <string.h>
 #include "../config.h"
 #include "../logger.h"
 #include "../fingerprint_auth.h"
@@ -28,35 +25,62 @@
 
 using namespace faceid;
 
-// Lock file path for system-wide singleton
-// DISABLED: File-based lock caused permission issues
-// Commenting out the lock mechanism - returning to pre-lock behavior
-// static const char* LOCK_FILE_PATH = "/run/lock/pam_faceid.lock";
-
-// No-op lock class - authentication proceeds without locking
-// DISABLED: File-based lock caused permission issues with polkit
-// This restores the behavior before lock implementation was added
+// Simplified locking: No file-based lock needed
+// PAM authentication is inherently serialized by the PAM stack
 class SystemWideLock {
 public:
-    SystemWideLock() {}
-    ~SystemWideLock() {}
+    SystemWideLock() = default;
+    ~SystemWideLock() = default;
     
-    // Always return true - no actual locking performed
-    bool tryAcquire() { return true; }
-    bool acquireWithTimeout(int timeout_seconds = 10) { 
-        (void)timeout_seconds; // Unused parameter
+    bool acquireWithTimeout(int /*timeout_seconds*/ = 10) { 
         return true; 
     }
-    void release() {}
-    bool isLocked() const { return true; }
 };
+
+// Check if we should skip biometric authentication
+// Returns true if biometric should be skipped, false if it should proceed
+static bool should_skip_biometric(pam_handle_t *pamh, const char* username) {
+    // Check 1: Password already in PAM stack?
+    // This happens when:
+    // - SDDM/GDM pre-provided password
+    // - Previous PAM module already prompted
+    // - try_first_pass flag used
+    const char *password = nullptr;
+    int ret = pam_get_item(pamh, PAM_AUTHTOK, (const void **)&password);
+    
+    if (ret == PAM_SUCCESS && password != nullptr && strlen(password) > 0) {
+        syslog(LOG_INFO, "pam_faceid: Password already in PAM stack for user %s, skipping biometric", username);
+        return true;
+    }
+    
+    // Check 2: SSH/remote session detected?
+    // No point trying biometric in headless/SSH sessions (no camera)
+    int is_remote = sd_session_is_remote(nullptr);
+    if (is_remote > 0) {
+        syslog(LOG_INFO, "pam_faceid: Remote SSH session detected for user %s, skipping biometric", username);
+        return true;
+    }
+    
+    // Check 3: Camera device accessible?
+    // Polkit and other restricted contexts may not have /dev/video0 visible
+    if (access("/dev/video0", F_OK) != 0) {
+        syslog(LOG_INFO, "pam_faceid: Camera device not accessible (namespace/permission issue), skipping biometric for user %s", username);
+        return true;
+    }
+    
+    // Proceed with biometric authentication
+    return false;
+}
 
 static bool authenticate_user(const char* username) {
     const auto auth_start = std::chrono::steady_clock::now();
     
+    // Set environment variable to signal Logger we're in PAM context
+    // This prevents stderr warnings that break pkttyagent authentication
+    setenv("FACEID_PAM_CONTEXT", "1", 1);
+    
     // Initialize logger
     Logger& logger = Logger::getInstance();
-    logger.setLogFile("/var/log/faceid.log");
     openlog("pam_faceid", LOG_PID, LOG_AUTH);
     
     // Load configuration
@@ -163,6 +187,8 @@ static bool authenticate_user(const char* username) {
     int timeout = config.getInt("recognition", "timeout").value_or(5);
     std::atomic<bool> auth_success(false);
     std::atomic<bool> cancel_flag(false);
+    std::atomic<bool> face_finished(false);
+    std::atomic<bool> fingerprint_finished(false);
     std::string success_method;
     
     // Launch face authentication in separate thread (if enrolled)
@@ -175,6 +201,7 @@ static bool authenticate_user(const char* username) {
                 BinaryFaceModel model;
                 if (!cache.loadUserModel(username, model)) {
                     logger.error(std::string("Failed to load face model for user ") + username);
+                    face_finished.store(true);
                     return false;
                 }
                 
@@ -187,6 +214,7 @@ static bool authenticate_user(const char* username) {
                 
                 if (!camera.open(width, height)) {
                     logger.error("Failed to open camera");
+                    face_finished.store(true);
                     return false;
                 }
                 
@@ -195,6 +223,7 @@ static bool authenticate_user(const char* username) {
                 
                 if (!detector.loadModels()) {  // Use default MODELS_DIR/sface path
                     logger.error("Failed to load face recognition model");
+                    face_finished.store(true);
                     return false;
                 }
                 
@@ -244,9 +273,11 @@ static bool authenticate_user(const char* username) {
                     }
                 }
                 
+                face_finished.store(true);
                 return false;
             } catch (const std::exception& e) {
                 logger.error(std::string("Face auth exception: ") + e.what());
+                face_finished.store(true);
                 return false;
             }
         });
@@ -269,6 +300,7 @@ static bool authenticate_user(const char* username) {
                     // Check if face auth already succeeded
                     if (cancel_flag.load()) {
                         logger.debug("Face auth succeeded, skipping fingerprint initialization");
+                        fingerprint_finished.store(true);
                         return false;
                     }
                 }
@@ -279,13 +311,17 @@ static bool authenticate_user(const char* username) {
                 
                 if (!fingerprint_available) {
                     logger.info("Fingerprint authentication not available");
+                    fingerprint_finished.store(true);
                     return false;
                 }
                 
                 logger.debug("Fingerprint reader initialized, starting authentication");
-                return fingerprint.authenticate(username, timeout, cancel_flag);
+                bool result = fingerprint.authenticate(username, timeout, cancel_flag);
+                fingerprint_finished.store(true);
+                return result;
             } catch (const std::exception& e) {
                 logger.error(std::string("Fingerprint auth exception: ") + e.what());
+                fingerprint_finished.store(true);
                 return false;
             }
         });
@@ -316,6 +352,14 @@ static bool authenticate_user(const char* username) {
                 auth_success.store(true);
                 break;
             }
+        }
+        
+        // Early exit if both methods have finished (failed)
+        bool face_done = !face_enrolled || face_finished.load();
+        bool fingerprint_done = !fingerprint_enabled || fingerprint_finished.load();
+        if (face_done && fingerprint_done && !auth_success.load()) {
+            syslog(LOG_INFO, "pam_faceid: Both authentication methods finished without success, exiting early");
+            break;
         }
         
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -367,7 +411,16 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags,
     
     // Debug: Log that PAM module was called
     openlog("pam_faceid", LOG_PID, LOG_AUTH);
-    syslog(LOG_INFO, "pam_faceid: authenticate called (PID: %d)", getpid());
+    
+    // Get process info for debugging
+    char exe_path[256] = {0};
+    ssize_t len = readlink("/proc/self/exe", exe_path, sizeof(exe_path)-1);
+    if (len != -1) {
+        exe_path[len] = '\0';
+    }
+    
+    syslog(LOG_INFO, "pam_faceid: authenticate called (PID: %d, UID: %d, GID: %d, exe: %s)", 
+           getpid(), getuid(), getgid(), len != -1 ? exe_path : "unknown");
     
     // Try to acquire system-wide lock with timeout
     SystemWideLock lock;
@@ -402,6 +455,12 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags,
     if (ret != PAM_SUCCESS || username == nullptr) {
         closelog();
         return PAM_USER_UNKNOWN;
+    }
+    
+    // Check if we should skip biometric authentication
+    if (should_skip_biometric(pamh, username)) {
+        closelog();
+        return PAM_AUTH_ERR;  // Let next PAM module handle authentication
     }
     
     bool success = authenticate_user(username);

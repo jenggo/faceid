@@ -1,12 +1,13 @@
 #include "camera.h"
+#include "logger.h"
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <dirent.h>
 #include <cstring>
+#include <cerrno>
 #include <algorithm>
-#include <iostream>
 #include <linux/videodev2.h>
 
 namespace faceid {
@@ -35,26 +36,27 @@ bool Camera::open(int width, int height) {
     // Open device
     fd_ = ::open(device_path_.c_str(), O_RDWR);
     if (fd_ < 0) {
-        std::cerr << "Failed to open camera device: " << device_path_ << std::endl;
+        Logger::getInstance().error("Failed to open camera device: " + device_path_ + 
+                                   " (errno: " + std::to_string(errno) + " - " + strerror(errno) + ")");
         return false;
     }
     
     // Query capabilities
     struct v4l2_capability cap;
     if (ioctl(fd_, VIDIOC_QUERYCAP, &cap) < 0) {
-        std::cerr << "VIDIOC_QUERYCAP failed" << std::endl;
+        Logger::getInstance().error("VIDIOC_QUERYCAP failed for device: " + device_path_);
         close();
         return false;
     }
     
     if (!(cap.capabilities & V4L2_CAP_VIDEO_CAPTURE)) {
-        std::cerr << "Device does not support video capture" << std::endl;
+        Logger::getInstance().error("Device does not support video capture: " + device_path_);
         close();
         return false;
     }
     
     if (!(cap.capabilities & V4L2_CAP_STREAMING)) {
-        std::cerr << "Device does not support streaming" << std::endl;
+        Logger::getInstance().error("Device does not support streaming: " + device_path_);
         close();
         return false;
     }
@@ -69,7 +71,7 @@ bool Camera::open(int width, int height) {
     fmt.fmt.pix.field = V4L2_FIELD_NONE;
     
     if (ioctl(fd_, VIDIOC_S_FMT, &fmt) < 0) {
-        std::cerr << "VIDIOC_S_FMT failed" << std::endl;
+        Logger::getInstance().error("VIDIOC_S_FMT failed (MJPEG format) for device: " + device_path_);
         close();
         return false;
     }
@@ -96,13 +98,13 @@ bool Camera::open(int width, int height) {
     req.memory = V4L2_MEMORY_MMAP;
     
     if (ioctl(fd_, VIDIOC_REQBUFS, &req) < 0) {
-        std::cerr << "VIDIOC_REQBUFS failed" << std::endl;
+        Logger::getInstance().error("VIDIOC_REQBUFS failed for device: " + device_path_);
         close();
         return false;
     }
     
     if (req.count < 2) {
-        std::cerr << "Insufficient buffer memory" << std::endl;
+        Logger::getInstance().error("Insufficient buffer memory for device: " + device_path_);
         close();
         return false;
     }
@@ -117,7 +119,7 @@ bool Camera::open(int width, int height) {
         buf.index = i;
         
         if (ioctl(fd_, VIDIOC_QUERYBUF, &buf) < 0) {
-            std::cerr << "VIDIOC_QUERYBUF failed" << std::endl;
+            Logger::getInstance().error("VIDIOC_QUERYBUF failed for device: " + device_path_);
             close();
             return false;
         }
@@ -129,7 +131,7 @@ bool Camera::open(int width, int height) {
                                 fd_, buf.m.offset);
         
         if (buffers_[i].start == MAP_FAILED) {
-            std::cerr << "mmap failed" << std::endl;
+            Logger::getInstance().error("mmap failed for buffer " + std::to_string(i) + " on device: " + device_path_);
             close();
             return false;
         }
@@ -144,7 +146,7 @@ bool Camera::open(int width, int height) {
         buf.index = i;
         
         if (ioctl(fd_, VIDIOC_QBUF, &buf) < 0) {
-            std::cerr << "VIDIOC_QBUF failed" << std::endl;
+            Logger::getInstance().error("VIDIOC_QBUF failed during initialization for device: " + device_path_);
             close();
             return false;
         }
@@ -153,7 +155,7 @@ bool Camera::open(int width, int height) {
     // Start streaming
     enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     if (ioctl(fd_, VIDIOC_STREAMON, &type) < 0) {
-        std::cerr << "VIDIOC_STREAMON failed" << std::endl;
+        Logger::getInstance().error("VIDIOC_STREAMON failed for device: " + device_path_);
         close();
         return false;
     }
@@ -162,7 +164,7 @@ bool Camera::open(int width, int height) {
     // Initialize TurboJPEG decompressor
     tjhandle_ = tjInitDecompress();
     if (!tjhandle_) {
-        std::cerr << "Failed to initialize TurboJPEG" << std::endl;
+        Logger::getInstance().error("Failed to initialize TurboJPEG for device: " + device_path_);
         close();
         return false;
     }
@@ -215,12 +217,12 @@ bool Camera::read(Image& frame) {
     buf.memory = V4L2_MEMORY_MMAP;
     
     if (ioctl(fd_, VIDIOC_DQBUF, &buf) < 0) {
-        std::cerr << "VIDIOC_DQBUF failed: " << strerror(errno) << std::endl;
+        Logger::getInstance().debug("VIDIOC_DQBUF failed: " + std::string(strerror(errno)));
         return false;
     }
     
     if (buf.index >= buffers_.size()) {
-        std::cerr << "Invalid buffer index" << std::endl;
+        Logger::getInstance().error("Invalid buffer index from V4L2");
         ioctl(fd_, VIDIOC_QBUF, &buf);
         return false;
     }
@@ -232,7 +234,7 @@ bool Camera::read(Image& frame) {
                            buf.bytesused,
                            &jpeg_width, &jpeg_height, 
                            &jpeg_subsamp, &jpeg_colorspace) < 0) {
-        std::cerr << "tjDecompressHeader3 failed: " << tjGetErrorStr() << std::endl;
+        Logger::getInstance().debug("tjDecompressHeader3 failed: " + std::string(tjGetErrorStr()));
         ioctl(fd_, VIDIOC_QBUF, &buf);
         return false;
     }
@@ -250,14 +252,14 @@ bool Camera::read(Image& frame) {
                      jpeg_width, 0, jpeg_height,
                      TJPF_BGR,
                      TJFLAG_FASTDCT) < 0) {
-        std::cerr << "tjDecompress2 failed: " << tjGetErrorStr() << std::endl;
+        Logger::getInstance().debug("tjDecompress2 failed: " + std::string(tjGetErrorStr()));
         ioctl(fd_, VIDIOC_QBUF, &buf);
         return false;
     }
     
     // Requeue buffer
     if (ioctl(fd_, VIDIOC_QBUF, &buf) < 0) {
-        std::cerr << "VIDIOC_QBUF (requeue) failed" << std::endl;
+        Logger::getInstance().debug("VIDIOC_QBUF (requeue) failed");
         return false;
     }
     

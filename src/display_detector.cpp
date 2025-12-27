@@ -1,4 +1,5 @@
 #include "display_detector.h"
+#include "systemd_helper.h"
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -52,31 +53,17 @@ DisplayState DisplayDetector::getDisplayState() {
 }
 
 bool DisplayDetector::isScreenLocked() {
-    // Check systemd session LockedHint (most reliable)
-    FILE* pipe = popen("loginctl show-session $(loginctl | grep $(whoami) | awk '{print $1}') -p LockedHint --value 2>/dev/null", "r");
-    if (pipe) {
-        char buffer[128];
-        if (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
-            pclose(pipe);
-            std::string result(buffer);
-            result.erase(result.find_last_not_of(" \t\n\r") + 1);  // Trim trailing whitespace
-            if (result == "yes" || result == "true" || result == "1") {
-                return true;
-            }
-        } else {
-            pclose(pipe);
+    // Check systemd session LockedHint using D-Bus (most reliable)
+    auto session_id = SystemdHelper::getActiveSessionId();
+    if (session_id.has_value()) {
+        if (SystemdHelper::isSessionLocked(*session_id)) {
+            return true;
         }
     }
     
     // Check for KDE lock screen GREETER (not daemon)
-    pipe = popen("ps aux | grep -w '[k]screenlocker_greet' 2>/dev/null", "r");
-    if (pipe) {
-        char buffer[128];
-        bool has_output = (fgets(buffer, sizeof(buffer), pipe) != nullptr);
-        pclose(pipe);
-        if (has_output) {
-            return true;
-        }
+    if (SystemdHelper::isProcessRunning("kscreenlocker_greet")) {
+        return true;
     }
     
     return false;
@@ -154,39 +141,17 @@ bool DisplayDetector::isDisplayBlanked() {
 bool DisplayDetector::checkKDELockScreen() {
     // Check if kscreenlocker_greet process exists (the actual lock screen UI)
     // NOT kscreenlocker (which is a daemon that runs all the time)
-    FILE* pipe = popen("ps aux | grep -w '[k]screenlocker_greet' 2>/dev/null", "r");
-    if (pipe) {
-        char buffer[128];
-        bool has_output = (fgets(buffer, sizeof(buffer), pipe) != nullptr);
-        pclose(pipe);
-        return has_output;
-    }
-    
-    return false;
+    return SystemdHelper::isProcessRunning("kscreenlocker_greet");
 }
 
 bool DisplayDetector::checkGNOMELockScreen() {
-    // Check for GNOME Shell's screen shield
-    FILE* pipe = popen("gdbus call --session --dest org.gnome.ScreenSaver --object-path /org/gnome/ScreenSaver --method org.gnome.ScreenSaver.GetActive 2>/dev/null", "r");
-    if (pipe) {
-        char buffer[128];
-        if (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
-            pclose(pipe);
-            return std::string(buffer).find("true") != std::string::npos;
-        }
-        pclose(pipe);
+    // Check for GNOME Shell's screen shield using D-Bus
+    if (SystemdHelper::isGnomeScreenSaverActive()) {
+        return true;
     }
     
     // Check if gnome-screensaver is running
-    pipe = popen("pgrep -x gnome-screensav 2>/dev/null", "r");
-    if (pipe) {
-        char buffer[128];
-        bool has_output = (fgets(buffer, sizeof(buffer), pipe) != nullptr);
-        pclose(pipe);
-        return has_output;
-    }
-    
-    return false;
+    return SystemdHelper::isProcessRunning("gnome-screensav");
 }
 
 bool DisplayDetector::isExternalMonitorOnly() {
