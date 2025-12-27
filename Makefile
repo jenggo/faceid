@@ -161,12 +161,14 @@ install: build
 	@printf "$(COLOR_CYAN)Setting up logging...$(COLOR_RESET)\n"
 	@if [ "$$(id -u)" != "0" ]; then \
 		sudo touch /var/log/faceid.log; \
-		sudo chmod 666 /var/log/faceid.log; \
+		sudo chown root:root /var/log/faceid.log; \
+		sudo chmod 644 /var/log/faceid.log; \
 	else \
 		touch /var/log/faceid.log; \
-		chmod 666 /var/log/faceid.log; \
+		chown root:root /var/log/faceid.log; \
+		chmod 644 /var/log/faceid.log; \
 	fi
-	@printf "$(COLOR_GREEN)✓ Log file created: /var/log/faceid.log$(COLOR_RESET)\n"
+	@printf "$(COLOR_GREEN)✓ Log file created: /var/log/faceid.log (root:root 644)$(COLOR_RESET)\n"
 	@printf " \n"
 	@printf "$(COLOR_CYAN)Installing systemd service...$(COLOR_RESET)\n"
 	@if [ -f "$(INSTALL_PREFIX)/lib/systemd/system/faceid-presence.service" ]; then \

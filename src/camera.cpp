@@ -6,6 +6,7 @@
 #include <unistd.h>
 #include <dirent.h>
 #include <cstring>
+#include <cerrno>
 #include <algorithm>
 #include <linux/videodev2.h>
 
@@ -35,7 +36,8 @@ bool Camera::open(int width, int height) {
     // Open device
     fd_ = ::open(device_path_.c_str(), O_RDWR);
     if (fd_ < 0) {
-        Logger::getInstance().error("Failed to open camera device: " + device_path_);
+        Logger::getInstance().error("Failed to open camera device: " + device_path_ + 
+                                   " (errno: " + std::to_string(errno) + " - " + strerror(errno) + ")");
         return false;
     }
     

@@ -2,6 +2,8 @@
 #include <iostream>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <cstdlib>
+#include <syslog.h>
 #include <sstream>
 #include <iomanip>
 #include <chrono>
@@ -16,8 +18,14 @@ Logger& Logger::getInstance() {
 }
 
 Logger::Logger() {
-    // Default log file
-    setLogFile("/var/log/faceid.log");
+    // Skip log file opening in PAM context to avoid stderr warnings
+    // that break pkttyagent (polkit) authentication
+    const char* pam_context = std::getenv("FACEID_PAM_CONTEXT");
+    if (pam_context == nullptr) {
+        // Not in PAM context - open log file normally
+        setLogFile("/var/log/faceid.log");
+    }
+    // In PAM context: skip setLogFile(), use syslog only
 }
 
 Logger::~Logger() {
@@ -136,6 +144,16 @@ void Logger::log(LogLevel level, const std::string& message) {
     } else if (log_file_.is_open()) {
         log_file_ << ss.str();
         log_file_.flush();
+    } else {
+        // If no file and no console (PAM context), use syslog as fallback
+        int syslog_level = LOG_INFO;
+        switch (level) {
+            case LogLevel::DEBUG:   syslog_level = LOG_DEBUG; break;
+            case LogLevel::INFO:    syslog_level = LOG_INFO; break;
+            case LogLevel::WARNING: syslog_level = LOG_WARNING; break;
+            case LogLevel::ERROR:   syslog_level = LOG_ERR; break;
+        }
+        syslog(syslog_level, "%s", message.c_str());
     }
     
     // Check if rotation is needed (every 10 writes)
