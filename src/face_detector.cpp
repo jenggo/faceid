@@ -2,170 +2,18 @@
 #include "clahe.h"
 #include "optical_flow.h"
 #include "config_paths.h"
+#include "logger.h"
+#include "detectors/common.h"
+#include "detectors/detectors.h"
 #include <libyuv.h>
 #include <algorithm>
 #include <cmath>
+#include <fstream>
+#include <sstream>
+#include <regex>
+#include <dirent.h>
 
 namespace faceid {
-
-// ===== RetinaFace Detection Helper Structures and Functions =====
-
-struct FaceObject {
-    Rect rect;
-    float prob;
-};
-
-static inline float intersection_area(const FaceObject& a, const FaceObject& b) {
-    int x1 = std::max(a.rect.x, b.rect.x);
-    int y1 = std::max(a.rect.y, b.rect.y);
-    int x2 = std::min(a.rect.x + a.rect.width, b.rect.x + b.rect.width);
-    int y2 = std::min(a.rect.y + a.rect.height, b.rect.y + b.rect.height);
-    
-    if (x2 < x1 || y2 < y1) return 0.0f;
-    return (x2 - x1) * (y2 - y1);
-}
-
-static void qsort_descent_inplace(std::vector<FaceObject>& faceobjects, int left, int right) {
-    int i = left;
-    int j = right;
-    float p = faceobjects[(left + right) / 2].prob;
-    
-    while (i <= j) {
-        while (faceobjects[i].prob > p) i++;
-        while (faceobjects[j].prob < p) j--;
-        
-        if (i <= j) {
-            std::swap(faceobjects[i], faceobjects[j]);
-            i++;
-            j--;
-        }
-    }
-    
-    if (left < j) qsort_descent_inplace(faceobjects, left, j);
-    if (i < right) qsort_descent_inplace(faceobjects, i, right);
-}
-
-static void qsort_descent_inplace(std::vector<FaceObject>& faceobjects) {
-    if (faceobjects.empty()) return;
-    qsort_descent_inplace(faceobjects, 0, faceobjects.size() - 1);
-}
-
-static void nms_sorted_bboxes(const std::vector<FaceObject>& faceobjects, std::vector<int>& picked, float nms_threshold) {
-    picked.clear();
-    const int n = faceobjects.size();
-    
-    std::vector<float> areas(n);
-    for (int i = 0; i < n; i++) {
-        areas[i] = faceobjects[i].rect.width * faceobjects[i].rect.height;
-    }
-    
-    for (int i = 0; i < n; i++) {
-        const FaceObject& a = faceobjects[i];
-        
-        int keep = 1;
-        for (int j = 0; j < (int)picked.size(); j++) {
-            const FaceObject& b = faceobjects[picked[j]];
-            float inter_area = intersection_area(a, b);
-            float union_area = areas[i] + areas[picked[j]] - inter_area;
-            if (inter_area / union_area > nms_threshold)
-                keep = 0;
-        }
-        
-        if (keep) picked.push_back(i);
-    }
-}
-
-static ncnn::Mat generate_anchors(int base_size, const ncnn::Mat& ratios, const ncnn::Mat& scales) {
-    int num_ratio = ratios.w;
-    int num_scale = scales.w;
-    
-    ncnn::Mat anchors;
-    anchors.create(4, num_ratio * num_scale);
-    
-    const float cx = base_size * 0.5f;
-    const float cy = base_size * 0.5f;
-    
-    for (int i = 0; i < num_ratio; i++) {
-        float ar = ratios[i];
-        int r_w = round(base_size / sqrt(ar));
-        int r_h = round(r_w * ar);
-        
-        for (int j = 0; j < num_scale; j++) {
-            float scale = scales[j];
-            float rs_w = r_w * scale;
-            float rs_h = r_h * scale;
-            
-            float* anchor = anchors.row(i * num_scale + j);
-            anchor[0] = cx - rs_w * 0.5f;
-            anchor[1] = cy - rs_h * 0.5f;
-            anchor[2] = cx + rs_w * 0.5f;
-            anchor[3] = cy + rs_h * 0.5f;
-        }
-    }
-    
-    return anchors;
-}
-
-static void generate_proposals(const ncnn::Mat& anchors, int feat_stride, const ncnn::Mat& score_blob, 
-                               const ncnn::Mat& bbox_blob, float prob_threshold, std::vector<FaceObject>& faceobjects) {
-    int w = score_blob.w;
-    int h = score_blob.h;
-    const int num_anchors = anchors.h;
-    
-    for (int q = 0; q < num_anchors; q++) {
-        const float* anchor = anchors.row(q);
-        const ncnn::Mat score = score_blob.channel(q + num_anchors);
-        const ncnn::Mat bbox = bbox_blob.channel_range(q * 4, 4);
-        
-        float anchor_y = anchor[1];
-        float anchor_w = anchor[2] - anchor[0];
-        float anchor_h = anchor[3] - anchor[1];
-        
-        for (int i = 0; i < h; i++) {
-            float anchor_x = anchor[0];
-            
-            for (int j = 0; j < w; j++) {
-                int index = i * w + j;
-                float prob = score[index];
-                
-                if (prob >= prob_threshold) {
-                    float dx = bbox.channel(0)[index];
-                    float dy = bbox.channel(1)[index];
-                    float dw = bbox.channel(2)[index];
-                    float dh = bbox.channel(3)[index];
-                    
-                    float cx = anchor_x + anchor_w * 0.5f;
-                    float cy = anchor_y + anchor_h * 0.5f;
-                    
-                    float pb_cx = cx + anchor_w * dx;
-                    float pb_cy = cy + anchor_h * dy;
-                    float pb_w = anchor_w * exp(dw);
-                    float pb_h = anchor_h * exp(dh);
-                    
-                    float x0 = pb_cx - pb_w * 0.5f;
-                    float y0 = pb_cy - pb_h * 0.5f;
-                    float x1 = pb_cx + pb_w * 0.5f;
-                    float y1 = pb_cy + pb_h * 0.5f;
-                    
-                    FaceObject obj;
-                    obj.rect.x = (int)x0;
-                    obj.rect.y = (int)y0;
-                    obj.rect.width = (int)(x1 - x0 + 1);
-                    obj.rect.height = (int)(y1 - y0 + 1);
-                    obj.prob = prob;
-                    
-                    faceobjects.push_back(obj);
-                }
-                
-                anchor_x += feat_stride;
-            }
-            
-            anchor_y += feat_stride;
-        }
-    }
-}
-
-// ===== End RetinaFace Helper Functions =====
 
 
 // Helper function: Fast image resize using libyuv (3-5x faster than OpenCV)
@@ -203,19 +51,257 @@ static Image toGrayscale(const uint8_t* src_data, int src_width, int src_height,
     return dst_gray;
 }
 
+// Helper: Parse NCNN param file to extract output dimension
+size_t FaceDetector::parseModelOutputDim(const std::string& param_path) {
+    std::ifstream file(param_path);
+    if (!file.is_open()) {
+        Logger::getInstance().debug("Failed to open param file: " + param_path);
+        return 0;
+    }
+    
+    std::string line;
+    // Match: InnerProduct ... out0 0=<dimension>
+    std::regex output_pattern("InnerProduct\\s+\\S+\\s+\\d+\\s+\\d+\\s+\\S+\\s+out0\\s+0=(\\d+)");
+    
+    while (std::getline(file, line)) {
+        std::smatch match;
+        if (std::regex_search(line, match, output_pattern)) {
+            size_t dim = std::stoull(match[1].str());
+            Logger::getInstance().debug("Detected output dimension: " + std::to_string(dim) + "D from " + param_path);
+            return dim;
+        }
+    }
+    
+    Logger::getInstance().debug("Could not detect output dimension from " + param_path);
+    return 0;
+}
+
+// Helper: Auto-detect detection model type from param file structure
+DetectionModelType FaceDetector::detectModelType(const std::string& param_path) {
+    std::ifstream file(param_path);
+    if (!file.is_open()) {
+        Logger::getInstance().debug("Failed to open detection param file: " + param_path);
+        return DetectionModelType::UNKNOWN;
+    }
+    
+    std::string line;
+    bool has_data_input = false;          // RetinaFace uses "data" as input
+    bool has_in0_input = false;           // YuNet and UltraFace use "in0" as input
+    bool has_face_rpn_outputs = false;    // RetinaFace has face_rpn_* outputs
+    int out_count = 0;                    // Count out0, out1, out2, ... outputs
+    
+    while (std::getline(file, line)) {
+        // Check for input layer names
+        if (line.find("Input") != std::string::npos) {
+            if (line.find(" data ") != std::string::npos) {
+                has_data_input = true;
+            } else if (line.find(" in0 ") != std::string::npos) {
+                has_in0_input = true;
+            }
+        }
+        
+        // Check for RetinaFace-specific output blobs
+        if (line.find("face_rpn") != std::string::npos) {
+            has_face_rpn_outputs = true;
+        }
+        
+        // Count generic outputs (out0, out1, out2, ...)
+        for (int i = 0; i < 20; i++) {
+            std::string out_name = " out" + std::to_string(i);
+            if (line.find(out_name) != std::string::npos) {
+                // Make sure it's actually an output (appears after layer name)
+                size_t pos = line.find(out_name);
+                if (pos != std::string::npos && pos > 20) {  // Not at the beginning of line
+                    out_count = std::max(out_count, i + 1);
+                }
+            }
+        }
+    }
+    
+    // Determine model type based on structure
+    if (has_data_input && has_face_rpn_outputs) {
+        Logger::getInstance().debug("Detected RetinaFace model (input='data', outputs=face_rpn_*)");
+        return DetectionModelType::RETINAFACE;
+    } else if (has_in0_input && out_count >= 12) {
+        Logger::getInstance().debug("Detected YuNet model (input='in0', " + std::to_string(out_count) + " outputs)");
+        return DetectionModelType::YUNET;
+    } else if (has_in0_input && out_count == 2) {
+        Logger::getInstance().debug("Detected UltraFace/RFB-320 model (input='in0', 2 outputs)");
+        return DetectionModelType::ULTRAFACE;
+    }
+    
+    // Check for SCRFD-specific patterns
+    bool has_input_1 = false;
+    bool has_scrfd_outputs = false;
+    
+    // Rewind file to check again
+    file.clear();
+    file.seekg(0);
+    while (std::getline(file, line)) {
+        if (line.find("Input") != std::string::npos && line.find(" input.1 ") != std::string::npos) {
+            has_input_1 = true;
+        }
+        if (line.find("score_8") != std::string::npos || line.find("bbox_8") != std::string::npos) {
+            has_scrfd_outputs = true;
+        }
+    }
+    
+    if (has_input_1 && has_scrfd_outputs) {
+        Logger::getInstance().debug("Detected SCRFD model (input='input.1', outputs=score_*/bbox_*/kps_*)");
+        return DetectionModelType::SCRFD;
+    }
+    
+    Logger::getInstance().debug("Unknown detection model type (data=" + std::to_string(has_data_input) + 
+        ", in0=" + std::to_string(has_in0_input) + ", face_rpn=" + std::to_string(has_face_rpn_outputs) + 
+        ", out_count=" + std::to_string(out_count) + ")");
+    return DetectionModelType::UNKNOWN;
+}
+
+// Helper: Find first available recognition model in models directory
+std::pair<std::string, size_t> FaceDetector::findAvailableModel(const std::string& models_dir) {
+    Logger::getInstance().debug("Scanning for models in: " + models_dir);
+    
+    DIR* dir = opendir(models_dir.c_str());
+    if (!dir) {
+        Logger::getInstance().debug("Failed to open models directory: " + models_dir);
+        return {"", 0};
+    }
+    
+    std::vector<std::string> param_files;
+    struct dirent* entry;
+    while ((entry = readdir(dir)) != nullptr) {
+        std::string filename = entry->d_name;
+        if (filename.length() > 6 && filename.substr(filename.length() - 6) == ".param") {
+            param_files.push_back(filename);
+        }
+    }
+    closedir(dir);
+    
+    Logger::getInstance().debug("Found " + std::to_string(param_files.size()) + " param file(s)");
+    
+    // Try each param file
+    for (const auto& param_file : param_files) {
+        std::string base_name = param_file.substr(0, param_file.length() - 6);  // Remove .param
+        std::string base_path = models_dir + "/" + base_name;
+        std::string param_path = base_path + ".param";
+        std::string bin_path = base_path + ".bin";
+        
+        Logger::getInstance().debug("Checking model: " + base_name);
+        
+        // Check if .bin file exists
+        std::ifstream bin_check(bin_path);
+        if (!bin_check.good()) {
+            Logger::getInstance().debug("  Missing .bin file, skipping");
+            continue;
+        }
+        
+        // Parse output dimension
+        size_t output_dim = parseModelOutputDim(param_path);
+        if (output_dim == 0) {
+            Logger::getInstance().debug("  Could not detect output dimension, skipping");
+            continue;
+        }
+        
+        // Validate dimension - face recognition models typically have 64D-2048D embeddings
+        // Filter out non-recognition models:
+        //   - Expression recognition: 7D (7 emotions)
+        //   - Age/gender classification: 2-10D
+        //   - Face recognition: 64D+ (ArcFace 128D, MobileFaceNet 128D, SFace 512D, InsightFace 1024D)
+        if (output_dim < 64) {
+            Logger::getInstance().debug("  ✗ Invalid dimension " + std::to_string(output_dim) + "D (expected ≥64D for face recognition), skipping");
+            Logger::getInstance().debug("    This appears to be a classification model (expression/age/gender), not face recognition");
+            continue;
+        }
+        
+        if (output_dim > 2048) {
+            Logger::getInstance().debug("  ✗ Dimension " + std::to_string(output_dim) + "D too large (expected ≤2048D), skipping");
+            continue;
+        }
+        
+        // Valid recognition model found
+        Logger::getInstance().debug("  ✓ Valid face recognition model: " + base_name + " (" + std::to_string(output_dim) + "D)");
+        return {base_path, output_dim};
+    }
+    
+    Logger::getInstance().debug("No valid recognition models found in " + models_dir);
+    return {"", 0};
+}
+
 FaceDetector::FaceDetector() {
     // RetinaFace and SFace models loaded separately via loadModels()
 }
 
-bool FaceDetector::loadModels(const std::string& model_base_path) {
+bool FaceDetector::loadModels(const std::string& model_base_path, const std::string& detection_model_path) {
     try {
-        // Load NCNN SFace model for recognition
-        std::string base_path = model_base_path.empty() 
-            ? std::string(MODELS_DIR) + "/sface"
-            : model_base_path;
+        std::string base_path;
+        size_t output_dim = 0;
+        
+        // If explicit path provided, use it
+        if (!model_base_path.empty()) {
+            base_path = model_base_path;
+            Logger::getInstance().debug("Using explicit model path: " + base_path);
+            
+            // Try to detect output dimension
+            std::string param_path = base_path + ".param";
+            output_dim = parseModelOutputDim(param_path);
+            if (output_dim == 0) {
+                Logger::getInstance().debug("Warning: Could not auto-detect output dimension, using default " + 
+                    std::to_string(FACE_ENCODING_DIM) + "D");
+                output_dim = FACE_ENCODING_DIM;
+            }
+        } else {
+            // Priority 1: Try standard name "recognition.{param,bin}"
+            std::string standard_path = std::string(MODELS_DIR) + "/recognition";
+            std::string standard_param = standard_path + ".param";
+            std::string standard_bin = standard_path + ".bin";
+            
+            std::ifstream param_check(standard_param);
+            std::ifstream bin_check(standard_bin);
+            
+            if (param_check.good() && bin_check.good()) {
+                Logger::getInstance().debug("Found standard recognition model: recognition.{param,bin}");
+                base_path = standard_path;
+                output_dim = parseModelOutputDim(standard_param);
+                if (output_dim == 0) {
+                    Logger::getInstance().debug("Warning: Could not detect dimension, using default");
+                    output_dim = FACE_ENCODING_DIM;
+                }
+            } else {
+                // Priority 2: Auto-detect from available models
+                Logger::getInstance().debug("Standard name not found, auto-detecting recognition model...");
+                auto model_info = findAvailableModel(std::string(MODELS_DIR));
+                base_path = model_info.first;
+                output_dim = model_info.second;
+                
+                if (base_path.empty() || output_dim == 0) {
+                    // Priority 3: Fall back to legacy "sface"
+                    Logger::getInstance().debug("No valid models found, falling back to legacy sface");
+                    base_path = std::string(MODELS_DIR) + "/sface";
+                    output_dim = FACE_ENCODING_DIM;
+                }
+            }
+        }
         
         std::string param_path = base_path + ".param";
         std::string bin_path = base_path + ".bin";
+        
+        // Check if .param exists, if not try .ncnn.param
+        std::ifstream param_check(param_path);
+        if (!param_check.good()) {
+            param_path = base_path + ".ncnn.param";
+            bin_path = base_path + ".ncnn.bin";
+        }
+        
+        // Extract model name from path
+        size_t last_slash = base_path.find_last_of("/\\");
+        current_model_name_ = (last_slash != std::string::npos) ? 
+            base_path.substr(last_slash + 1) : base_path;
+        current_encoding_dim_ = output_dim;
+        
+        Logger::getInstance().debug("Loading recognition model: " + current_model_name_ + 
+            " (" + std::to_string(current_encoding_dim_) + "D)");
+        Logger::getInstance().debug("  param: " + param_path);
+        Logger::getInstance().debug("  bin:   " + bin_path);
         
         // Configure NCNN options for optimal CPU performance
         ncnn_net_.opt.use_vulkan_compute = false;
@@ -223,28 +309,82 @@ bool FaceDetector::loadModels(const std::string& model_base_path) {
         ncnn_net_.opt.use_fp16_packed = false;
         ncnn_net_.opt.use_fp16_storage = false;
         
+        Logger::getInstance().debug("Loading param file...");
         int ret = ncnn_net_.load_param(param_path.c_str());
         if (ret != 0) {
+            Logger::getInstance().debug("Failed to load param file, ret=" + std::to_string(ret));
             return false;
         }
+        Logger::getInstance().debug("Param file loaded successfully");
         
+        Logger::getInstance().debug("Loading model file...");
         ret = ncnn_net_.load_model(bin_path.c_str());
         if (ret != 0) {
+            Logger::getInstance().debug("Failed to load model file, ret=" + std::to_string(ret));
             return false;
         }
+        Logger::getInstance().debug("Model file loaded successfully");
         
         try {
             ncnn::Extractor ex = ncnn_net_.create_extractor();
+            Logger::getInstance().debug("NCNN extractor created successfully");
         } catch (...) {
+            Logger::getInstance().debug("Failed to create NCNN extractor");
             return false;
         }
         
         models_loaded_ = true;
+        Logger::getInstance().debug("✓ Recognition model loaded: " + current_model_name_ + 
+            " (" + std::to_string(current_encoding_dim_) + "D)");
         
-        // Load RetinaFace detection model
-        std::string retinaface_base = std::string(MODELS_DIR) + "/mnet.25-opt";
-        std::string retinaface_param = retinaface_base + ".param";
-        std::string retinaface_bin = retinaface_base + ".bin";
+        // Load detection model with priority system
+        std::string detection_base;
+        
+        // If explicit detection path provided, use it
+        if (!detection_model_path.empty()) {
+            detection_base = detection_model_path;
+            Logger::getInstance().debug("Using explicit detection model path: " + detection_base);
+        } else {
+            // Priority 1: Try standard name "detection.{param,bin}"
+            std::string standard_detection = std::string(MODELS_DIR) + "/detection";
+            std::string standard_detection_param = standard_detection + ".param";
+            std::string standard_detection_bin = standard_detection + ".bin";
+            
+            std::ifstream det_param_check(standard_detection_param);
+            std::ifstream det_bin_check(standard_detection_bin);
+            
+            if (det_param_check.good() && det_bin_check.good()) {
+                Logger::getInstance().debug("Found standard detection model: detection.{param,bin}");
+                detection_base = standard_detection;
+            } else {
+                // Priority 2: Try legacy mnet.25-opt (RetinaFace)
+                Logger::getInstance().debug("Standard detection name not found, trying mnet.25-opt");
+                detection_base = std::string(MODELS_DIR) + "/mnet.25-opt";
+                
+                std::string legacy_param = detection_base + ".param";
+                std::string legacy_bin = detection_base + ".bin";
+                std::ifstream legacy_param_check(legacy_param);
+                std::ifstream legacy_bin_check(legacy_bin);
+                
+                if (!legacy_param_check.good() || !legacy_bin_check.good()) {
+                    // Priority 3: Try RFB-320
+                    Logger::getInstance().debug("mnet.25-opt not found, trying RFB-320");
+                    detection_base = std::string(MODELS_DIR) + "/RFB-320";
+                }
+            }
+        }
+        
+        std::string retinaface_param = detection_base + ".param";
+        std::string retinaface_bin = detection_base + ".bin";
+        
+        // Check if .param exists, if not try .ncnn.param
+        std::ifstream det_param_check(retinaface_param);
+        if (!det_param_check.good()) {
+            retinaface_param = detection_base + ".ncnn.param";
+            retinaface_bin = detection_base + ".ncnn.bin";
+        }
+        
+        Logger::getInstance().debug("Loading detection model from: " + detection_base);
         
         retinaface_net_.opt.use_vulkan_compute = false;
         retinaface_net_.opt.num_threads = 4;
@@ -253,14 +393,30 @@ bool FaceDetector::loadModels(const std::string& model_base_path) {
         
         ret = retinaface_net_.load_param(retinaface_param.c_str());
         if (ret != 0) {
-            // RetinaFace model not found - this is OK, will fall back if needed
+            // Detection model not found - this is OK, will fall back if needed
             detection_model_loaded_ = false;
+            Logger::getInstance().debug("Detection model param not found (ret=" + std::to_string(ret) + "), detection_model_loaded_=false");
         } else {
             ret = retinaface_net_.load_model(retinaface_bin.c_str());
             if (ret != 0) {
                 detection_model_loaded_ = false;
+                Logger::getInstance().debug("Detection model bin not found (ret=" + std::to_string(ret) + "), detection_model_loaded_=false");
             } else {
                 detection_model_loaded_ = true;
+                // Auto-detect detection model type
+                detection_model_type_ = detectModelType(retinaface_param);
+                detection_model_name_ = detection_base.substr(detection_base.find_last_of("/\\") + 1);
+                
+                std::string model_type_str;
+                switch (detection_model_type_) {
+                    case DetectionModelType::RETINAFACE: model_type_str = "RetinaFace"; break;
+                    case DetectionModelType::YUNET: model_type_str = "YuNet"; break;
+                    case DetectionModelType::ULTRAFACE: model_type_str = "UltraFace/RFB-320"; break;
+                    case DetectionModelType::SCRFD: model_type_str = "SCRFD"; break;
+                    default: model_type_str = "Unknown"; break;
+                }
+                
+                Logger::getInstance().debug("Detection model loaded successfully: " + detection_model_name_ + " (type: " + model_type_str + ")");
             }
         }
         
@@ -273,9 +429,8 @@ bool FaceDetector::loadModels(const std::string& model_base_path) {
 std::vector<Rect> FaceDetector::detectFaces(const ImageView& frame, bool downscale) {
     (void)downscale;  // Parameter kept for API compatibility
     
-    // Check if RetinaFace model is loaded
+    // Check if detection model is loaded
     if (!detection_model_loaded_) {
-        // RetinaFace not available, return empty
         return {};
     }
     
@@ -291,123 +446,56 @@ std::vector<Rect> FaceDetector::detectFaces(const ImageView& frame, bool downsca
     int img_w = frame.width();
     int img_h = frame.height();
     
-    // Convert BGR to RGB for RetinaFace
+    // Convert BGR to RGB (all models expect RGB)
     ncnn::Mat in = ncnn::Mat::from_pixels(frame.data(), ncnn::Mat::PIXEL_BGR2RGB, img_w, img_h);
     
-    ncnn::Extractor ex = retinaface_net_.create_extractor();
-    ex.set_light_mode(true);  // Optimize for speed
-    ex.input("data", in);
-    
-    std::vector<FaceObject> faceproposals;
-    
-    const float prob_threshold = 0.8f;
-    const float nms_threshold = 0.4f;
-    
-    // stride 32
-    {
-        ncnn::Mat score_blob, bbox_blob;
-        ex.extract("face_rpn_cls_prob_reshape_stride32", score_blob);
-        ex.extract("face_rpn_bbox_pred_stride32", bbox_blob);
-        
-        const int base_size = 16;
-        const int feat_stride = 32;
-        ncnn::Mat ratios(1);
-        ratios[0] = 1.f;
-        ncnn::Mat scales(2);
-        scales[0] = 32.f;
-        scales[1] = 16.f;
-        ncnn::Mat anchors = generate_anchors(base_size, ratios, scales);
-        
-        std::vector<FaceObject> faceobjects32;
-        generate_proposals(anchors, feat_stride, score_blob, bbox_blob, prob_threshold, faceobjects32);
-        faceproposals.insert(faceproposals.end(), faceobjects32.begin(), faceobjects32.end());
-    }
-    
-    // stride 16
-    {
-        ncnn::Mat score_blob, bbox_blob;
-        ex.extract("face_rpn_cls_prob_reshape_stride16", score_blob);
-        ex.extract("face_rpn_bbox_pred_stride16", bbox_blob);
-        
-        const int base_size = 16;
-        const int feat_stride = 16;
-        ncnn::Mat ratios(1);
-        ratios[0] = 1.f;
-        ncnn::Mat scales(2);
-        scales[0] = 8.f;
-        scales[1] = 4.f;
-        ncnn::Mat anchors = generate_anchors(base_size, ratios, scales);
-        
-        std::vector<FaceObject> faceobjects16;
-        generate_proposals(anchors, feat_stride, score_blob, bbox_blob, prob_threshold, faceobjects16);
-        faceproposals.insert(faceproposals.end(), faceobjects16.begin(), faceobjects16.end());
-    }
-    
-    // stride 8
-    {
-        ncnn::Mat score_blob, bbox_blob;
-        ex.extract("face_rpn_cls_prob_reshape_stride8", score_blob);
-        ex.extract("face_rpn_bbox_pred_stride8", bbox_blob);
-        
-        const int base_size = 16;
-        const int feat_stride = 8;
-        ncnn::Mat ratios(1);
-        ratios[0] = 1.f;
-        ncnn::Mat scales(2);
-        scales[0] = 2.f;
-        scales[1] = 1.f;
-        ncnn::Mat anchors = generate_anchors(base_size, ratios, scales);
-        
-        std::vector<FaceObject> faceobjects8;
-        generate_proposals(anchors, feat_stride, score_blob, bbox_blob, prob_threshold, faceobjects8);
-        faceproposals.insert(faceproposals.end(), faceobjects8.begin(), faceobjects8.end());
-    }
-    
-    // Sort and apply NMS
-    qsort_descent_inplace(faceproposals);
-    
-    std::vector<int> picked;
-    nms_sorted_bboxes(faceproposals, picked, nms_threshold);
-    
-    // Convert to Rect and clip to image bounds
+    // Route to appropriate detector based on model type
     std::vector<Rect> faces;
-    for (int idx : picked) {
-        FaceObject& obj = faceproposals[idx];
-        
-        // Clip to image size
-        float x0 = obj.rect.x;
-        float y0 = obj.rect.y;
-        float x1 = x0 + obj.rect.width;
-        float y1 = y0 + obj.rect.height;
-        
-        x0 = std::max(std::min(x0, (float)img_w - 1), 0.f);
-        y0 = std::max(std::min(y0, (float)img_h - 1), 0.f);
-        x1 = std::max(std::min(x1, (float)img_w - 1), 0.f);
-        y1 = std::max(std::min(y1, (float)img_h - 1), 0.f);
-        
-        obj.rect.x = (int)x0;
-        obj.rect.y = (int)y0;
-        obj.rect.width = (int)(x1 - x0);
-        obj.rect.height = (int)(y1 - y0);
-        
-        // Filter out invalid boxes
-        if (obj.rect.width > 0 && obj.rect.height > 0) {
-            faces.push_back(obj.rect);
-        }
+    switch (detection_model_type_) {
+        case DetectionModelType::RETINAFACE:
+            faces = detectWithRetinaFace(in, img_w, img_h);
+            break;
+        case DetectionModelType::YUNET:
+            faces = detectWithYuNet(in, img_w, img_h);
+            break;
+        case DetectionModelType::ULTRAFACE:
+            faces = detectWithUltraFace(in, img_w, img_h);
+            break;
+        case DetectionModelType::SCRFD:
+            faces = detectWithSCRFD(in, img_w, img_h);
+            break;
+        default:
+            Logger::getInstance().error("Unknown detection model type");
+            return {};
     }
     
-    // Cache result
+    // Cache results
     if (use_cache_) {
         uint64_t frame_hash = hashFrame(frame);
         detection_cache_[frame_hash] = faces;
-        
-        // Limit cache size
-        if (detection_cache_.size() > 10) {
-            detection_cache_.clear();
-        }
     }
     
     return faces;
+}
+
+// RetinaFace detection implementation
+std::vector<Rect> FaceDetector::detectWithRetinaFace(const ncnn::Mat& in, int img_w, int img_h) {
+    return ::faceid::detectWithRetinaFace(retinaface_net_, in, img_w, img_h);
+}
+
+// YuNet detection implementation
+std::vector<Rect> FaceDetector::detectWithYuNet(const ncnn::Mat& in, int img_w, int img_h) {
+    return ::faceid::detectWithYuNet(retinaface_net_, in, img_w, img_h);
+}
+
+// SCRFD detection implementation
+std::vector<Rect> FaceDetector::detectWithSCRFD(const ncnn::Mat& in, int img_w, int img_h) {
+    return ::faceid::detectWithSCRFD(retinaface_net_, in, img_w, img_h);
+}
+
+// UltraFace/RFB-320 detection implementation
+std::vector<Rect> FaceDetector::detectWithUltraFace(const ncnn::Mat& in, int img_w, int img_h) {
+    return ::faceid::detectWithUltraFace(retinaface_net_, in, img_w, img_h);
 }
 
 std::vector<Rect> FaceDetector::detectOrTrackFaces(const ImageView& frame, int track_interval) {
@@ -529,14 +617,28 @@ std::vector<FaceEncoding> FaceDetector::encodeFaces(
     const std::vector<Rect>& face_locations) {
     
     if (!models_loaded_ || face_locations.empty()) {
+        if (!models_loaded_) {
+            Logger::getInstance().debug("encodeFaces() called but models_loaded_=false");
+        }
+        if (face_locations.empty()) {
+            Logger::getInstance().debug("encodeFaces() called but face_locations is empty");
+        }
         return {};
     }
     
+    Logger::getInstance().debug("encodeFaces() processing " + std::to_string(face_locations.size()) + " face(s)");
+    
     std::vector<FaceEncoding> encodings;
     
-    for (const auto& face_rect : face_locations) {
+    for (size_t idx = 0; idx < face_locations.size(); idx++) {
+        const auto& face_rect = face_locations[idx];
+        Logger::getInstance().debug("Processing face " + std::to_string(idx) + ": rect(" + 
+            std::to_string(face_rect.x) + "," + std::to_string(face_rect.y) + "," +
+            std::to_string(face_rect.width) + "x" + std::to_string(face_rect.height) + ")");
+        
         // Align face for SFace (112x112)
         Image aligned = alignFace(frame, face_rect);
+        Logger::getInstance().debug("Aligned face to " + std::to_string(aligned.width()) + "x" + std::to_string(aligned.height()));
         
         // Convert to NCNN format (no manual normalization - model has built-in preprocessing)
         ncnn::Mat in = ncnn::Mat::from_pixels(
@@ -546,10 +648,15 @@ std::vector<FaceEncoding> FaceDetector::encodeFaces(
             aligned.height()
         );
         
+        Logger::getInstance().debug("Created NCNN input mat: " + std::to_string(in.w) + "x" + 
+            std::to_string(in.h) + "x" + std::to_string(in.c));
+        
         // Create extractor and run inference
         ncnn::Extractor ex = ncnn_net_.create_extractor();
         ex.set_light_mode(true);  // Optimize for speed
         ex.input("in0", in);  // SFace model uses "in0" as input layer
+        
+        Logger::getInstance().debug("Running NCNN inference...");
         
         // Extract features
         ncnn::Mat out;
@@ -557,14 +664,22 @@ std::vector<FaceEncoding> FaceDetector::encodeFaces(
         if (ret != 0) {
             // Inference failed - skip this face
             // This can happen with corrupted models or invalid input
+            Logger::getInstance().debug("NCNN inference FAILED with ret=" + std::to_string(ret));
             continue;
         }
         
-        // Validate output dimensions (SFace produces 512D vector)
-        if (out.w != static_cast<int>(FACE_ENCODING_DIM) || out.h != 1 || out.c != 1) {
+        Logger::getInstance().debug("NCNN inference SUCCESS, output dims: w=" + std::to_string(out.w) + 
+            " h=" + std::to_string(out.h) + " c=" + std::to_string(out.c));
+        
+        // Validate output dimensions (check against detected model dimension)
+        if (out.w != static_cast<int>(current_encoding_dim_) || out.h != 1 || out.c != 1) {
             // Unexpected output dimensions - skip this face
+            Logger::getInstance().debug("Output dimensions INVALID: expected w=" + std::to_string(current_encoding_dim_) + 
+                " h=1 c=1, got w=" + std::to_string(out.w) + " h=" + std::to_string(out.h) + " c=" + std::to_string(out.c));
             continue;
         }
+        
+        Logger::getInstance().debug("Output dimensions valid, converting to encoding vector");
         
         // Convert NCNN output to std::vector<float> and normalize
         FaceEncoding encoding(out.w);
@@ -579,14 +694,22 @@ std::vector<FaceEncoding> FaceDetector::encodeFaces(
         }
         norm = std::sqrt(norm);
         
+        Logger::getInstance().debug("L2 norm before normalization: " + std::to_string(norm));
+        
         if (norm > 0) {
             for (float& val : encoding) {
                 val /= norm;
             }
+            Logger::getInstance().debug("L2 normalization applied successfully");
+        } else {
+            Logger::getInstance().debug("WARNING: L2 norm is zero, skipping normalization");
         }
         
         encodings.push_back(encoding);
+        Logger::getInstance().debug("Face " + std::to_string(idx) + " encoded successfully");
     }
+    
+    Logger::getInstance().debug("encodeFaces() returning " + std::to_string(encodings.size()) + " encoding(s)");
     
     return encodings;
 }
@@ -599,8 +722,10 @@ double FaceDetector::compareFaces(const FaceEncoding& encoding1, const FaceEncod
         return 999.0;  // Return large distance for invalid comparison
     }
     
-    // Check size (should match FACE_ENCODING_DIM for current model)
-    if (encoding1.size() != encoding2.size() || encoding1.size() != FACE_ENCODING_DIM) {
+    // Check size compatibility (both encodings must have same size)
+    if (encoding1.size() != encoding2.size()) {
+        Logger::getInstance().debug("Encoding size mismatch: " + std::to_string(encoding1.size()) + 
+            " vs " + std::to_string(encoding2.size()));
         return 999.0;  // Size mismatch
     }
     

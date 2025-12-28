@@ -1,5 +1,4 @@
 #include "presence_detector.h"
-#include "../libfacedetection/facedetectcnn.h"
 #include "../logger.h"
 #include "../face_detector.h"
 #include "../image.h"
@@ -11,8 +10,6 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <dirent.h>
-#include <algorithm>
-#include <cctype>
 #include <cmath>
 #include <atomic>
 

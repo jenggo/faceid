@@ -9,6 +9,8 @@
 #include <chrono>
 #include <fstream>
 #include <vector>
+#include <grp.h>
+#include <fcntl.h>
 
 namespace faceid {
 
@@ -42,6 +44,24 @@ void Logger::setLogFile(const std::string& path) {
     }
     
     log_file_path_ = path;
+    
+    // Check if file exists
+    bool file_exists = (access(path.c_str(), F_OK) == 0);
+    
+    // If file doesn't exist, create it with proper permissions
+    if (!file_exists) {
+        // Create file with 664 permissions (rw-rw-r--)
+        int fd = open(path.c_str(), O_CREAT | O_WRONLY | O_APPEND, 0664);
+        if (fd >= 0) {
+            // Try to set group to 'log' (gid 19) for shared access
+            struct group *grp = getgrnam("log");
+            if (grp != nullptr) {
+                fchown(fd, -1, grp->gr_gid);  // Keep owner, change group
+            }
+            close(fd);
+        }
+    }
+    
     log_file_.open(path, std::ios::app);
     if (!log_file_.is_open()) {
         // Fallback to stderr

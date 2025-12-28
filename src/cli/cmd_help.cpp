@@ -14,6 +14,7 @@ void print_usage() {
     std::cout << "  list [username]               List all enrolled users or user's faces" << std::endl;
     std::cout << "  test <username>               Test face recognition" << std::endl;
     std::cout << "  show                          Show live camera view with face detection" << std::endl;
+    std::cout << "  bench <directory>             Benchmark recognition models in directory" << std::endl;
     std::cout << "  devices                       List available camera devices" << std::endl;
     std::cout << "  version                       Show version information" << std::endl;
     std::cout << "  help                          Show this help message" << std::endl;
@@ -25,6 +26,7 @@ void print_usage() {
     std::cout << "  faceid remove jenggo glasses  # Remove 'glasses' face only" << std::endl;
     std::cout << "  faceid remove jenggo          # Remove ALL faces for jenggo" << std::endl;
     std::cout << "  faceid show                   # Live camera preview with detection" << std::endl;
+    std::cout << "  faceid bench /tmp/models      # Benchmark all models in /tmp/models" << std::endl;
 }
 
 } // namespace faceid

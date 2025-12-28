@@ -49,6 +49,61 @@ pnnx face_recognition_sface_2021dec.onnx
 sudo mv face_recognition_sface_2021dec.ncnn.{param,bin} sface.{param,bin}
 ```
 
+### Model Selection Guide
+
+FaceID supports multiple recognition models with different trade-offs between speed and accuracy.
+
+#### Benchmark Your Models
+
+```bash
+# Download test models to /tmp/models/
+# Then benchmark them:
+faceid bench /tmp/models
+```
+
+#### Performance Comparison
+
+| Model | Dimension | Size | Encoding Time | FPS | Best For |
+|-------|-----------|------|---------------|-----|----------|
+| **sface (int8)** | 128D | 18 MB | ~4.5 ms | 225 fps | ⚡ Speed, Real-time |
+| **webface_r50** | 512D | 83 MB | ~20 ms | 50 fps | ⚖️ Balanced |
+| **glint360k_r50_pfc** | 512D | 83 MB | ~20 ms | 50 fps | 🎯 Accuracy, Security |
+| **ms1m_megaface_r50** | 512D | 83 MB | ~20 ms | 50 fps | 🎯 Accuracy, Security |
+| **ms1mv2_r50_pfc** | 512D | 83 MB | ~20 ms | 49 fps | 🎯 Accuracy, Security |
+
+#### Use Case Recommendations
+
+**Real-time Authentication (PAM, Screen Lock)**:
+- **Use:** sface (128D)
+- **Why:** 4.5x faster encoding, instant unlock feel
+- **Trade-off:** Lower accuracy with extreme lighting/angles
+
+**High Security (Multi-user, Public Systems)**:
+- **Use:** glint360k_r50_pfc (512D)
+- **Why:** Trained on 360K identities, better at distinguishing similar faces
+- **Trade-off:** 4x slower, larger file size
+
+**Home/Office (Balanced)**:
+- **Use:** sface for single-user, glint360k for multi-user
+
+#### Install a Different Model
+
+```bash
+# Option 1: Standard naming (recommended)
+sudo cp model.ncnn.param /etc/faceid/models/recognition.param
+sudo cp model.ncnn.bin /etc/faceid/models/recognition.bin
+
+# Option 2: Legacy naming  
+sudo cp model.ncnn.param /etc/faceid/models/sface.param
+sudo cp model.ncnn.bin /etc/faceid/models/sface.bin
+
+# Re-enroll after changing models (required)
+sudo make install
+sudo faceid add $(whoami)
+```
+
+**Note:** Switching between different model dimensions (128D ↔ 512D) or different models always requires re-enrollment.
+
 ### Enroll & Configure
 
 ```bash
@@ -68,11 +123,12 @@ sudo ls
 ## Commands
 
 ```bash
-faceid devices           # List cameras
-faceid show              # Live preview
-sudo faceid add <user>   # Enroll face
-sudo faceid test <user>  # Test with timing
-sudo faceid list         # List users
+faceid devices              # List cameras
+faceid show                 # Live preview
+faceid bench <directory>    # Benchmark recognition models
+sudo faceid add <user>      # Enroll face
+sudo faceid test <user>     # Test with timing
+sudo faceid list            # List users
 ```
 
 ## Troubleshooting

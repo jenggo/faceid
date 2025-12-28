@@ -72,6 +72,18 @@ int cmd_show();
 int cmd_test(const std::string& username);
 
 /**
+ * Benchmark recognition models
+ * 
+ * Tests all recognition models in the specified directory and reports performance metrics.
+ * Requires a face to be visible in the camera frame.
+ * 
+ * @param test_dir Directory containing model files to benchmark
+ * @param show_detail If true, shows detailed per-model testing output
+ * @return 0 on success, 1 on error
+ */
+int cmd_bench(const std::string& test_dir, bool show_detail = false);
+
+/**
  * Print usage information and command help
  */
 void print_usage();
