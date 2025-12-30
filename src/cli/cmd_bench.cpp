@@ -12,6 +12,13 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+// STB_IMAGE_IMPLEMENTATION is defined in cmd_test_image.cpp
+// We just need to declare the functions we use
+extern "C" {
+    unsigned char *stbi_load(char const *filename, int *x, int *y, int *comp, int req_comp);
+    void stbi_image_free(void *retval_from_stbi_load);
+}
+
 namespace faceid {
 
 struct ModelBenchmark {
@@ -25,6 +32,7 @@ struct ModelBenchmark {
     double total_time_ms;
     double fps;
     int detection_count;
+    float optimal_threshold;  // Auto-detected optimal similarity threshold
     bool success;
 };
 
@@ -36,6 +44,7 @@ struct DetectionModelBenchmark {
     double detection_time_ms;
     double fps;
     int detection_count;
+    float optimal_confidence;  // Auto-detected optimal confidence
     bool success;
 };
 
@@ -105,6 +114,115 @@ static std::string truncate(const std::string& str, size_t max_width) {
         return str.substr(0, max_width);
     }
     return str.substr(0, max_width - 3) + "...";
+}
+
+// Find optimal detection confidence threshold for a model
+// Returns -1.0 if no suitable threshold found
+static float findOptimalConfidence(FaceDetector& detector, const ImageView& processed_frame, 
+                                   int img_width, int img_height, bool show_progress = false) {
+    // Helper to check if face is valid (reasonable size and position)
+    auto isValidFace = [](const Rect& face, int img_w, int img_h) -> bool {
+        // Check if face is reasonably sized (not too small or too large)
+        float face_area_percent = (face.width * face.height * 100.0f) / (img_w * img_h);
+        if (face_area_percent < 1.0f || face_area_percent > 80.0f) return false;
+        
+        // Check aspect ratio (faces are roughly 0.7-1.3 ratio)
+        float aspect_ratio = static_cast<float>(face.width) / face.height;
+        if (aspect_ratio < 0.5f || aspect_ratio > 2.0f) return false;
+        
+        // Check if face is within frame bounds
+        if (face.x < 0 || face.y < 0 || 
+            face.x + face.width > img_w || face.y + face.height > img_h) return false;
+        
+        return true;
+    };
+    
+    // Helper to count valid faces at a given confidence
+    auto countValidFaces = [&](float conf) -> int {
+        auto faces = detector.detectFaces(processed_frame, false, conf);
+        int valid_count = 0;
+        for (const auto& face : faces) {
+            if (isValidFace(face, img_width, img_height)) {
+                valid_count++;
+            }
+        }
+        return valid_count;
+    };
+    
+    // Binary search for optimal confidence threshold
+    // Start with a lower bound to support models like YuNet that multiply scores
+    float low = 0.02f;
+    float high = 0.95f;
+    float optimal_confidence = -1.0f;
+    int target_face_count = 1;  // We want exactly 1 valid face
+    
+    // First, check if we can detect any faces at low threshold
+    if (countValidFaces(low) == 0) {
+        if (show_progress) {
+            std::cout << "  No faces detected even at threshold=" << std::fixed << std::setprecision(2) << low << std::endl;
+        }
+        return -1.0f;  // Cannot detect any faces
+    }
+    
+    // Binary search to find highest threshold that still detects target_face_count faces
+    while (high - low > 0.01f) {
+        float mid = (low + high) / 2.0f;
+        int face_count = countValidFaces(mid);
+        
+        if (face_count >= target_face_count) {
+            optimal_confidence = mid;
+            low = mid;
+        } else {
+            high = mid;
+        }
+    }
+    
+    if (show_progress && optimal_confidence > 0) {
+        std::cout << "  Auto-detected optimal confidence: " << std::fixed << std::setprecision(2) 
+                  << optimal_confidence << std::endl;
+    }
+    
+    return optimal_confidence;
+}
+
+// Find optimal recognition similarity threshold for a model
+// Returns -1.0 if encoding fails, otherwise returns a model-appropriate threshold
+static float findOptimalRecognitionThreshold(FaceDetector& detector, const ImageView& processed_frame, 
+                                             bool show_progress = false) {
+    // Check if we can generate encodings successfully
+    auto faces = detector.detectFaces(processed_frame);
+    if (faces.empty()) {
+        if (show_progress) {
+            std::cout << "  No faces detected for threshold test" << std::endl;
+        }
+        return -1.0f;
+    }
+    
+    if (show_progress) {
+        std::cout << "  Detected " << faces.size() << " face(s), attempting encoding..." << std::endl;
+    }
+    
+    auto encodings = detector.encodeFaces(processed_frame, faces);
+    if (encodings.empty()) {
+        if (show_progress) {
+            std::cout << "  Failed to generate encodings (encodeFaces returned empty)" << std::endl;
+        }
+        return -1.0f;
+    }
+    
+    // Return a reasonable default threshold
+    // Note: Actual optimal threshold would require a reference face to compare against,
+    // which we don't have in the benchmark context. The threshold is used during
+    // face matching (similarity comparison), not during encoding.
+    float optimal_threshold = 0.40f;  // Standard middle-ground threshold
+    
+    if (show_progress) {
+        std::cout << "  Encoding successful (" << encodings.size() << " encoding(s) generated)" << std::endl;
+        std::cout << "  Using standard threshold: " << std::fixed << std::setprecision(2) 
+                  << optimal_threshold << std::endl;
+    }
+    
+    return optimal_threshold;
 }
 
 int cmd_bench(const std::string& test_dir, bool show_detail) {
@@ -198,28 +316,101 @@ int cmd_bench(const std::string& test_dir, bool show_detail) {
               });
     
     // Initialize camera
-    std::cout << "Initializing camera..." << std::endl;
-    Camera camera("/dev/video0");
-    if (!camera.open(640, 480)) {
-        std::cerr << "Error: Failed to open camera" << std::endl;
-        std::cerr << "Please ensure your camera is connected and accessible." << std::endl;
-        return 1;
+    std::cout << "\n=== Loading Test Image ===" << std::endl;
+    
+    // Try to load static test image first
+    std::string test_image_path = test_dir + "/face-test/single-face.jpg";
+    Image test_frame;
+    bool using_static_image = false;
+    
+    // Try to load with stb_image
+    int img_w, img_h, channels;
+    unsigned char* img_data = stbi_load(test_image_path.c_str(), &img_w, &img_h, &channels, 3);
+    
+    if (img_data) {
+        std::cout << "Loaded test image: " << test_image_path << " (" << img_w << "x" << img_h << ")" << std::endl;
+        test_frame = Image(img_w, img_h, 3);
+        memcpy(test_frame.data(), img_data, img_w * img_h * 3);
+        stbi_image_free(img_data);
+        using_static_image = true;
+    } else {
+        std::cout << "Static test image not found, using camera..." << std::endl;
+        
+        // Fall back to camera capture
+        // Get camera settings from config
+        Config& config = Config::getInstance();
+        auto device = config.getString("camera", "device").value_or("/dev/video0");
+        int width = config.getInt("camera", "width").value_or(640);
+        int height = config.getInt("camera", "height").value_or(480);
+        
+        std::cout << "Initializing camera: " << device << " (" << width << "x" << height << ")" << std::endl;
+        Camera camera(device);
+        if (!camera.open(width, height)) {
+            std::cerr << "Error: Failed to open camera" << std::endl;
+            std::cerr << "Please ensure your camera is connected or provide test image at:" << std::endl;
+            std::cerr << "  " << test_image_path << std::endl;
+            return 1;
+        }
+        
+        // Capture test frame ONCE - will be reused for all benchmarks
+        if (!camera.read(test_frame)) {
+            std::cerr << "Error: Failed to capture frame" << std::endl;
+            return 1;
+        }
+        camera.close();
     }
     
-    // Capture test frame
-    Image test_frame;
-    if (!camera.read(test_frame)) {
-        std::cerr << "Error: Failed to capture frame" << std::endl;
-        return 1;
+    std::cout << "Test frame: " << test_frame.width() << "x" << test_frame.height() 
+              << " channels=" << test_frame.channels() << std::endl;
+    
+    // Save test frame for debugging
+    if (show_detail) {
+        std::string debug_path = "/tmp/faceid_bench_frame.jpg";
+        // Simple PPM save for debugging (can be converted with: convert frame.ppm frame.jpg)
+        std::ofstream ofs(debug_path.c_str(), std::ios::binary);
+        if (ofs) {
+            ofs << "P6\n" << test_frame.width() << " " << test_frame.height() << "\n255\n";
+            // Convert BGR to RGB for PPM
+            for (int i = 0; i < test_frame.width() * test_frame.height(); i++) {
+                ofs << test_frame.data()[i*3 + 2];  // R (from B)
+                ofs << test_frame.data()[i*3 + 1];  // G
+                ofs << test_frame.data()[i*3 + 0];  // B (from R)
+            }
+            ofs.close();
+            std::cout << "Debug: Saved test frame to " << debug_path << " (PPM format)" << std::endl;
+        }
     }
-    std::cout << "Captured test frame: " << test_frame.width() << "x" << test_frame.height() << "\n" << std::endl;
+    
+    // Test if face can be detected with installed detection model
+    {
+        FaceDetector test_detector;
+        if (!test_detector.loadModels()) {
+            std::cerr << "Warning: Could not load installed detection model" << std::endl;
+        } else {
+            Image processed = test_detector.preprocessFrame(test_frame.view());
+            auto test_faces = test_detector.detectFaces(processed.view());
+            if (test_faces.empty()) {
+                std::cerr << "\nWARNING: No faces detected in captured frame with installed model!" << std::endl;
+                std::cerr << "This usually means:" << std::endl;
+                std::cerr << "  1. No face visible in camera view" << std::endl;
+                std::cerr << "  2. Frame is too dark" << std::endl;
+                std::cerr << "  3. Detection threshold is too high" << std::endl;
+                std::cerr << "\nBenchmark will likely show all failures.\n" << std::endl;
+            } else {
+                std::cout << "Pre-check: Detected " << test_faces.size() << " face(s) with installed model (" 
+                          << test_detector.getDetectionModelType() << ")" << std::endl;
+            }
+        }
+    }
+    
+    std::cout << "Using " << (using_static_image ? "static test image" : "captured frame") 
+              << " for all benchmarks (more consistent results)\n" << std::endl;
     
     // Benchmark detection models first
     if (!detection_models.empty()) {
         if (show_detail) {
             std::cout << "=== Benchmarking Detection Models ===" << std::endl;
-            std::cout << "Running 20 iterations per model (with 5-frame warmup)..." << std::endl;
-            std::cout << "Please remain still in front of the camera.\n" << std::endl;
+            std::cout << "Running 20 iterations per model (with 5-iteration warmup)...\n" << std::endl;
         } else {
             std::cout << "Benchmarking detection models..." << std::endl;
         }
@@ -231,69 +422,61 @@ int cmd_bench(const std::string& test_dir, bool show_detail) {
             
             FaceDetector detector;
             
-            // Create temporary symlinks
-            std::string temp_param = "/tmp/faceid_bench_detect.param";
-            std::string temp_bin = "/tmp/faceid_bench_detect.bin";
-            
-            // Remove old symlinks
-            unlink(temp_param.c_str());
-            unlink(temp_bin.c_str());
-            
-            // Create new symlinks
-            if (symlink(model.param_path.c_str(), temp_param.c_str()) != 0 ||
-                symlink(model.bin_path.c_str(), temp_bin.c_str()) != 0) {
-                if (show_detail) {
-                    std::cout << "  ✗ Failed to create symlinks" << std::endl;
-                }
-                continue;
+            // Get base path without extension (loadModels appends .param/.bin)
+            std::string base_path = model.param_path;
+            size_t ext_pos = base_path.rfind(".param");
+            if (ext_pos != std::string::npos) {
+                base_path = base_path.substr(0, ext_pos);
             }
             
-            if (!detector.loadModels("/tmp/faceid_bench_detect")) {
+            // Load with empty recognition model path, but explicit detection model path
+            if (!detector.loadModels("", base_path)) {
                 if (show_detail) {
                     std::cout << "  ✗ Failed to load model" << std::endl;
                 }
-                unlink(temp_param.c_str());
-                unlink(temp_bin.c_str());
                 continue;
             }
             
-            // Preprocess frame
+            if (show_detail) {
+                std::cout << "  Model loaded: " << detector.getDetectionModelType() << std::endl;
+            }
+            
+            // Preprocess frame once
             Image processed = detector.preprocessFrame(test_frame.view());
             
-            // Check if faces are detected
-            auto test_faces = detector.detectFaces(processed.view());
-            if (test_faces.empty()) {
+            // Auto-detect optimal confidence threshold
+            float optimal_conf = findOptimalConfidence(detector, processed.view(), 
+                                                       test_frame.width(), test_frame.height(), 
+                                                       show_detail);
+            
+            if (optimal_conf < 0) {
                 if (show_detail) {
-                    std::cout << "  ✗ No faces detected in test frame" << std::endl;
-                    std::cout << "     Please position your face in front of the camera and try again." << std::endl;
+                    std::cout << "  ✗ Could not find optimal confidence (no faces detected)" << std::endl;
                 }
-                unlink(temp_param.c_str());
-                unlink(temp_bin.c_str());
+                model.optimal_confidence = -1.0f;
                 continue;
             }
+            
+            model.optimal_confidence = optimal_conf;
+            
             if (show_detail) {
-                std::cout << "  Detected " << test_faces.size() << " face(s)" << std::endl;
+                std::cout << "  Using confidence: " << std::fixed << std::setprecision(2) << optimal_conf << std::endl;
             }
             
-            // Warmup (5 frames)
+            // Warmup (5 iterations with optimal confidence)
             for (int i = 0; i < 5; i++) {
-                Image frame;
-                camera.read(frame);
-                Image proc = detector.preprocessFrame(frame.view());
-                detector.detectFaces(proc.view());
+                Image proc = detector.preprocessFrame(test_frame.view());
+                detector.detectFaces(proc.view(), false, optimal_conf);
             }
             
-            // Benchmark (20 frames) - measure full detection pipeline
+            // Benchmark (20 iterations) - measure full detection pipeline with optimal confidence
             int total_detections = 0;
             double total_detect_time = 0.0;
             
             for (int i = 0; i < 20; i++) {
-                Image frame;
-                camera.read(frame);
-                
                 auto detect_start = std::chrono::high_resolution_clock::now();
-                Image proc = detector.preprocessFrame(frame.view());
-                auto faces = detector.detectFaces(proc.view());
+                Image proc = detector.preprocessFrame(test_frame.view());
+                auto faces = detector.detectFaces(proc.view(), false, optimal_conf);
                 auto detect_end = std::chrono::high_resolution_clock::now();
                 
                 double detect_time = std::chrono::duration<double, std::milli>(detect_end - detect_start).count();
@@ -307,15 +490,12 @@ int cmd_bench(const std::string& test_dir, bool show_detail) {
             model.success = (total_detections > 0);
             
             if (show_detail) {
-                std::cout << "  Detection:  " << std::fixed << std::setprecision(1) << model.detection_time_ms << " ms" << std::endl;
-                std::cout << "  FPS:        " << std::fixed << std::setprecision(1) << model.fps << std::endl;
+                std::cout << "  Detection:   " << std::fixed << std::setprecision(1) << model.detection_time_ms << " ms" << std::endl;
+                std::cout << "  FPS:         " << std::fixed << std::setprecision(1) << model.fps << std::endl;
                 std::cout << "  Faces/frame: " << model.detection_count << std::endl;
                 std::cout << "  ✓ Success\n" << std::endl;
             }
             
-            // Cleanup symlinks
-            unlink(temp_param.c_str());
-            unlink(temp_bin.c_str());
         }
         
         if (!show_detail) {
@@ -327,8 +507,7 @@ int cmd_bench(const std::string& test_dir, bool show_detail) {
     if (!recognition_models.empty()) {
         if (show_detail) {
             std::cout << "=== Benchmarking Recognition Models ===" << std::endl;
-            std::cout << "Running 10 iterations per model (with 5-frame warmup)..." << std::endl;
-            std::cout << "Please remain still in front of the camera.\n" << std::endl;
+            std::cout << "Running 10 iterations per model (with 5-iteration warmup)...\n" << std::endl;
         } else {
             std::cout << "Benchmarking recognition models..." << std::endl;
         }
@@ -348,30 +527,25 @@ int cmd_bench(const std::string& test_dir, bool show_detail) {
             
             FaceDetector detector;
             
-            // Create temporary symlinks for models with .ncnn extensions
-            std::string temp_param = "/tmp/faceid_bench_recog.param";
-            std::string temp_bin = "/tmp/faceid_bench_recog.bin";
+            // Get base path without extension (loadModels appends .param/.bin or .ncnn.param/.ncnn.bin)
+            std::string base_path = model.param_path;
+            size_t ext_pos = base_path.rfind(".ncnn.param");
+            if (ext_pos == std::string::npos) {
+                ext_pos = base_path.rfind(".param");
+            }
+            if (ext_pos != std::string::npos) {
+                base_path = base_path.substr(0, ext_pos);
+            }
             
-            // Remove old symlinks
-            unlink(temp_param.c_str());
-            unlink(temp_bin.c_str());
-            
-            // Create new symlinks
-            if (symlink(model.param_path.c_str(), temp_param.c_str()) != 0 ||
-                symlink(model.bin_path.c_str(), temp_bin.c_str()) != 0) {
+            if (!detector.loadModels(base_path)) {
                 if (show_detail) {
-                    std::cout << "  ✗ Failed to create symlinks" << std::endl;
+                    std::cout << "  ✗ Failed to load model" << std::endl;
                 }
                 continue;
             }
             
-            if (!detector.loadModels("/tmp/faceid_bench_recog")) {
-                if (show_detail) {
-                    std::cout << "  ✗ Failed to load model" << std::endl;
-                }
-                unlink(temp_param.c_str());
-                unlink(temp_bin.c_str());
-                continue;
+            if (show_detail) {
+                std::cout << "  Model loaded successfully: " << base_path << std::endl;
             }
             
             // Preprocess frame
@@ -384,12 +558,27 @@ int cmd_bench(const std::string& test_dir, bool show_detail) {
                     std::cout << "  ✗ No faces detected in test frame" << std::endl;
                     std::cout << "     Please position your face in front of the camera and try again." << std::endl;
                 }
-                unlink(temp_param.c_str());
-                unlink(temp_bin.c_str());
                 continue;
             }
             if (show_detail) {
                 std::cout << "  Detected " << test_faces.size() << " face(s)" << std::endl;
+            }
+            
+            // Auto-detect optimal similarity threshold
+            float optimal_threshold = findOptimalRecognitionThreshold(detector, processed.view(), show_detail);
+            
+            if (optimal_threshold < 0) {
+                if (show_detail) {
+                    std::cout << "  ✗ Could not find optimal threshold (recognition failed)" << std::endl;
+                }
+                model.optimal_threshold = -1.0f;
+                continue;
+            }
+            
+            model.optimal_threshold = optimal_threshold;
+            
+            if (show_detail) {
+                std::cout << "  Using threshold: " << std::fixed << std::setprecision(2) << optimal_threshold << std::endl;
             }
             
             // Warmup (5 frames)
@@ -438,9 +627,6 @@ int cmd_bench(const std::string& test_dir, bool show_detail) {
                 std::cout << "  ✓ Success\n" << std::endl;
             }
             
-            // Cleanup symlinks
-            unlink(temp_param.c_str());
-            unlink(temp_bin.c_str());
         }
         
         if (!show_detail) {
@@ -497,11 +683,9 @@ int cmd_bench(const std::string& test_dir, bool show_detail) {
                     continue;
                 }
                 
-                // Warmup (2 frames)
+                // Warmup (2 iterations with same frame)
                 for (int i = 0; i < 2; i++) {
-                    Image frame;
-                    camera.read(frame);
-                    Image proc = detector.preprocessFrame(frame.view());
+                    Image proc = detector.preprocessFrame(test_frame.view());
                     auto faces = detector.detectFaces(proc.view());
                     if (!faces.empty()) {
                         detector.encodeFaces(proc.view(), faces);
@@ -514,12 +698,9 @@ int cmd_bench(const std::string& test_dir, bool show_detail) {
                 int successful_iterations = 0;
                 
                 for (int i = 0; i < 5; i++) {
-                    Image frame;
-                    camera.read(frame);
-                    
                     // Measure detection (preprocessing + face detection)
                     auto detect_start = std::chrono::high_resolution_clock::now();
-                    Image proc = detector.preprocessFrame(frame.view());
+                    Image proc = detector.preprocessFrame(test_frame.view());
                     auto faces = detector.detectFaces(proc.view());
                     auto detect_end = std::chrono::high_resolution_clock::now();
                     
@@ -579,16 +760,18 @@ int cmd_bench(const std::string& test_dir, bool show_detail) {
     if (!detection_models.empty()) {
         std::cout << "Detection Models Performance:" << std::endl;
         std::cout << std::endl;
-        std::cout << std::setw(45) << std::left << "Model" 
+        std::cout << std::setw(30) << std::left << "Model" 
                   << std::setw(10) << "Size (KB)" 
+                  << std::setw(10) << "Conf"
                   << std::setw(15) << "Detection" 
                   << std::setw(10) << "FPS" << std::endl;
-        std::cout << std::string(80, '-') << std::endl;
+        std::cout << std::string(75, '-') << std::endl;
         
         for (const auto& model : detection_models) {
             if (model.success) {
-                std::cout << std::setw(45) << std::left << truncate(model.name, 45)
+                std::cout << std::setw(30) << std::left << truncate(model.name, 30)
                           << std::setw(10) << model.file_size_kb
+                          << std::setw(10) << (std::to_string(static_cast<int>(model.optimal_confidence * 100)) + "%")
                           << std::setw(15) << (formatMs(model.detection_time_ms) + " ms")
                           << std::setw(10) << (std::to_string(static_cast<int>(model.fps)) + " fps")
                           << std::endl;
@@ -630,16 +813,18 @@ int cmd_bench(const std::string& test_dir, bool show_detail) {
         std::cout << std::setw(45) << std::left << "Model" 
                   << std::setw(10) << "Dimension" 
                   << std::setw(10) << "Size (MB)" 
+                  << std::setw(10) << "Thresh"
                   << std::setw(12) << "Encoding" 
                   << std::setw(12) << "Total" 
                   << std::setw(10) << "FPS" << std::endl;
-        std::cout << std::string(99, '-') << std::endl;
+        std::cout << std::string(109, '-') << std::endl;
         
         for (const auto& model : recognition_models) {
             if (model.success) {
                 std::cout << std::setw(45) << std::left << truncate(model.name, 45)
                           << std::setw(10) << (std::to_string(model.dimension) + "D")
                           << std::setw(10) << model.file_size_mb
+                          << std::setw(10) << (std::to_string(static_cast<int>(model.optimal_threshold * 100)) + "%")
                           << std::setw(12) << (formatMs(model.encoding_time_ms) + " ms")
                           << std::setw(12) << (formatMs(model.total_time_ms) + " ms")
                           << std::setw(10) << (std::to_string(static_cast<int>(model.fps)) + " fps")

@@ -54,7 +54,22 @@ static Image toGrayscale(const uint8_t* src_data, int src_width, int src_height,
 
 // Helper: Parse NCNN param file to extract output dimension
 size_t FaceDetector::parseModelOutputDim(const std::string& param_path) {
+    // Try the provided path first
     std::ifstream file(param_path);
+    std::string actual_path = param_path;
+    
+    // If it doesn't exist and ends with .param, try .ncnn.param instead
+    if (!file.is_open() && param_path.size() >= 6 && 
+        param_path.substr(param_path.size() - 6) == ".param") {
+        std::string base = param_path.substr(0, param_path.size() - 6);
+        std::string ncnn_path = base + ".ncnn.param";
+        file.open(ncnn_path);
+        if (file.is_open()) {
+            actual_path = ncnn_path;
+            Logger::getInstance().debug("Trying .ncnn.param extension: " + ncnn_path);
+        }
+    }
+    
     if (!file.is_open()) {
         Logger::getInstance().debug("Failed to open param file: " + param_path);
         return 0;
@@ -68,12 +83,12 @@ size_t FaceDetector::parseModelOutputDim(const std::string& param_path) {
         std::smatch match;
         if (std::regex_search(line, match, output_pattern)) {
             size_t dim = std::stoull(match[1].str());
-            Logger::getInstance().debug("Detected output dimension: " + std::to_string(dim) + "D from " + param_path);
+            Logger::getInstance().debug("Detected output dimension: " + std::to_string(dim) + "D from " + actual_path);
             return dim;
         }
     }
     
-    Logger::getInstance().debug("Could not detect output dimension from " + param_path);
+    Logger::getInstance().debug("Could not detect output dimension from " + actual_path);
     return 0;
 }
 
@@ -147,6 +162,52 @@ DetectionModelType FaceDetector::detectModelType(const std::string& param_path) 
     if (has_input_1) {
         Logger::getInstance().debug("Detected SCRFD model (input='input.1')");
         return DetectionModelType::SCRFD;
+    }
+    
+    // Check for YOLO-specific patterns
+    bool has_yolov5_outputs = false;  // YOLOv5: outputs "981", "983", "985"
+    bool has_yolov7_outputs = false;  // YOLOv7: outputs "stride_8", "stride_16", "stride_32"
+    bool has_yolov8_outputs = false;  // YOLOv8: outputs "output0", "1076", "1084"
+    bool has_images_input = false;    // YOLOv7/v8 use "images" as input
+    
+    // Rewind file to check again
+    file.clear();
+    file.seekg(0);
+    while (std::getline(file, line)) {
+        // Check for YOLOv5 output layers (appear as outputs at end of line)
+        if (line.find(" 981") != std::string::npos || 
+            line.find(" 983") != std::string::npos || 
+            line.find(" 985") != std::string::npos) {
+            has_yolov5_outputs = true;
+        }
+        // Check for YOLOv7 output layers
+        if (line.find("stride_8") != std::string::npos || 
+            line.find("stride_16") != std::string::npos || 
+            line.find("stride_32") != std::string::npos) {
+            has_yolov7_outputs = true;
+        }
+        // Check for YOLOv8 output layers (appear as outputs at end of line)
+        if (line.find(" output0") != std::string::npos || 
+            line.find(" 1076") != std::string::npos || 
+            line.find(" 1084") != std::string::npos) {
+            has_yolov8_outputs = true;
+        }
+        // Check for "images" input (YOLOv7/v8)
+        if (line.find("Input") != std::string::npos && line.find(" images ") != std::string::npos) {
+            has_images_input = true;
+        }
+    }
+    
+    // Determine YOLO version
+    if (has_data_input && has_yolov5_outputs) {
+        Logger::getInstance().debug("Detected YOLOv5-Face model (input='data', outputs='981', '983', '985')");
+        return DetectionModelType::YOLOV5;
+    } else if (has_images_input && has_yolov7_outputs) {
+        Logger::getInstance().debug("Detected YOLOv7-Face model (input='images', outputs='stride_8', 'stride_16', 'stride_32')");
+        return DetectionModelType::YOLOV7;
+    } else if (has_images_input && has_yolov8_outputs) {
+        Logger::getInstance().debug("Detected YOLOv8-Face model (input='images', outputs='output0', '1076', '1084')");
+        return DetectionModelType::YOLOV8;
     }
     
     Logger::getInstance().debug("Unknown detection model type (data=" + std::to_string(has_data_input) + 
@@ -586,6 +647,33 @@ std::vector<Rect> FaceDetector::detectFaces(const ImageView& frame, bool downsca
                 Logger::getInstance().debug("SCRFD detected " + std::to_string(faces.size()) + " faces");
                 
                 // Note: Coordinate adjustment is done inside detectWithSCRFD
+            }
+            break;
+        case DetectionModelType::YOLOV5:
+        case DetectionModelType::YOLOV7:
+        case DetectionModelType::YOLOV8:
+            {
+                // Convert BGR to RGB (all YOLO models expect RGB)
+                ncnn::Mat in = ncnn::Mat::from_pixels(frame.data(), ncnn::Mat::PIXEL_BGR2RGB, img_w, img_h);
+                
+                // Apply model-specific default thresholds if not specified
+                float yolo_threshold = confidence_threshold;
+                if (confidence_threshold == detection_confidence_threshold_) {
+                    // User didn't specify threshold, use model-specific default
+                    if (detection_model_type_ == DetectionModelType::YOLOV7) {
+                        yolo_threshold = 0.65f;  // YOLOv7 needs higher threshold
+                    } else {
+                        yolo_threshold = 0.5f;   // YOLOv5 and YOLOv8 use 0.5
+                    }
+                }
+                
+                if (detection_model_type_ == DetectionModelType::YOLOV5) {
+                    faces = detectWithYOLOv5(retinaface_net_, in, img_w, img_h, yolo_threshold);
+                } else if (detection_model_type_ == DetectionModelType::YOLOV7) {
+                    faces = detectWithYOLOv7(retinaface_net_, in, img_w, img_h, yolo_threshold);
+                } else {
+                    faces = detectWithYOLOv8(retinaface_net_, in, img_w, img_h, yolo_threshold);
+                }
             }
             break;
         default:

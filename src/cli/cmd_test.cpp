@@ -531,34 +531,38 @@ int cmd_test(const std::string& username, bool auto_adjust) {
         
         std::cout << std::endl;
         std::cout << "=== Calculating Optimal Recognition Threshold ===" << std::endl;
-        std::cout << "Analyzing variation between test samples..." << std::endl;
+        std::cout << "Comparing test samples against enrolled face..." << std::endl;
         
-        // Compare test samples against each other
+        // Compare test samples against enrolled face (not against each other!)
         std::vector<float> test_distances;
-        for (size_t i = 0; i < test_encodings.size(); i++) {
-            for (size_t j = i + 1; j < test_encodings.size(); j++) {
-                float dist = cosineDistance(test_encodings[i], test_encodings[j]);
-                test_distances.push_back(dist);
+        for (const auto& test_enc : test_encodings) {
+            // Compare against ALL enrolled faces to find the best match
+            for (const auto& model : all_models) {
+                for (const auto& enrolled_enc : model.encodings) {
+                    float dist = cosineDistance(enrolled_enc, test_enc);
+                    test_distances.push_back(dist);
+                }
             }
         }
         
         float optimal_threshold = 0.4f;  // Default fallback
         if (!test_distances.empty()) {
-            // Find maximum distance between test samples
-            float max_test_distance = *std::max_element(test_distances.begin(), test_distances.end());
+            // Find maximum distance from test samples to enrolled face
+            float max_enrolled_distance = *std::max_element(test_distances.begin(), test_distances.end());
             
-            // Set threshold with 20% safety margin
-            optimal_threshold = max_test_distance * 1.2f;
+            // Set threshold with 20% safety margin above max enrolled distance
+            optimal_threshold = max_enrolled_distance * 1.2f;
             
             // Clamp to reasonable range
             if (optimal_threshold < 0.15f) optimal_threshold = 0.15f;
-            if (optimal_threshold > 0.6f) optimal_threshold = 0.6f;
+            if (optimal_threshold > 0.80f) optimal_threshold = 0.80f;
             
             std::cout << "✓ Optimal recognition threshold calculated: " << std::fixed << std::setprecision(2) 
                       << optimal_threshold << std::endl;
-            std::cout << "  Based on " << test_distances.size() << " sample comparisons in current conditions" << std::endl;
-            std::cout << "  Max distance between samples: " << std::fixed << std::setprecision(4) 
-                      << max_test_distance << std::endl;
+            std::cout << "  Based on " << test_distances.size() << " comparisons against enrolled face" << std::endl;
+            std::cout << "  Max distance to enrolled face: " << std::fixed << std::setprecision(4) 
+                      << max_enrolled_distance << " (" << std::setprecision(0) 
+                      << (max_enrolled_distance * 100) << "%)" << std::endl;
         } else {
             std::cerr << "⚠ Could not calculate optimal threshold" << std::endl;
             std::cerr << "  Using default value: " << optimal_threshold << std::endl;
@@ -652,16 +656,20 @@ int cmd_test(const std::string& username, bool auto_adjust) {
             
             // Calculate new optimal threshold if we got all 3 samples
             if (adjustment_encodings.size() == 3) {
+                // Compare adjustment samples against enrolled face (not against each other!)
                 double max_distance = 0.0;
-                for (size_t i = 0; i < adjustment_encodings.size(); i++) {
-                    for (size_t j = i + 1; j < adjustment_encodings.size(); j++) {
-                        double dist = cosineDistance(adjustment_encodings[i], adjustment_encodings[j]);
-                        max_distance = std::max(max_distance, dist);
+                for (const auto& adj_enc : adjustment_encodings) {
+                    // Compare against ALL enrolled faces to find the best match
+                    for (const auto& model : all_models) {
+                        for (const auto& enrolled_enc : model.encodings) {
+                            double dist = cosineDistance(enrolled_enc, adj_enc);
+                            max_distance = std::max(max_distance, dist);
+                        }
                     }
                 }
                 
                 // Calculate new threshold with safety margin
-                float new_threshold = static_cast<float>(max_distance * 1.5);
+                float new_threshold = static_cast<float>(max_distance * 1.2);
                 new_threshold = std::max(0.15f, std::min(0.80f, new_threshold));
                 
                 // Update threshold immediately
@@ -754,8 +762,8 @@ int cmd_test(const std::string& username, bool auto_adjust) {
         if (elapsed > 0) {
             double fps = static_cast<double>(frame_count) / elapsed;
 
-            // Draw info banner at top
-            faceid::drawFilledRectangle(display_frame, 0, 0, display_frame.width(), 95, faceid::Color::Black());
+            // Draw info banner at top (expanded to 110px for 5 lines)
+            faceid::drawFilledRectangle(display_frame, 0, 0, display_frame.width(), 110, faceid::Color::Black());
 
             // Face count
             std::string info_text = "Detected faces: " + std::to_string(faces.size());
@@ -769,11 +777,22 @@ int cmd_test(const std::string& username, bool auto_adjust) {
             int fps_width = fps_text.length() * 8;
             faceid::drawText(display_frame, fps_text, display_frame.width() - 10 - fps_width, 25, faceid::Color::Green(), 1.0);
 
+            // Current enrolled face distance (show the distance for the first detected face)
+            if (!faces.empty() && !matched_distances.empty()) {
+                double current_distance = matched_distances[0];
+                std::string dist_text = "Distance: " + std::to_string(static_cast<int>(current_distance * 100)) + "%";
+                std::reverse(dist_text.begin(), dist_text.end());
+                int dist_width = dist_text.length() * 8;
+                // Color: green if matched, red if not
+                faceid::Color dist_color = (current_distance < threshold) ? faceid::Color::Green() : faceid::Color::Red();
+                faceid::drawText(display_frame, dist_text, display_frame.width() - 10 - dist_width, 45, dist_color, 1.0);
+            }
+
             // Threshold info
             std::string thresh_text = "Threshold: " + std::to_string(static_cast<int>(threshold * 100)) + "%";
             std::reverse(thresh_text.begin(), thresh_text.end());
             int thresh_width = thresh_text.length() * 8;
-            faceid::drawText(display_frame, thresh_text, display_frame.width() - 10 - thresh_width, 45, faceid::Color::Gray(), 1.0);
+            faceid::drawText(display_frame, thresh_text, display_frame.width() - 10 - thresh_width, 65, faceid::Color::Gray(), 1.0);
             
             // Adjustment status (if auto-adjust enabled)
             if (auto_adjust && !adjustment_status.empty()) {
@@ -781,7 +800,7 @@ int cmd_test(const std::string& username, bool auto_adjust) {
                 std::reverse(adj_text.begin(), adj_text.end());
                 int adj_width = adj_text.length() * 8;
                 faceid::Color adj_color = is_adjusting ? faceid::Color::Yellow() : faceid::Color::Cyan();
-                faceid::drawText(display_frame, adj_text, display_frame.width() - 10 - adj_width, 70, adj_color, 1.0);
+                faceid::drawText(display_frame, adj_text, display_frame.width() - 10 - adj_width, 85, adj_color, 1.0);
             }
         }
 

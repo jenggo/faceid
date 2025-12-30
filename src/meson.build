@@ -27,6 +27,7 @@ core_sources = files(
     'detectors/yunet.cpp',
     'detectors/scrfd.cpp',
     'detectors/ultraface.cpp',
+    'detectors/yolo.cpp',
 )
 
 core_lib = static_library(
