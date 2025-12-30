@@ -2,6 +2,7 @@
 #include "clahe.h"
 #include "optical_flow.h"
 #include "config_paths.h"
+#include "config.h"
 #include "logger.h"
 #include "detectors/common.h"
 #include "detectors/detectors.h"
@@ -132,7 +133,6 @@ DetectionModelType FaceDetector::detectModelType(const std::string& param_path) 
     
     // Check for SCRFD-specific patterns
     bool has_input_1 = false;
-    bool has_scrfd_outputs = false;
     
     // Rewind file to check again
     file.clear();
@@ -140,14 +140,12 @@ DetectionModelType FaceDetector::detectModelType(const std::string& param_path) 
     while (std::getline(file, line)) {
         if (line.find("Input") != std::string::npos && line.find(" input.1 ") != std::string::npos) {
             has_input_1 = true;
-        }
-        if (line.find("score_8") != std::string::npos || line.find("bbox_8") != std::string::npos) {
-            has_scrfd_outputs = true;
+            break; // input.1 is unique to SCRFD
         }
     }
     
-    if (has_input_1 && has_scrfd_outputs) {
-        Logger::getInstance().debug("Detected SCRFD model (input='input.1', outputs=score_*/bbox_*/kps_*)");
+    if (has_input_1) {
+        Logger::getInstance().debug("Detected SCRFD model (input='input.1')");
         return DetectionModelType::SCRFD;
     }
     
@@ -233,6 +231,20 @@ FaceDetector::FaceDetector() {
 
 bool FaceDetector::loadModels(const std::string& model_base_path, const std::string& detection_model_path) {
     try {
+        // Load detection confidence threshold from config
+        auto confidence_opt = Config::getInstance().getDouble("recognition", "confidence");
+        bool user_specified_confidence = confidence_opt.has_value();
+        
+        if (user_specified_confidence) {
+            detection_confidence_threshold_ = static_cast<float>(confidence_opt.value());
+            Logger::getInstance().debug("Detection confidence threshold from config: " + 
+                std::to_string(detection_confidence_threshold_));
+        } else {
+            // Use sensible defaults based on model type (will be adjusted after model detection)
+            detection_confidence_threshold_ = 0.8f;
+            Logger::getInstance().debug("Using default detection confidence threshold: 0.8 (will adjust based on model type)");
+        }
+        
         std::string base_path;
         size_t output_dim = 0;
         
@@ -296,6 +308,27 @@ bool FaceDetector::loadModels(const std::string& model_base_path, const std::str
         size_t last_slash = base_path.find_last_of("/\\");
         current_model_name_ = (last_slash != std::string::npos) ? 
             base_path.substr(last_slash + 1) : base_path;
+        
+        // Try to read original model name from .use file
+        std::string use_file = std::string(MODELS_DIR) + "/.use";
+        std::ifstream use_stream(use_file);
+        if (use_stream.good()) {
+            std::string line;
+            while (std::getline(use_stream, line)) {
+                if (line.empty() || line[0] == '#') continue;
+                
+                size_t eq_pos = line.find('=');
+                if (eq_pos != std::string::npos) {
+                    std::string key = line.substr(0, eq_pos);
+                    std::string value = line.substr(eq_pos + 1);
+                    if (key == "recognition") {
+                        current_model_name_ = value;
+                        break;
+                    }
+                }
+            }
+        }
+        
         current_encoding_dim_ = output_dim;
         
         Logger::getInstance().debug("Loading recognition model: " + current_model_name_ + 
@@ -407,6 +440,40 @@ bool FaceDetector::loadModels(const std::string& model_base_path, const std::str
                 detection_model_type_ = detectModelType(retinaface_param);
                 detection_model_name_ = detection_base.substr(detection_base.find_last_of("/\\") + 1);
                 
+                // Adjust default confidence threshold based on model type (if not set by user)
+                auto confidence_opt = Config::getInstance().getDouble("recognition", "confidence");
+                if (!confidence_opt.has_value()) {
+                    // User didn't specify confidence in config, use model-specific defaults
+                    if (detection_model_type_ == DetectionModelType::SCRFD ||
+                        detection_model_type_ == DetectionModelType::ULTRAFACE) {
+                        detection_confidence_threshold_ = 0.5f;
+                        Logger::getInstance().debug("Using SCRFD/UltraFace default confidence: 0.5");
+                    } else {
+                        detection_confidence_threshold_ = 0.8f;
+                        Logger::getInstance().debug("Using RetinaFace/YuNet default confidence: 0.8");
+                    }
+                }
+                
+                // Try to read original detection model name from .use file
+                std::string use_file = std::string(MODELS_DIR) + "/.use";
+                std::ifstream use_stream(use_file);
+                if (use_stream.good()) {
+                    std::string line;
+                    while (std::getline(use_stream, line)) {
+                        if (line.empty() || line[0] == '#') continue;
+                        
+                        size_t eq_pos = line.find('=');
+                        if (eq_pos != std::string::npos) {
+                            std::string key = line.substr(0, eq_pos);
+                            std::string value = line.substr(eq_pos + 1);
+                            if (key == "detection") {
+                                detection_model_name_ = value;
+                                break;
+                            }
+                        }
+                    }
+                }
+                
                 std::string model_type_str;
                 switch (detection_model_type_) {
                     case DetectionModelType::RETINAFACE: model_type_str = "RetinaFace"; break;
@@ -426,12 +493,17 @@ bool FaceDetector::loadModels(const std::string& model_base_path, const std::str
     }
 }
 
-std::vector<Rect> FaceDetector::detectFaces(const ImageView& frame, bool downscale) {
+std::vector<Rect> FaceDetector::detectFaces(const ImageView& frame, bool downscale, float confidence_threshold) {
     (void)downscale;  // Parameter kept for API compatibility
     
     // Check if detection model is loaded
     if (!detection_model_loaded_) {
         return {};
+    }
+    
+    // Use default threshold from config if not specified
+    if (confidence_threshold <= 0.0f) {
+        confidence_threshold = detection_confidence_threshold_;
     }
     
     // Check cache first
@@ -446,23 +518,75 @@ std::vector<Rect> FaceDetector::detectFaces(const ImageView& frame, bool downsca
     int img_w = frame.width();
     int img_h = frame.height();
     
-    // Convert BGR to RGB (all models expect RGB)
-    ncnn::Mat in = ncnn::Mat::from_pixels(frame.data(), ncnn::Mat::PIXEL_BGR2RGB, img_w, img_h);
-    
     // Route to appropriate detector based on model type
     std::vector<Rect> faces;
     switch (detection_model_type_) {
         case DetectionModelType::RETINAFACE:
-            faces = detectWithRetinaFace(in, img_w, img_h);
-            break;
         case DetectionModelType::YUNET:
-            faces = detectWithYuNet(in, img_w, img_h);
-            break;
         case DetectionModelType::ULTRAFACE:
-            faces = detectWithUltraFace(in, img_w, img_h);
+            {
+                // Convert BGR to RGB (all models expect RGB)
+                ncnn::Mat in = ncnn::Mat::from_pixels(frame.data(), ncnn::Mat::PIXEL_BGR2RGB, img_w, img_h);
+                
+                if (detection_model_type_ == DetectionModelType::RETINAFACE) {
+                    faces = detectWithRetinaFace(in, img_w, img_h, confidence_threshold);
+                } else if (detection_model_type_ == DetectionModelType::YUNET) {
+                    faces = detectWithYuNet(in, img_w, img_h, confidence_threshold);
+                } else {
+                    faces = detectWithUltraFace(in, img_w, img_h, confidence_threshold);
+                }
+            }
             break;
         case DetectionModelType::SCRFD:
-            faces = detectWithSCRFD(in, img_w, img_h);
+            {
+                // SCRFD requires special preprocessing: aspect-ratio preserving resize + padding
+                // Reference: https://github.com/nihui/ncnn-webassembly-scrfd
+                const int target_size = 640;
+                
+                // Calculate scale to fit into target_size
+                int w = img_w;
+                int h = img_h;
+                float scale = 1.f;
+                if (w > h) {
+                    scale = (float)target_size / w;
+                    w = target_size;
+                    h = h * scale;
+                } else {
+                    scale = (float)target_size / h;
+                    h = target_size;
+                    w = w * scale;
+                }
+                
+                Logger::getInstance().debug("SCRFD preprocessing: orig=" + std::to_string(img_w) + "x" + std::to_string(img_h) + 
+                                          " -> resized=" + std::to_string(w) + "x" + std::to_string(h) + 
+                                          " scale=" + std::to_string(scale));
+                
+                // Resize with aspect ratio preserved
+                ncnn::Mat in = ncnn::Mat::from_pixels_resize(frame.data(), ncnn::Mat::PIXEL_BGR2RGB, 
+                                                            img_w, img_h, w, h);
+                
+                // Pad to multiples of 32
+                int wpad = (w + 31) / 32 * 32 - w;
+                int hpad = (h + 31) / 32 * 32 - h;
+                ncnn::Mat in_pad;
+                ncnn::copy_make_border(in, in_pad, hpad / 2, hpad - hpad / 2, wpad / 2, wpad - wpad / 2, 
+                                     ncnn::BORDER_CONSTANT, 0.f);
+                
+                Logger::getInstance().debug("SCRFD padding: wpad=" + std::to_string(wpad) + " hpad=" + std::to_string(hpad) + 
+                                          " -> final=" + std::to_string(in_pad.w) + "x" + std::to_string(in_pad.h));
+                
+                // Normalize: mean=[127.5, 127.5, 127.5], norm=[1/128.0]
+                const float mean_vals[3] = {127.5f, 127.5f, 127.5f};
+                const float norm_vals[3] = {1/128.f, 1/128.f, 1/128.f};
+                in_pad.substract_mean_normalize(mean_vals, norm_vals);
+                
+                // Detect faces
+                faces = detectWithSCRFD(in_pad, in_pad.w, in_pad.h, confidence_threshold, scale, wpad, hpad, img_w, img_h);
+                
+                Logger::getInstance().debug("SCRFD detected " + std::to_string(faces.size()) + " faces");
+                
+                // Note: Coordinate adjustment is done inside detectWithSCRFD
+            }
             break;
         default:
             Logger::getInstance().error("Unknown detection model type");
@@ -479,23 +603,37 @@ std::vector<Rect> FaceDetector::detectFaces(const ImageView& frame, bool downsca
 }
 
 // RetinaFace detection implementation
-std::vector<Rect> FaceDetector::detectWithRetinaFace(const ncnn::Mat& in, int img_w, int img_h) {
-    return ::faceid::detectWithRetinaFace(retinaface_net_, in, img_w, img_h);
+std::vector<Rect> FaceDetector::detectWithRetinaFace(const ncnn::Mat& in, int img_w, int img_h, float confidence_threshold) {
+    if (confidence_threshold <= 0.0f) {
+        confidence_threshold = detection_confidence_threshold_;
+    }
+    return ::faceid::detectWithRetinaFace(retinaface_net_, in, img_w, img_h, confidence_threshold);
 }
 
 // YuNet detection implementation
-std::vector<Rect> FaceDetector::detectWithYuNet(const ncnn::Mat& in, int img_w, int img_h) {
-    return ::faceid::detectWithYuNet(retinaface_net_, in, img_w, img_h);
+std::vector<Rect> FaceDetector::detectWithYuNet(const ncnn::Mat& in, int img_w, int img_h, float confidence_threshold) {
+    if (confidence_threshold <= 0.0f) {
+        confidence_threshold = detection_confidence_threshold_;
+    }
+    return ::faceid::detectWithYuNet(retinaface_net_, in, img_w, img_h, confidence_threshold);
 }
 
 // SCRFD detection implementation
-std::vector<Rect> FaceDetector::detectWithSCRFD(const ncnn::Mat& in, int img_w, int img_h) {
-    return ::faceid::detectWithSCRFD(retinaface_net_, in, img_w, img_h);
+std::vector<Rect> FaceDetector::detectWithSCRFD(const ncnn::Mat& in, int img_w, int img_h, float confidence_threshold, 
+                                                float scale, int wpad, int hpad, int orig_w, int orig_h) {
+    if (confidence_threshold <= 0.0f) {
+        confidence_threshold = detection_confidence_threshold_;
+    }
+    return ::faceid::detectWithSCRFD(retinaface_net_, in, img_w, img_h, confidence_threshold, 
+                                     scale, wpad, hpad, orig_w, orig_h);
 }
 
 // UltraFace/RFB-320 detection implementation
-std::vector<Rect> FaceDetector::detectWithUltraFace(const ncnn::Mat& in, int img_w, int img_h) {
-    return ::faceid::detectWithUltraFace(retinaface_net_, in, img_w, img_h);
+std::vector<Rect> FaceDetector::detectWithUltraFace(const ncnn::Mat& in, int img_w, int img_h, float confidence_threshold) {
+    if (confidence_threshold <= 0.0f) {
+        confidence_threshold = detection_confidence_threshold_;
+    }
+    return ::faceid::detectWithUltraFace(retinaface_net_, in, img_w, img_h, confidence_threshold);
 }
 
 std::vector<Rect> FaceDetector::detectOrTrackFaces(const ImageView& frame, int track_interval) {

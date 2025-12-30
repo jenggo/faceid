@@ -2,6 +2,7 @@
 .cache/
 docs/
 tests/
+models/
 *.*backup
 *.md
 !README.md

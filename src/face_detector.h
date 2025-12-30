@@ -35,7 +35,8 @@ public:
     bool loadModels(const std::string& model_base_path = "", const std::string& detection_model_path = "");
     
     // Detect faces in frame using RetinaFace
-    std::vector<Rect> detectFaces(const ImageView& frame, bool downscale = false);
+    // confidence_threshold: minimum detection confidence (0.0-1.0, 0 = use config default)
+    std::vector<Rect> detectFaces(const ImageView& frame, bool downscale = false, float confidence_threshold = 0.0f);
     
     // Detect or track faces (automatically uses tracking when possible)
     // track_interval: how many frames to track before re-detecting (0 = always detect)
@@ -76,8 +77,72 @@ public:
     // Get current encoding dimension (from loaded model)
     size_t getEncodingDimension() const { return current_encoding_dim_; }
     
-    // Get current model name
+    // Get current recognition model name
     const std::string& getModelName() const { return current_model_name_; }
+    
+    // Get current detection model name
+    const std::string& getDetectionModelName() const { return detection_model_name_; }
+    
+    // Get current detection model type as string
+    std::string getDetectionModelType() const {
+        switch (detection_model_type_) {
+            case DetectionModelType::RETINAFACE: return "RetinaFace";
+            case DetectionModelType::YUNET: return "YuNet";
+            case DetectionModelType::ULTRAFACE: return "UltraFace/RFB-320";
+            case DetectionModelType::SCRFD: return "SCRFD";
+            default: return "Unknown";
+        }
+    }
+    
+    // Get current recognition model type as string
+    std::string getRecognitionModelType() const {
+        // Return actual model name if available
+        if (!current_model_name_.empty() && current_model_name_ != "recognition") {
+            // Extract model type from filename
+            std::string model_lower = current_model_name_;
+            std::transform(model_lower.begin(), model_lower.end(), model_lower.begin(), ::tolower);
+            
+            if (model_lower.find("sface") != std::string::npos) {
+                return "SFace";
+            } else if (model_lower.find("mobilefacenet") != std::string::npos || 
+                       model_lower.find("mobile_face") != std::string::npos) {
+                return "MobileFaceNet";
+            } else if (model_lower.find("arcface") != std::string::npos) {
+                if (current_encoding_dim_ == 256) {
+                    return "ArcFace-R34";
+                } else {
+                    return "ArcFace-R50";
+                }
+            } else if (model_lower.find("webface") != std::string::npos) {
+                return "WebFace-R50";
+            } else if (model_lower.find("glint360k") != std::string::npos) {
+                return "Glint360K-R50";
+            } else if (model_lower.find("ms1m") != std::string::npos || 
+                       model_lower.find("ms1mv2") != std::string::npos) {
+                return "MS1M-R50";
+            }
+        }
+        
+        // Fallback: For generic names like "recognition", show dimension
+        // This happens when models are installed via "faceid use" command
+        if (current_encoding_dim_ == 128) {
+            return "Unknown (128D - likely SFace)";
+        } else if (current_encoding_dim_ == 192) {
+            return "Unknown (192D - likely MobileFaceNet)";
+        } else if (current_encoding_dim_ == 256) {
+            return "Unknown (256D - likely ArcFace-R34)";
+        } else if (current_encoding_dim_ == 512) {
+            return "Unknown (512D - ArcFace/WebFace/MS1M)";
+        } else {
+            return "Unknown (" + std::to_string(current_encoding_dim_) + "D)";
+        }
+    }
+    
+    // Helper: Parse param file to extract output dimensions
+    size_t parseModelOutputDim(const std::string& param_path);
+    
+    // Helper: Auto-detect detection model type from param file
+    DetectionModelType detectModelType(const std::string& param_path);
 
 private:
     // NCNN networks
@@ -94,6 +159,9 @@ private:
     // Recognition model information (auto-detected from param file)
     size_t current_encoding_dim_ = FACE_ENCODING_DIM;  // Default to 512D
     std::string current_model_name_;
+    
+    // Detection configuration
+    float detection_confidence_threshold_ = 0.8f;  // Default confidence threshold
     
     // Performance optimizations
     bool use_cache_ = true;
@@ -114,20 +182,15 @@ private:
     // Helper: Align face for recognition model (expects 112x112)
     Image alignFace(const ImageView& frame, const Rect& face_rect);
     
-    // Helper: Parse param file to extract output dimensions
-    size_t parseModelOutputDim(const std::string& param_path);
-    
     // Helper: Find first available recognition model in directory
     std::pair<std::string, size_t> findAvailableModel(const std::string& models_dir);
     
-    // Helper: Auto-detect detection model type from param file
-    DetectionModelType detectModelType(const std::string& param_path);
-    
     // Detection decoders for different model types
-    std::vector<Rect> detectWithRetinaFace(const ncnn::Mat& in, int img_w, int img_h);
-    std::vector<Rect> detectWithYuNet(const ncnn::Mat& in, int img_w, int img_h);
-    std::vector<Rect> detectWithUltraFace(const ncnn::Mat& in, int img_w, int img_h);
-    std::vector<Rect> detectWithSCRFD(const ncnn::Mat& in, int img_w, int img_h);
+    std::vector<Rect> detectWithRetinaFace(const ncnn::Mat& in, int img_w, int img_h, float confidence_threshold = 0.0f);
+    std::vector<Rect> detectWithYuNet(const ncnn::Mat& in, int img_w, int img_h, float confidence_threshold = 0.0f);
+    std::vector<Rect> detectWithUltraFace(const ncnn::Mat& in, int img_w, int img_h, float confidence_threshold = 0.0f);
+    std::vector<Rect> detectWithSCRFD(const ncnn::Mat& in, int img_w, int img_h, float confidence_threshold, 
+                                      float scale, int wpad, int hpad, int orig_w, int orig_h);
 };
 
 } // namespace faceid

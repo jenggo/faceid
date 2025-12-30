@@ -6,19 +6,24 @@
 namespace faceid {
 
 // ============================================================================
-// FACE ENCODING DIMENSION - SINGLE SOURCE OF TRUTH
+// FACE ENCODING DIMENSION - FALLBACK DEFAULT
 // ============================================================================
-// Change this constant if you switch to a different face recognition model:
-// - SFace model: 512D (current)
-// - ArcFace model: typically 512D
-// - FaceNet model: typically 128D or 512D depending on variant
+// This is a FALLBACK value used when:
+// 1. Model dimension cannot be auto-detected from .param file
+// 2. Legacy binary files without dimension header are loaded
 // 
-// After changing this constant:
-// 1. Rebuild the project: make build && sudo make install
-// 2. Re-enroll all users: sudo faceid add <username>
-// 3. Delete old .bin files from /etc/faceid/faces/
+// The actual dimension is AUTO-DETECTED from the loaded model's output layer.
+// 
+// Common model dimensions:
+// - SFace: 128D
+// - MobileFaceNet: 192D  
+// - ArcFace-R34: 256D
+// - ArcFace-R50 / WebFace / Glint360K / MS1M models: 512D
+// 
+// NOTE: You can use any model - the code will detect its dimension automatically.
+// Old and new enrollments with different dimensions can coexist.
 // ============================================================================
-constexpr size_t FACE_ENCODING_DIM = 512;  // Current model: SFace (512D)
+constexpr size_t FACE_ENCODING_DIM = 512;  // Fallback default (auto-detected in practice)
 
 } // namespace faceid
 

@@ -22,9 +22,9 @@ struct BinaryFaceModel {
 class BinaryModelLoader {
 public:
     static constexpr size_t HEADER_SIZE = 120;  // 0x78
-    // Use the global encoding dimension constant from encoding_config.h
+    // NOTE: Encoding dimension is stored in each binary file and detected at runtime.
+    // ENCODING_DIM below is only a fallback for legacy files without dimension header.
     static constexpr size_t ENCODING_DIM = FACE_ENCODING_DIM;
-    static constexpr size_t ENCODING_SIZE = ENCODING_DIM * sizeof(float);
     static constexpr size_t FACE_ID_LABEL_SIZE = 36;
 
     // Load user model from binary file

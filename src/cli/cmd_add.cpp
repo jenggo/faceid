@@ -6,6 +6,7 @@
 #include <iomanip>
 #include <algorithm>
 #include <dirent.h>
+#include <cmath>
 #include "../models/binary_model.h"
 #include "config_paths.h"
 #include "../config.h"
@@ -14,6 +15,7 @@
 #include "../display.h"
 #include "commands.h"
 #include "cli_common.h"
+#include "cli_helpers.h"
 
 namespace faceid {
 
@@ -91,85 +93,192 @@ int cmd_add(const std::string& username, const std::string& face_id) {
     std::cout << "   Press 'q' in the preview window to cancel" << std::endl;
     std::cout << std::endl;
     
+    // Step 1: Auto-detect optimal detection confidence
+    float optimal_confidence = findOptimalDetectionConfidence(camera, detector, display);
+    if (optimal_confidence < 0.0f) {
+        std::cerr << "Failed to determine optimal confidence" << std::endl;
+        return 1;
+    }
+    
     // Capture and process multiple frames
     const int num_samples = 5;
     std::vector<faceid::FaceEncoding> encodings;
     
     std::cout << "Capturing " << num_samples << " face samples..." << std::endl;
+    std::cout << "Tip: Move your head slightly between samples for better recognition" << std::endl;
+    std::cout << std::endl;
+    
+    // Prompts to encourage variation
+    const std::string prompts[] = {
+        "(Look straight at camera)",
+        "(Turn head slightly left)",
+        "(Turn head slightly right)",
+        "(Tilt head slightly up)",
+        "(Neutral expression)"
+    };
     
     for (int i = 0; i < num_samples; i++) {
-        std::cout << "  Sample " << (i + 1) << "/" << num_samples << "... " << std::flush;
+        std::cout << "  Sample " << (i + 1) << "/" << num_samples << " " << prompts[i] << "... " << std::flush;
         
-        faceid::Image frame;
-        if (!camera.read(frame)) {
-            std::cerr << "Failed to read frame" << std::endl;
-            continue;
-        }
+        // Phase 1: Wait for valid face detection (exactly 1 face)
+        // Keep showing live preview until user is properly positioned
+        bool face_detected = false;
+        faceid::Image last_valid_frame;
+        std::vector<faceid::Rect> last_valid_faces;
         
-        // Preprocess frame
-        faceid::Image processed_frame = detector.preprocessFrame(frame.view());
-        
-        // Detect faces (with tracking optimization)
-        auto faces = detector.detectOrTrackFaces(processed_frame.view(), tracking_interval);
-        
-        // Draw visualization on original frame
-        faceid::Image display_frame = frame.clone();
-        
-        // Draw detected face rectangles (adjust coordinates for SDL flip)
-        for (const auto& face : faces) {
-            faceid::Color color = (faces.size() == 1) 
-                ? faceid::Color::Green()  // Green for good detection
-                : faceid::Color::Red();   // Red for multiple faces
+        while (!face_detected) {
+            // Read and display current frame
+            faceid::Image frame;
+            if (!camera.read(frame)) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                continue;
+            }
             
-            // Draw rectangle at ORIGINAL position (SDL will flip it correctly)
-            faceid::drawRectangle(display_frame, face.x, face.y, 
-                                 face.width, face.height, color, 2);
+            // Preprocess frame
+            faceid::Image processed_frame = detector.preprocessFrame(frame.view());
+            
+            // Detect faces (with tracking optimization)
+            auto faces = detector.detectOrTrackFaces(processed_frame.view(), tracking_interval);
+            
+            // Draw visualization on original frame
+            faceid::Image display_frame = frame.clone();
+            
+            // Draw detected face rectangles
+            for (const auto& face : faces) {
+                faceid::Color color = (faces.size() == 1) 
+                    ? faceid::Color::Green()  // Green for good detection
+                    : faceid::Color::Red();   // Red for multiple faces
+                
+                faceid::drawRectangle(display_frame, face.x, face.y, 
+                                     face.width, face.height, color, 2);
+            }
+            
+            // Draw status text
+            std::string status_text;
+            faceid::Color status_color = faceid::Color::White();
+            
+            if (faces.empty()) {
+                status_text = prompts[i] + " - Waiting for face...";
+                status_color = faceid::Color::Orange();
+            } else if (faces.size() > 1) {
+                status_text = prompts[i] + " - Multiple faces detected, show only one";
+                status_color = faceid::Color::Red();
+            } else {
+                // Exactly 1 face detected - ready to start countdown!
+                status_text = prompts[i] + " - Face detected! Get ready...";
+                status_color = faceid::Color::Green();
+                face_detected = true;
+                last_valid_frame = frame.clone();
+                last_valid_faces = faces;
+            }
+            
+            // Draw status banner at top
+            faceid::drawFilledRectangle(display_frame, 0, 0, display_frame.width(), 40, faceid::Color::Black());
+            std::string status_text_reversed = status_text;
+            std::reverse(status_text_reversed.begin(), status_text_reversed.end());
+            int status_width = status_text_reversed.length() * 8;
+            faceid::drawText(display_frame, status_text_reversed, display_frame.width() - 10 - status_width, 10, status_color, 1.0);
+            
+            // Show progress bar at bottom
+            int progress_width = (display_frame.width() * i) / num_samples;
+            faceid::drawFilledRectangle(display_frame, 0, display_frame.height() - 10, 
+                                       progress_width, 10, faceid::Color::Green());
+            
+            // Display the frame
+            display.show(display_frame);
+            
+            // Check for quit key
+            int key = display.waitKey(50);
+            if (key == 'q' || key == 'Q' || key == 27 || !display.isOpen()) {
+                std::cout << std::endl << "Cancelled by user" << std::endl;
+                return 1;
+            }
         }
         
-        // Draw status text
-        std::string status_text;
-        faceid::Color status_color = faceid::Color::Black();  // Initialize with default
+        // Phase 2: Countdown with live preview (3 seconds)
+        // Now that face is detected, give user time to adjust pose
+        auto countdown_start = std::chrono::steady_clock::now();
+        const int prep_time_ms = 3000;  // 3 seconds preparation time
         
-        if (faces.empty()) {
-            status_text = "No face detected - position yourself in frame";
-            status_color = faceid::Color::Orange();
-        } else if (faces.size() > 1) {
-            status_text = "Multiple faces (" + std::to_string(faces.size()) + ") - only one person should be visible";
-            status_color = faceid::Color::Red();
-        } else {
-            status_text = "Face detected - capturing sample " + std::to_string(i + 1) + "/" + std::to_string(num_samples);
-            status_color = faceid::Color::Green();
+        while (true) {
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - countdown_start).count();
+            
+            if (elapsed >= prep_time_ms) break;
+            
+            // Read and display current frame
+            faceid::Image frame;
+            if (!camera.read(frame)) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                continue;
+            }
+            
+            // Preprocess frame
+            faceid::Image processed_frame = detector.preprocessFrame(frame.view());
+            
+            // Detect faces (with tracking optimization)
+            auto faces = detector.detectOrTrackFaces(processed_frame.view(), tracking_interval);
+            
+            // Save this frame as potential capture candidate
+            if (faces.size() == 1) {
+                last_valid_frame = frame.clone();
+                last_valid_faces = faces;
+            }
+            
+            // Draw visualization on original frame
+            faceid::Image display_frame = frame.clone();
+            
+            // Draw detected face rectangles
+            for (const auto& face : faces) {
+                faceid::Color color = (faces.size() == 1) 
+                    ? faceid::Color::Green()  // Green for good detection
+                    : faceid::Color::Red();   // Red for multiple faces
+                
+                faceid::drawRectangle(display_frame, face.x, face.y, 
+                                     face.width, face.height, color, 2);
+            }
+            
+            // Draw countdown
+            int remaining_sec = (prep_time_ms - elapsed) / 1000 + 1;
+            std::string status_text = prompts[i] + " - Capturing in " + std::to_string(remaining_sec) + "s...";
+            faceid::Color status_color = (faces.size() == 1) ? faceid::Color::Green() : faceid::Color::Orange();
+            
+            // Draw status banner at top
+            faceid::drawFilledRectangle(display_frame, 0, 0, display_frame.width(), 40, faceid::Color::Black());
+            std::string status_text_reversed = status_text;
+            std::reverse(status_text_reversed.begin(), status_text_reversed.end());
+            int status_width = status_text_reversed.length() * 8;
+            faceid::drawText(display_frame, status_text_reversed, display_frame.width() - 10 - status_width, 10, status_color, 1.0);
+            
+            // Show progress bar at bottom (gradually fills during countdown)
+            int progress_width = (display_frame.width() * (i * prep_time_ms + elapsed)) / (num_samples * prep_time_ms);
+            faceid::drawFilledRectangle(display_frame, 0, display_frame.height() - 10, 
+                                       progress_width, 10, faceid::Color::Green());
+            
+            // Display the frame
+            display.show(display_frame);
+            
+            // Check for quit key
+            int key = display.waitKey(50);
+            if (key == 'q' || key == 'Q' || key == 27 || !display.isOpen()) {
+                std::cout << std::endl << "Cancelled by user" << std::endl;
+                return 1;
+            }
         }
         
-        // Draw status banner at top
-        faceid::drawFilledRectangle(display_frame, 0, 0, display_frame.width(), 40, faceid::Color::Black());
-        std::string status_text_reversed = status_text;
-        std::reverse(status_text_reversed.begin(), status_text_reversed.end());
-        int status_width = status_text_reversed.length() * 8;
-        faceid::drawText(display_frame, status_text_reversed, display_frame.width() - 10 - status_width, 10, status_color, 1.0);
-        
-        // Show progress bar at bottom
-        int progress_width = (display_frame.width() * (i + 1)) / num_samples;
-        faceid::drawFilledRectangle(display_frame, 0, display_frame.height() - 10, 
-                                   progress_width, 10, faceid::Color::Green());
-        
-        // Display the frame (SDL will flip horizontally)
-        display.show(display_frame);
-        
-        // Check for quit key (short wait to keep display responsive)
-        int key = display.waitKey(30);
-        if (key == 'q' || key == 'Q' || key == 27 || !display.isOpen()) {  // q or ESC or window closed
-            std::cout << std::endl << "Cancelled by user" << std::endl;
-            return 1;
-        }
-        
-        // Validate detection
-        if (faces.empty()) {
-            std::cout << "No face detected, retrying..." << std::endl;
+        // Now capture: use the last valid frame we saw during countdown
+        if (last_valid_frame.data() == nullptr || last_valid_faces.empty()) {
+            std::cout << "No valid face detected during countdown, retrying..." << std::endl;
             i--;  // Retry this sample
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
             continue;
         }
+        
+        // Preprocess the captured frame
+        faceid::Image processed_frame = detector.preprocessFrame(last_valid_frame.view());
+        
+        // Use the detected faces from this frame
+        auto faces = last_valid_faces;
         
         // If multiple faces, select the largest one (closest to camera)
         faceid::Rect selected_face;
@@ -201,8 +310,6 @@ int cmd_add(const std::string& username, const std::string& face_id) {
         
         encodings.push_back(face_encodings[0]);
         std::cout << "✓ OK" << std::endl;
-        
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
     
     // Display window will close automatically when display object goes out of scope
@@ -214,6 +321,40 @@ int cmd_add(const std::string& username, const std::string& face_id) {
     }
     
     std::cout << "Successfully captured " << encodings.size() << " samples!" << std::endl;
+    
+    // Step 2: Calculate optimal recognition threshold by comparing samples against each other
+    std::cout << std::endl;
+    std::cout << "=== Calculating Optimal Recognition Threshold ===" << std::endl;
+    std::cout << "Comparing samples to find best threshold..." << std::endl;
+    
+    std::vector<float> all_distances;
+    for (size_t i = 0; i < encodings.size(); i++) {
+        for (size_t j = i + 1; j < encodings.size(); j++) {
+            float dist = cosineDistance(encodings[i], encodings[j]);
+            all_distances.push_back(dist);
+        }
+    }
+    
+    // Find the maximum distance between any two samples (same person)
+    // The threshold should be higher than this to accept all variations
+    float max_intra_distance = 0.0f;
+    if (!all_distances.empty()) {
+        max_intra_distance = *std::max_element(all_distances.begin(), all_distances.end());
+    }
+    
+    // Set threshold with safety margin (20% above max intra-distance)
+    // This ensures all your samples will match, while still rejecting different people
+    float optimal_threshold = max_intra_distance * 1.2f;
+    
+    // Clamp to reasonable range
+    if (optimal_threshold < 0.15f) optimal_threshold = 0.15f;  // Minimum safety
+    if (optimal_threshold > 0.6f) optimal_threshold = 0.6f;    // Maximum usability
+    
+    std::cout << "✓ Optimal recognition threshold calculated: " << std::fixed << std::setprecision(2) 
+              << optimal_threshold << std::endl;
+    std::cout << "  Based on variation between your " << encodings.size() << " samples" << std::endl;
+    std::cout << "  Max intra-person distance: " << std::fixed << std::setprecision(4) 
+              << max_intra_distance << std::endl;
     
     // Create model for this face (save to FACES_DIR)
     std::string model_path = std::string(FACES_DIR) + "/" + username + "." + face_id + ".bin";
@@ -239,6 +380,14 @@ int cmd_add(const std::string& username, const std::string& face_id) {
     // Show total faces for this user
     int total_faces = 1;  // Since we create one file per face
     std::cout << "  Total faces for " << username << ": " << total_faces << " (this session)" << std::endl;
+    std::cout << std::endl;
+    
+    // Step 3: Update config file with optimal values
+    if (!updateConfigFile(config_path, optimal_confidence, optimal_threshold)) {
+        std::cerr << "Warning: Could not update config file" << std::endl;
+        std::cerr << "You may need to manually set these values in " << config_path << std::endl;
+    }
+    
     std::cout << std::endl;
     std::cout << "You can now use face authentication for user: " << username << std::endl;
     

@@ -188,8 +188,14 @@ bool BinaryModelLoader::validateBinaryFile(const std::string& path) {
     // Check file size
     file.seekg(0, std::ios::end);
     size_t file_size = file.tellg();
-    size_t expected_size = HEADER_SIZE + model.encodings.size() * ENCODING_SIZE;
+    
+    // Calculate expected size based on actual encoding dimension
+    size_t actual_encoding_dim = model.encodings.empty() ? ENCODING_DIM : model.encodings[0].size();
+    size_t expected_size = HEADER_SIZE + model.encodings.size() * actual_encoding_dim * sizeof(float);
+    
     if (file_size != expected_size) {
+        faceid::Logger::getInstance().warning("File size mismatch: expected " + std::to_string(expected_size) + 
+                                            " bytes, got " + std::to_string(file_size) + " bytes for " + path);
         return false;
     }
 
@@ -197,7 +203,11 @@ bool BinaryModelLoader::validateBinaryFile(const std::string& path) {
 }
 
 size_t BinaryModelLoader::getModelFileSize(const BinaryFaceModel& model) {
-    return HEADER_SIZE + model.encodings.size() * ENCODING_SIZE;
+    if (model.encodings.empty()) {
+        return HEADER_SIZE;
+    }
+    size_t actual_encoding_dim = model.encodings[0].size();
+    return HEADER_SIZE + model.encodings.size() * actual_encoding_dim * sizeof(float);
 }
 
 uint32_t BinaryModelLoader::readUint32LE(std::ifstream& file) {

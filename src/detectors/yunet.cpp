@@ -16,12 +16,13 @@
 
 namespace faceid {
 
-std::vector<Rect> detectWithYuNet(ncnn::Net& net, const ncnn::Mat& in, int img_w, int img_h) {
+std::vector<Rect> detectWithYuNet(ncnn::Net& net, const ncnn::Mat& in, int img_w, int img_h,
+                                  float confidence_threshold) {
     ncnn::Extractor ex = net.create_extractor();
     ex.set_light_mode(true);
     ex.input("in0", in);
     
-    const float conf_threshold = 0.8f;  // High threshold to filter noise
+    const float conf_threshold = confidence_threshold;
     const float nms_threshold = 0.3f;
     std::vector<FaceObject> proposals;
     
@@ -92,7 +93,8 @@ std::vector<Rect> detectWithYuNet(ncnn::Net& net, const ncnn::Mat& in, int img_w
                 float box_w = x2 - x1;
                 float box_h = y2 - y1;
                 
-                if (box_w > 20 && box_h > 20) {
+                // Filter by minimum size
+                if (box_w > 0 && box_h > 0) {
                     FaceObject faceobj;
                     faceobj.rect.x = x1;
                     faceobj.rect.y = y1;

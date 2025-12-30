@@ -13,14 +13,15 @@
 
 namespace faceid {
 
-std::vector<Rect> detectWithRetinaFace(ncnn::Net& net, const ncnn::Mat& in, int img_w, int img_h) {
+std::vector<Rect> detectWithRetinaFace(ncnn::Net& net, const ncnn::Mat& in, int img_w, int img_h,
+                                       float confidence_threshold) {
     ncnn::Extractor ex = net.create_extractor();
     ex.set_light_mode(true);  // Optimize for speed
     ex.input("data", in);
     
     std::vector<FaceObject> faceproposals;
     
-    const float prob_threshold = 0.8f;
+    const float prob_threshold = confidence_threshold;
     const float nms_threshold = 0.4f;
     
     // stride 32
@@ -110,7 +111,7 @@ std::vector<Rect> detectWithRetinaFace(ncnn::Net& net, const ncnn::Mat& in, int 
         obj.rect.width = (int)(x1 - x0);
         obj.rect.height = (int)(y1 - y0);
         
-        // Filter out invalid boxes
+        // Only check for valid dimensions
         if (obj.rect.width > 0 && obj.rect.height > 0) {
             faces.push_back(obj.rect);
         }

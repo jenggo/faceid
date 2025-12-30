@@ -14,7 +14,8 @@
 
 namespace faceid {
 
-std::vector<Rect> detectWithUltraFace(ncnn::Net& net, const ncnn::Mat& in, int img_w, int img_h) {
+std::vector<Rect> detectWithUltraFace(ncnn::Net& net, const ncnn::Mat& in, int img_w, int img_h,
+                                      float confidence_threshold) {
     // UltraFace/RFB-320: input 320x240, outputs raw scores and bbox offsets
     
     // Resize input to 320x240 (model's expected input size)
@@ -36,7 +37,7 @@ std::vector<Rect> detectWithUltraFace(ncnn::Net& net, const ncnn::Mat& in, int i
     ex.extract("out0", scores);  // (2, 4420)
     ex.extract("out1", boxes);   // (4, 4420)
     
-    const float prob_threshold = 0.5f;
+    const float prob_threshold = confidence_threshold;
     const float nms_threshold = 0.3f;
     std::vector<FaceObject> proposals;
     
@@ -116,7 +117,8 @@ std::vector<Rect> detectWithUltraFace(ncnn::Net& net, const ncnn::Mat& in, int i
         float box_w = box_x2 - box_x1;
         float box_h = box_y2 - box_y1;
         
-        if (box_w > 20 && box_h > 20) {
+        // Filter by minimum size
+        if (box_w > 0 && box_h > 0) {
             FaceObject faceobj;
             faceobj.rect.x = box_x1;
             faceobj.rect.y = box_y1;

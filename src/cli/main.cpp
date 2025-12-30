@@ -1,5 +1,6 @@
 #include <iostream>
 #include <string>
+#include <vector>
 #include "commands.h"
 #include "config_paths.h"
 
@@ -65,7 +66,43 @@ int main(int argc, char* argv[]) {
             std::cerr << "Error: username required" << std::endl;
             return 1;
         }
-        return cmd_test(argv[2]);
+        
+        // Check for --auto-adjust flag
+        bool auto_adjust = false;
+        if (argc >= 4 && std::string(argv[3]) == "--auto-adjust") {
+            auto_adjust = true;
+        }
+        
+        return cmd_test(argv[2], auto_adjust);
+    }
+    
+    if (command == "image") {
+        if (argc < 3) {
+            std::cerr << "Error: image subcommand required" << std::endl;
+            std::cerr << "Usage: faceid image <subcommand> [options]" << std::endl;
+            std::cerr << "Subcommands:" << std::endl;
+            std::cerr << "  test --enroll <img> --test <img>  Test detection/recognition on images" << std::endl;
+            return 1;
+        }
+        
+        std::string subcmd = argv[2];
+        
+        if (subcmd == "test") {
+            std::vector<std::string> args;
+            for (int i = 3; i < argc; i++) {
+                args.push_back(argv[i]);
+            }
+            return cmd_test_image(args);
+        } else {
+            std::cerr << "Unknown image subcommand: " << subcmd << std::endl;
+            std::cerr << std::endl;
+            std::cerr << "Usage: faceid image <subcommand> [options]" << std::endl;
+            std::cerr << "Available subcommands:" << std::endl;
+            std::cerr << "  test --enroll <img> --test <img>  Test detection/recognition on images" << std::endl;
+            std::cerr << std::endl;
+            std::cerr << "Example: faceid image test --enroll single-face.jpg --test two-faces.jpg" << std::endl;
+            return 1;
+        }
     }
     
     if (command == "bench" || command == "benchmark") {
@@ -92,6 +129,17 @@ int main(int argc, char* argv[]) {
         }
         
         return cmd_bench(test_dir, show_detail);
+    }
+    
+    if (command == "use") {
+        if (argc < 3) {
+            std::cerr << "Error: absolute model path required" << std::endl;
+            std::cerr << "Usage: faceid use <absolute_path_to_model>" << std::endl;
+            std::cerr << "Example: faceid use /home/user/models/mnet-retinaface.param" << std::endl;
+            std::cerr << "         faceid use $(pwd)/models/sface_2021dec_int8bq.ncnn.param" << std::endl;
+            return 1;
+        }
+        return cmd_use(argv[2]);
     }
     
     std::cerr << "Unknown command: " << command << std::endl;

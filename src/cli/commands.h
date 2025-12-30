@@ -2,6 +2,7 @@
 #define FACEID_CLI_COMMANDS_H
 
 #include <string>
+#include <vector>
 
 namespace faceid {
 
@@ -66,10 +67,27 @@ int cmd_show();
  * Compares detected faces against ALL enrolled users and displays the matched username.
  * Green box = Match found, Red box = Unknown face
  *
+ * With --auto-adjust flag: automatically finds optimal detection confidence
+ * and recognition threshold based on enrolled samples, then updates config file.
+ *
  * @param username Optional username for running integrity checks (can be empty)
+ * @param auto_adjust If true, perform auto-optimization and update config
  * @return 0 on success, 1 on error
  */
-int cmd_test(const std::string& username);
+int cmd_test(const std::string& username, bool auto_adjust = false);
+
+/**
+ * Test face detection and recognition on static images
+ *
+ * Loads an enrollment image to use as reference, then detects all faces in a test image
+ * and compares each against the enrolled reference face. Reports detailed debug information
+ * including cosine distances, false positive rate, and threshold tuning recommendations.
+ * Useful for testing and debugging recognition thresholds without needing camera interaction.
+ *
+ * @param args Command arguments: [0] = enrollment image path, [1] = test image path
+ * @return 0 on success, 1 on error
+ */
+int cmd_test_image(const std::vector<std::string>& args);
 
 /**
  * Benchmark recognition models
@@ -82,6 +100,18 @@ int cmd_test(const std::string& username);
  * @return 0 on success, 1 on error
  */
 int cmd_bench(const std::string& test_dir, bool show_detail = false);
+
+/**
+ * Switch active model (detection or recognition)
+ * 
+ * Automatically detects if the model is for detection or recognition,
+ * backs up the current model, and symlinks the new model as detection.* or recognition.*
+ * 
+ * @param model_name Model name (with or without extension)
+ *                   Examples: "mnet-retinaface", "scrfd_500m-opt2.bin", "sface_2021dec_int8bq.ncnn"
+ * @return 0 on success, 1 on error
+ */
+int cmd_use(const std::string& model_name);
 
 /**
  * Print usage information and command help

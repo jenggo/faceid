@@ -8,6 +8,14 @@
 
 namespace faceid {
 
+// Camera format types
+enum CameraFormat {
+    FORMAT_UNKNOWN,
+    FORMAT_MJPEG,   // RGB camera - Motion JPEG compressed
+    FORMAT_GREY,    // IR camera - 8-bit grayscale
+    FORMAT_YUYV     // RGB camera - YUV 4:2:2 uncompressed
+};
+
 class Camera {
 public:
     Camera(const std::string& device_path = "/dev/video0");
@@ -39,6 +47,7 @@ private:
     
     tjhandle tjhandle_ = nullptr;
     bool streaming_ = false;
+    CameraFormat format_ = FORMAT_UNKNOWN;
 };
 
 } // namespace faceid

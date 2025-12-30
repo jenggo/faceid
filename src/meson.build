@@ -62,7 +62,9 @@ cli_sources = files(
     'cli/cmd_list.cpp',
     'cli/cmd_show.cpp',
     'cli/cmd_test.cpp',
+    'cli/cmd_test_image.cpp',
     'cli/cmd_bench.cpp',
+    'cli/cmd_use.cpp',
     'cli/cmd_help.cpp',
     'display.cpp'
 )

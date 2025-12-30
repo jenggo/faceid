@@ -7,13 +7,14 @@ Tested on T14 Gen4 Ryzen (Manjaro Plasma Wayland)
 ## Key Features
 
 - **Parallel Biometric Auth**: Face + fingerprint run simultaneously, first to succeed wins (~50-500ms)
-- **Fast Face Detection**: RetinaFace (MobileNet backbone, 74.90% faster than LibFaceDetection) + SFace (recognition)
+- **Fast Face Detection**: SCRFD/RetinaFace/YuNet (pluggable models) + multi-model recognition support
 - **Smart Lid Detection**: Skips biometric auth when lid closed, saves 5-second timeout
 - **Shoulder Surfing Detection**: Detects multiple faces and blanks screen if someone looks over your shoulder
 - **Live Camera Preview**: `faceid show` command displays real-time face detection visualization with SDL2 hardware acceleration
+- **Auto-Optimization**: Enrollment automatically finds optimal detection confidence and recognition threshold
 - **Single Binary**: C++20, no Python dependencies, low memory footprint (~50-100 MB)
 - **D-Bus Fingerprint**: Integrates with fprintd, uses existing enrollments
-- **Performance**: ~15ms face detection (RetinaFace), ~33ms recognition (SFace)
+- **Performance**: ~7-15ms face detection, ~20-33ms recognition (model-dependent)
 - **Comprehensive Logging**: Audit trail at `/var/log/faceid.log`
 - **PAM Compatible**: Works with sudo, login, lock screen, GDM, LightDM
 - **Zero OpenCV Dependencies**: 83% smaller binaries (3.3MB vs 20MB), specialized libraries for each task
@@ -34,13 +35,29 @@ make build && sudo make install
 
 ### Download Models
 
-**RetinaFace (Detection)**:
+**Detection Models** (choose one):
+
+**SCRFD (Recommended)**:
+```bash
+cd /etc/faceid/models
+sudo wget https://github.com/nihui/ncnn-assets/raw/master/models/scrfd_500m-opt2.{param,bin}
+```
+
+**RetinaFace**:
 ```bash
 cd /etc/faceid/models
 sudo wget https://github.com/nihui/ncnn-assets/raw/master/models/mnet.25-opt.{param,bin}
+sudo mv mnet.25-opt.param mnet-retinaface.param
+sudo mv mnet.25-opt.bin mnet-retinaface.bin
 ```
 
-**SFace (Recognition)** - convert from ONNX:
+**YuNet**:
+```bash
+cd /etc/faceid/models
+sudo wget https://github.com/nihui/ncnn-assets/raw/master/models/yunet_2023mar.ncnn.{param,bin}
+```
+
+**Recognition Models** (SFace - convert from ONNX):
 ```bash
 pip3 install pnnx
 cd /etc/faceid/models
@@ -107,8 +124,13 @@ sudo faceid add $(whoami)
 ### Enroll & Configure
 
 ```bash
-# Enroll face
+# Enroll face (auto-detects optimal settings)
 sudo faceid add $(whoami)
+# This automatically:
+# - Finds optimal detection confidence for your face
+# - Captures 5 diverse samples with guided prompts
+# - Calculates optimal recognition threshold
+# - Updates /etc/faceid/faceid.conf
 
 # Enroll fingerprint (optional)
 fprintd-enroll
@@ -124,11 +146,13 @@ sudo ls
 
 ```bash
 faceid devices              # List cameras
-faceid show                 # Live preview
+faceid show                 # Live preview with face detection
 faceid bench <directory>    # Benchmark recognition models
-sudo faceid add <user>      # Enroll face
-sudo faceid test <user>     # Test with timing
-sudo faceid list            # List users
+faceid image test           # Test with static images (auto-finds optimal thresholds)
+sudo faceid add <user>      # Enroll face (auto-optimizes settings)
+sudo faceid test <user>     # Test authentication with timing metrics
+sudo faceid list            # List enrolled users
+sudo faceid remove <user>   # Remove user enrollment
 ```
 
 ## Troubleshooting
@@ -142,10 +166,13 @@ sudo faceid list            # List users
 ## Configuration
 
 Edit `/etc/faceid/faceid.conf`:
-- `[recognition] threshold = 0.6` - Lower = stricter (default: 0.6)
+- `[recognition] threshold = 0.6` - Lower = stricter (auto-set during enrollment)
+- `[recognition] confidence = 0.5` - Detection confidence (auto-set during enrollment)
 - `[authentication] check_lid_state = true` - Skip auth when lid closed
 - `[no_peek]` - Screen blanking when multiple faces detected
 - `[logging] log_level = INFO` - View logs: `tail -f /var/log/faceid.log`
+
+**Note**: Values are automatically optimized during `faceid add` enrollment. Manual adjustment rarely needed.
 
 ## FAQ
 
@@ -157,11 +184,12 @@ Edit `/etc/faceid/faceid.conf`:
 
 ## Technical Details
 
-**Pipeline**: Lid check → parallel (RetinaFace+SFace | fprintd) → first success wins  
-**Detection**: RetinaFace MobileNet 0.25 (~15ms, multi-scale anchors, NCNN 4 threads)  
-**Recognition**: SFace MobileFaceNet (~33ms, 512D encodings)  
-**Performance**: ~48ms total face auth, ~50-100MB memory  
-**Storage**: Face models in `/etc/faceid/models/<user>.bin`, logs in `/var/log/faceid.log`
+**Pipeline**: Lid check → parallel (face detection + recognition | fprintd) → first success wins  
+**Detection Models**: SCRFD/RetinaFace/YuNet/UltraFace (pluggable, auto-detected from NCNN structure)  
+**Recognition Models**: SFace/MobileFaceNet/ArcFace variants (128D-512D encodings)  
+**Performance**: ~7-15ms detection (SCRFD fastest), ~20-33ms recognition, ~50-100MB memory  
+**Storage**: Face models in `/var/lib/faceid/faces/<user>.<faceid>.bin`, logs in `/var/log/faceid.log`  
+**Enrollment**: Binary search for optimal confidence (0.01 precision), 5 samples with 1s intervals, automatic threshold calculation
 
 **Zero OpenCV Stack**:
 - Camera: V4L2 + TurboJPEG (2x faster than cv::VideoCapture)
