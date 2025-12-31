@@ -176,11 +176,7 @@ static inline float findOptimalDetectionConfidence(Camera& camera, FaceDetector&
         std::cerr << "  Using default value (0.5 for " << detector.getDetectionModelType() << ")" << std::endl;
         
         // Set reasonable default based on model type
-        if (detector.getDetectionModelType() == "SCRFD" || detector.getDetectionModelType() == "UltraFace") {
-            found_confidence = 0.5f;
-        } else {
-            found_confidence = 0.8f;  // RetinaFace, YuNet
-        }
+        found_confidence = 0.8f;  // RetinaFace, YuNet, YOLOv5/v7/v8-Face
     }
     
     return found_confidence;

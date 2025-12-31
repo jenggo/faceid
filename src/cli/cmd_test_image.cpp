@@ -100,17 +100,10 @@ static bool encodeFaceFromImage(FaceDetector& detector, const std::string& image
 
     std::cout << "  Original size: " << frame.width() << "x" << frame.height() << std::endl;
     
-    // SCRFD does its own aspect-ratio preserving resize, so skip pre-resizing for SCRFD
-    faceid::Image resized_frame;
-    if (detector.getDetectionModelType() == "SCRFD") {
-        std::cout << "  Using original resolution (SCRFD handles its own resizing)" << std::endl;
-        resized_frame = frame.clone();
-    } else {
-        // Other models need pre-resizing to camera resolution
-        resized_frame = resizeImage(frame, target_width, target_height);
-        std::cout << "  Resized to: " << resized_frame.width() << "x" << resized_frame.height() 
-                  << " (camera resolution)" << std::endl;
-    }
+    // Resize to camera resolution for consistent detection
+    faceid::Image resized_frame = resizeImage(frame, target_width, target_height);
+    std::cout << "  Resized to: " << resized_frame.width() << "x" << resized_frame.height() 
+              << " (camera resolution)" << std::endl;
 
     // Preprocess and detect faces
     faceid::Image processed_frame = detector.preprocessFrame(resized_frame.view());
@@ -191,13 +184,8 @@ static float testDetectionConfidence(FaceDetector& detector, const std::string& 
         return -1.0f;
     }
     
-    // SCRFD does its own resizing, others need pre-resize
-    faceid::Image resized_frame;
-    if (detector.getDetectionModelType() == "SCRFD") {
-        resized_frame = frame.clone();
-    } else {
-        resized_frame = resizeImage(frame, target_width, target_height);
-    }
+    // Resize to camera resolution for consistent detection
+    faceid::Image resized_frame = resizeImage(frame, target_width, target_height);
     
     faceid::Image processed_frame = detector.preprocessFrame(resized_frame.view());
     
@@ -377,7 +365,7 @@ int cmd_test_image(const std::vector<std::string>& args) {
         std::cerr << "  --test <image>         Image with faces to test against reference" << std::endl;
         std::cerr << "  --confidence <0.0-1.0> Detection confidence threshold (default: from config)" << std::endl;
         std::cerr << "                         Higher values = stricter detection, fewer false positives" << std::endl;
-        std::cerr << "                         RetinaFace/YuNet: 0.8 recommended, SCRFD/UltraFace: 0.5" << std::endl;
+        std::cerr << "                         RetinaFace/YuNet/YOLO-Face: 0.8 recommended" << std::endl;
         std::cerr << "  --verbose, -v          Show detailed analysis and debug information" << std::endl;
         std::cerr << std::endl;
         std::cerr << "Example: faceid image test --enroll single-face.jpg --test two-faces.jpg --confidence 0.9" << std::endl;
@@ -476,17 +464,10 @@ int cmd_test_image(const std::vector<std::string>& args) {
     std::cout << "✓ Test image loaded" << std::endl;
     std::cout << "  Original size: " << test_frame.width() << "x" << test_frame.height() << std::endl;
     
-    // SCRFD does its own resizing, others need pre-resize
-    faceid::Image resized_test;
-    if (detector.getDetectionModelType() == "SCRFD") {
-        std::cout << "  Using original resolution (SCRFD handles its own resizing)" << std::endl;
-        resized_test = test_frame.clone();
-    } else {
-        // Resize to camera resolution for consistent face detection
-        resized_test = resizeImage(test_frame, camera_width, camera_height);
-        std::cout << "  Resized to: " << resized_test.width() << "x" << resized_test.height() 
-                  << " (camera resolution)" << std::endl;
-    }
+    // Resize to camera resolution for consistent detection
+    faceid::Image resized_test = resizeImage(test_frame, camera_width, camera_height);
+    std::cout << "  Resized to: " << resized_test.width() << "x" << resized_test.height() 
+              << " (camera resolution)" << std::endl;
     std::cout << std::endl;
 
     // Step 3: Detect faces
@@ -684,10 +665,7 @@ int cmd_test_image(const std::vector<std::string>& args) {
         
         // Also show the confidence recommendation from earlier
         std::string model_type = detector.getDetectionModelType();
-        float recommended_confidence = 0.8f;  // Default for RetinaFace/YuNet
-        if (model_type == "SCRFD" || model_type == "UltraFace") {
-            recommended_confidence = 0.5f;
-        }
+        float recommended_confidence = 0.8f;  // Default for all supported models
         
         // Use the optimal confidence found earlier if available
         if (optimal_detection_confidence > 0.0f) {

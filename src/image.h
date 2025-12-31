@@ -18,6 +18,7 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <vector>
 #include <cstring>
 #include <stdexcept>
 #include <algorithm>
@@ -28,10 +29,24 @@ namespace faceid {
 class Image;
 class ImageView;
 
-// ========== Rect: Bounding Rectangle ==========
+// ========== Point: 2D Point ==========
+
+struct Point {
+    float x, y;
+    
+    constexpr Point() noexcept : x(0), y(0) {}
+    constexpr Point(float x_, float y_) noexcept : x(x_), y(y_) {}
+    constexpr Point(int x_, int y_) noexcept : x(static_cast<float>(x_)), y(static_cast<float>(y_)) {}
+};
+
+// ========== Rect: Bounding Rectangle with Optional Landmarks ==========
 
 struct Rect {
     int x, y, width, height;
+    
+    // Facial landmarks (optional - populated by some detectors)
+    // Standard 5-point landmarks: [0]=left_eye, [1]=right_eye, [2]=nose, [3]=left_mouth, [4]=right_mouth
+    std::vector<Point> landmarks;
     
     constexpr Rect() noexcept : x(0), y(0), width(0), height(0) {}
     constexpr Rect(int x_, int y_, int w, int h) noexcept 
@@ -63,6 +78,11 @@ struct Rect {
     
     constexpr int centerY() const noexcept { 
         return y + height / 2; 
+    }
+    
+    // Check if landmarks are available
+    bool hasLandmarks() const noexcept {
+        return !landmarks.empty();
     }
 };
 

@@ -25,8 +25,6 @@ core_sources = files(
     'models/model_cache.cpp',
     'detectors/retinaface.cpp',
     'detectors/yunet.cpp',
-    'detectors/scrfd.cpp',
-    'detectors/ultraface.cpp',
     'detectors/yolo.cpp',
 )
 

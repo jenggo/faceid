@@ -27,6 +27,7 @@ std::vector<Rect> detectWithYuNet(ncnn::Net& net, const ncnn::Mat& in, int img_w
     std::vector<FaceObject> proposals;
     
     // Extract all 12 outputs (3 scales × 4 types)
+    // kpss = keypoints (5 points: 2 eyes, nose, 2 mouth corners)
     std::vector<ncnn::Mat> cls_scores(3), obj_scores(3), bboxes(3), kpss(3);
     for (int i = 0; i < 3; i++) {
         ex.extract(("out" + std::to_string(i)).c_str(), cls_scores[i]);
@@ -42,6 +43,7 @@ std::vector<Rect> detectWithYuNet(ncnn::Net& net, const ncnn::Mat& in, int img_w
         const ncnn::Mat& cls = cls_scores[scale_idx];
         const ncnn::Mat& obj = obj_scores[scale_idx];
         const ncnn::Mat& bbox = bboxes[scale_idx];
+        const ncnn::Mat& kps = kpss[scale_idx];
         
         // YuNet outputs are flattened - reshape to proper grid
         int total_elements = cls.w * cls.h;
@@ -101,6 +103,26 @@ std::vector<Rect> detectWithYuNet(ncnn::Net& net, const ncnn::Mat& in, int img_w
                     faceobj.rect.width = box_w;
                     faceobj.rect.height = box_h;
                     faceobj.prob = score;
+                    
+                    // Decode 5-point landmarks (2 eyes, nose, 2 mouth corners)
+                    // YuNet outputs landmarks in normalized format relative to the feature map
+                    // Data layout: (w=10, h=grid_size, c=1) - row-major with 10 values per cell
+                    const float* kps_ptr = (const float*)kps.data;
+                    for (int k = 0; k < 5; k++) {
+                        float kps_x_raw = kps_ptr[idx * 10 + k * 2];
+                        float kps_y_raw = kps_ptr[idx * 10 + k * 2 + 1];
+                        
+                        // Use grid cell + offset interpretation
+                        float kps_x = (j + kps_x_raw) * stride;
+                        float kps_y = (i + kps_y_raw) * stride;
+                        
+                        // Clip to image bounds
+                        kps_x = std::max(0.0f, std::min((float)img_w, kps_x));
+                        kps_y = std::max(0.0f, std::min((float)img_h, kps_y));
+                        
+                        faceobj.rect.landmarks.push_back(Point(kps_x, kps_y));
+                    }
+                    
                     proposals.push_back(faceobj);
                 }
             }
@@ -132,6 +154,7 @@ std::vector<Rect> detectWithYuNet(ncnn::Net& net, const ncnn::Mat& in, int img_w
         r.y = (int)best->rect.y;
         r.width = (int)best->rect.width;
         r.height = (int)best->rect.height;
+        r.landmarks = best->rect.landmarks;  // Copy landmarks
         faces.push_back(r);
     }
     

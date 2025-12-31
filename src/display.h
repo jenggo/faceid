@@ -136,6 +136,37 @@ inline void drawPixel(faceid::Image& img, int x, int y, const Color& color) {
     }
 }
 
+// Helper: Draw filled circle (for facial landmarks)
+inline void drawCircle(faceid::Image& img, int cx, int cy, int radius, const Color& color) {
+    int x = 0;
+    int y = radius;
+    int d = 3 - 2 * radius;
+    
+    auto drawCirclePoints = [&](int xc, int yc, int x, int y) {
+        // Fill horizontal lines for solid circle
+        for (int i = cx - x; i <= cx + x; i++) {
+            drawPixel(img, i, cy + y, color);
+            drawPixel(img, i, cy - y, color);
+        }
+        for (int i = cx - y; i <= cx + y; i++) {
+            drawPixel(img, i, cy + x, color);
+            drawPixel(img, i, cy - x, color);
+        }
+    };
+    
+    drawCirclePoints(cx, cy, x, y);
+    while (y >= x) {
+        x++;
+        if (d > 0) {
+            y--;
+            d = d + 4 * (x - y) + 10;
+        } else {
+            d = d + 4 * x + 6;
+        }
+        drawCirclePoints(cx, cy, x, y);
+    }
+}
+
 // Helper: Draw horizontal line
 void drawHLine(faceid::Image& img, int x1, int x2, int y, const Color& color);
 

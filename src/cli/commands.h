@@ -97,9 +97,10 @@ int cmd_test_image(const std::vector<std::string>& args);
  * 
  * @param test_dir Directory containing model files to benchmark
  * @param show_detail If true, shows detailed per-model testing output
+ * @param custom_image_path Optional path to custom test image (uses embedded image if empty)
  * @return 0 on success, 1 on error
  */
-int cmd_bench(const std::string& test_dir, bool show_detail = false);
+int cmd_bench(const std::string& test_dir, bool show_detail = false, const std::string& custom_image_path = "");
 
 /**
  * Switch active model (detection or recognition)
@@ -108,7 +109,7 @@ int cmd_bench(const std::string& test_dir, bool show_detail = false);
  * backs up the current model, and symlinks the new model as detection.* or recognition.*
  * 
  * @param model_name Model name (with or without extension)
- *                   Examples: "mnet-retinaface", "scrfd_500m-opt2.bin", "sface_2021dec_int8bq.ncnn"
+ *                   Examples: "mnet-retinaface", "yunet", "sface_2021dec_int8bq.ncnn"
  * @return 0 on success, 1 on error
  */
 int cmd_use(const std::string& model_name);

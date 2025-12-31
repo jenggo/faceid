@@ -31,7 +31,8 @@ void print_usage() {
     std::cout << "  faceid remove jenggo                                # Remove ALL faces for jenggo" << std::endl;
     std::cout << "  faceid show                                         # Live camera preview with detection" << std::endl;
     std::cout << "  faceid image test --enroll a.jpg --test b.jpg       # Test recognition on static images" << std::endl;
-    std::cout << "  faceid bench /tmp/models                            # Benchmark all models in /tmp/models" << std::endl;
+    std::cout << "  faceid bench /tmp/models                            # Benchmark models (uses embedded image)" << std::endl;
+    std::cout << "  faceid bench --image face.jpg /tmp/models           # Benchmark with custom test image" << std::endl;
     std::cout << "  faceid use $(pwd)/models/mnet-retinaface.param      # Switch to RetinaFace detection model" << std::endl;
     std::cout << "  faceid use /path/to/sface_2021dec_int8bq.ncnn.param # Switch to SFace recognition model" << std::endl;
 }

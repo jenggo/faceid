@@ -108,27 +108,41 @@ int main(int argc, char* argv[]) {
     if (command == "bench" || command == "benchmark") {
         if (argc < 3) {
             std::cerr << "Error: model directory required" << std::endl;
-            std::cerr << "Usage: faceid bench [--detail] <model_directory>" << std::endl;
+            std::cerr << "Usage: faceid bench [--detail] [--image <path>] <model_directory>" << std::endl;
             std::cerr << "Example: faceid bench /tmp/models" << std::endl;
             std::cerr << "         faceid bench --detail /tmp/models" << std::endl;
+            std::cerr << "         faceid bench --image /path/to/test.jpg /tmp/models" << std::endl;
+            std::cerr << "         faceid bench --detail --image test.jpg /tmp/models" << std::endl;
             return 1;
         }
         
-        // Check for --detail flag
+        // Parse flags and arguments
         bool show_detail = false;
+        std::string custom_image_path;
         std::string test_dir;
         
-        if (argc >= 4 && std::string(argv[2]) == "--detail") {
-            show_detail = true;
-            test_dir = argv[3];
-        } else if (argc >= 4 && std::string(argv[3]) == "--detail") {
-            show_detail = true;
-            test_dir = argv[2];
-        } else {
-            test_dir = argv[2];
+        for (int i = 2; i < argc; i++) {
+            std::string arg = argv[i];
+            if (arg == "--detail") {
+                show_detail = true;
+            } else if (arg == "--image") {
+                if (i + 1 < argc) {
+                    custom_image_path = argv[++i];
+                } else {
+                    std::cerr << "Error: --image requires a path argument" << std::endl;
+                    return 1;
+                }
+            } else if (test_dir.empty()) {
+                test_dir = arg;
+            }
         }
         
-        return cmd_bench(test_dir, show_detail);
+        if (test_dir.empty()) {
+            std::cerr << "Error: model directory required" << std::endl;
+            return 1;
+        }
+        
+        return cmd_bench(test_dir, show_detail, custom_image_path);
     }
     
     if (command == "use") {

@@ -163,7 +163,7 @@ int cmd_use(const std::string& model_path) {
         std::cerr << std::endl;
         std::cerr << "Example with absolute path:" << std::endl;
         std::cerr << "  faceid use /home/user/models/mnet-retinaface.param" << std::endl;
-        std::cerr << "  faceid use $(pwd)/models/scrfd_500m-opt2.param" << std::endl;
+        std::cerr << "  faceid use $(pwd)/models/yunet.param" << std::endl;
         return 1;
     }
     

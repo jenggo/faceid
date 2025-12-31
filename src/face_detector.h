@@ -17,8 +17,6 @@ using FaceEncoding = std::vector<float>;
 enum class DetectionModelType {
     RETINAFACE,   // RetinaFace (mnet.25-opt): input="data", outputs=face_rpn_*
     YUNET,        // YuNet: input="in0", 12 outputs (out0-out11)
-    ULTRAFACE,    // UltraFace/RFB-320: input="in0", 2 outputs (out0, out1)
-    SCRFD,        // SCRFD: input="input.1", 6-9 outputs (score_*/bbox_*/kps_*)
     YOLOV5,       // YOLOv5-Face: input="data", outputs="981", "983", "985"
     YOLOV7,       // YOLOv7-Face: input="images", outputs="stride_8", "stride_16", "stride_32"
     YOLOV8,       // YOLOv8-Face: input="images", outputs="output0", "1076", "1084"
@@ -91,8 +89,6 @@ public:
         switch (detection_model_type_) {
             case DetectionModelType::RETINAFACE: return "RetinaFace";
             case DetectionModelType::YUNET: return "YuNet";
-            case DetectionModelType::ULTRAFACE: return "UltraFace/RFB-320";
-            case DetectionModelType::SCRFD: return "SCRFD";
             case DetectionModelType::YOLOV5: return "YOLOv5-Face";
             case DetectionModelType::YOLOV7: return "YOLOv7-Face";
             case DetectionModelType::YOLOV8: return "YOLOv8-Face";
@@ -149,6 +145,14 @@ public:
     
     // Helper: Auto-detect detection model type from param file
     DetectionModelType detectModelType(const std::string& param_path);
+    
+    // Helper: Deduplicate faces based on encoding similarity
+    // Returns indices of unique faces (filters out duplicates of the same person)
+    static std::vector<size_t> deduplicateFaces(
+        const std::vector<Rect>& faces,
+        const std::vector<FaceEncoding>& encodings,
+        double similarity_threshold = 0.15  // Faces with distance < 0.15 are considered same person
+    );
 
 private:
     // NCNN networks
@@ -194,9 +198,6 @@ private:
     // Detection decoders for different model types
     std::vector<Rect> detectWithRetinaFace(const ncnn::Mat& in, int img_w, int img_h, float confidence_threshold = 0.0f);
     std::vector<Rect> detectWithYuNet(const ncnn::Mat& in, int img_w, int img_h, float confidence_threshold = 0.0f);
-    std::vector<Rect> detectWithUltraFace(const ncnn::Mat& in, int img_w, int img_h, float confidence_threshold = 0.0f);
-    std::vector<Rect> detectWithSCRFD(const ncnn::Mat& in, int img_w, int img_h, float confidence_threshold, 
-                                      float scale, int wpad, int hpad, int orig_w, int orig_h);
 };
 
 } // namespace faceid

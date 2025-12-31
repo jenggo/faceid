@@ -26,9 +26,10 @@ std::vector<Rect> detectWithRetinaFace(ncnn::Net& net, const ncnn::Mat& in, int 
     
     // stride 32
     {
-        ncnn::Mat score_blob, bbox_blob;
+        ncnn::Mat score_blob, bbox_blob, landmark_blob;
         ex.extract("face_rpn_cls_prob_reshape_stride32", score_blob);
         ex.extract("face_rpn_bbox_pred_stride32", bbox_blob);
+        ex.extract("face_rpn_landmark_pred_stride32", landmark_blob);
         
         const int base_size = 16;
         const int feat_stride = 32;
@@ -40,15 +41,16 @@ std::vector<Rect> detectWithRetinaFace(ncnn::Net& net, const ncnn::Mat& in, int 
         ncnn::Mat anchors = generate_anchors(base_size, ratios, scales);
         
         std::vector<FaceObject> faceobjects32;
-        generate_proposals(anchors, feat_stride, score_blob, bbox_blob, prob_threshold, faceobjects32);
+        generate_proposals(anchors, feat_stride, score_blob, bbox_blob, prob_threshold, faceobjects32, landmark_blob);
         faceproposals.insert(faceproposals.end(), faceobjects32.begin(), faceobjects32.end());
     }
     
     // stride 16
     {
-        ncnn::Mat score_blob, bbox_blob;
+        ncnn::Mat score_blob, bbox_blob, landmark_blob;
         ex.extract("face_rpn_cls_prob_reshape_stride16", score_blob);
         ex.extract("face_rpn_bbox_pred_stride16", bbox_blob);
+        ex.extract("face_rpn_landmark_pred_stride16", landmark_blob);
         
         const int base_size = 16;
         const int feat_stride = 16;
@@ -60,15 +62,16 @@ std::vector<Rect> detectWithRetinaFace(ncnn::Net& net, const ncnn::Mat& in, int 
         ncnn::Mat anchors = generate_anchors(base_size, ratios, scales);
         
         std::vector<FaceObject> faceobjects16;
-        generate_proposals(anchors, feat_stride, score_blob, bbox_blob, prob_threshold, faceobjects16);
+        generate_proposals(anchors, feat_stride, score_blob, bbox_blob, prob_threshold, faceobjects16, landmark_blob);
         faceproposals.insert(faceproposals.end(), faceobjects16.begin(), faceobjects16.end());
     }
     
     // stride 8
     {
-        ncnn::Mat score_blob, bbox_blob;
+        ncnn::Mat score_blob, bbox_blob, landmark_blob;
         ex.extract("face_rpn_cls_prob_reshape_stride8", score_blob);
         ex.extract("face_rpn_bbox_pred_stride8", bbox_blob);
+        ex.extract("face_rpn_landmark_pred_stride8", landmark_blob);
         
         const int base_size = 16;
         const int feat_stride = 8;
@@ -80,7 +83,7 @@ std::vector<Rect> detectWithRetinaFace(ncnn::Net& net, const ncnn::Mat& in, int 
         ncnn::Mat anchors = generate_anchors(base_size, ratios, scales);
         
         std::vector<FaceObject> faceobjects8;
-        generate_proposals(anchors, feat_stride, score_blob, bbox_blob, prob_threshold, faceobjects8);
+        generate_proposals(anchors, feat_stride, score_blob, bbox_blob, prob_threshold, faceobjects8, landmark_blob);
         faceproposals.insert(faceproposals.end(), faceobjects8.begin(), faceobjects8.end());
     }
     
@@ -110,6 +113,14 @@ std::vector<Rect> detectWithRetinaFace(ncnn::Net& net, const ncnn::Mat& in, int 
         obj.rect.y = (int)y0;
         obj.rect.width = (int)(x1 - x0);
         obj.rect.height = (int)(y1 - y0);
+        
+        // Clip landmarks to image bounds
+        if (obj.rect.hasLandmarks()) {
+            for (Point& pt : obj.rect.landmarks) {
+                pt.x = std::max(std::min(pt.x, (float)img_w - 1), 0.f);
+                pt.y = std::max(std::min(pt.y, (float)img_h - 1), 0.f);
+            }
+        }
         
         // Only check for valid dimensions
         if (obj.rect.width > 0 && obj.rect.height > 0) {

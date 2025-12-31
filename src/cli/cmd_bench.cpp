@@ -1,4 +1,5 @@
 #include "cli_common.h"
+#include "embedded_test_image.h"
 #include <iostream>
 #include <chrono>
 #include <vector>
@@ -16,6 +17,7 @@
 // We just need to declare the functions we use
 extern "C" {
     unsigned char *stbi_load(char const *filename, int *x, int *y, int *comp, int req_comp);
+    unsigned char *stbi_load_from_memory(unsigned char const *buffer, int len, int *x, int *y, int *comp, int req_comp);
     void stbi_image_free(void *retval_from_stbi_load);
 }
 
@@ -225,7 +227,7 @@ static float findOptimalRecognitionThreshold(FaceDetector& detector, const Image
     return optimal_threshold;
 }
 
-int cmd_bench(const std::string& test_dir, bool show_detail) {
+int cmd_bench(const std::string& test_dir, bool show_detail, const std::string& custom_image_path) {
     std::cout << "=== FaceID Model Benchmark ===" << std::endl;
     std::cout << "Scanning directory: " << test_dir << "\n" << std::endl;
     
@@ -318,25 +320,53 @@ int cmd_bench(const std::string& test_dir, bool show_detail) {
     // Initialize camera
     std::cout << "\n=== Loading Test Image ===" << std::endl;
     
-    // Try to load static test image first
-    std::string test_image_path = test_dir + "/face-test/single-face.jpg";
     Image test_frame;
-    bool using_static_image = false;
+    std::string image_source;
     
     // Try to load with stb_image
     int img_w, img_h, channels;
-    unsigned char* img_data = stbi_load(test_image_path.c_str(), &img_w, &img_h, &channels, 3);
+    unsigned char* img_data = nullptr;
     
-    if (img_data) {
-        std::cout << "Loaded test image: " << test_image_path << " (" << img_w << "x" << img_h << ")" << std::endl;
-        test_frame = Image(img_w, img_h, 3);
-        memcpy(test_frame.data(), img_data, img_w * img_h * 3);
-        stbi_image_free(img_data);
-        using_static_image = true;
-    } else {
-        std::cout << "Static test image not found, using camera..." << std::endl;
+    // Priority 1: Custom image provided via --image
+    if (!custom_image_path.empty()) {
+        img_data = stbi_load(custom_image_path.c_str(), &img_w, &img_h, &channels, 3);
+        if (img_data) {
+            image_source = custom_image_path;
+            std::cout << "Loaded custom test image: " << custom_image_path << " (" << img_w << "x" << img_h << ")" << std::endl;
+        } else {
+            std::cerr << "Error: Failed to load custom image: " << custom_image_path << std::endl;
+            return 1;
+        }
+    }
+    
+    // Priority 2: Try to load from models directory
+    if (!img_data) {
+        std::string test_image_path = test_dir + "/face-test/single-face.jpg";
+        img_data = stbi_load(test_image_path.c_str(), &img_w, &img_h, &channels, 3);
+        if (img_data) {
+            image_source = test_image_path;
+            std::cout << "Loaded test image from models directory: " << test_image_path << " (" << img_w << "x" << img_h << ")" << std::endl;
+        }
+    }
+    
+    // Priority 3: Use embedded test image
+    if (!img_data) {
+        std::cout << "No external test image found, using embedded test image..." << std::endl;
+        img_data = stbi_load_from_memory(
+            models_face_test_single_face_jpg, 
+            models_face_test_single_face_jpg_len, 
+            &img_w, &img_h, &channels, 3
+        );
+        if (img_data) {
+            image_source = "embedded image (853x480)";
+            std::cout << "Loaded embedded test image: " << img_w << "x" << img_h << std::endl;
+        }
+    }
+    
+    // Priority 4: Fall back to camera
+    if (!img_data) {
+        std::cout << "No test images available, using camera..." << std::endl;
         
-        // Fall back to camera capture
         // Get camera settings from config
         Config& config = Config::getInstance();
         auto device = config.getString("camera", "device").value_or("/dev/video0");
@@ -347,8 +377,8 @@ int cmd_bench(const std::string& test_dir, bool show_detail) {
         Camera camera(device);
         if (!camera.open(width, height)) {
             std::cerr << "Error: Failed to open camera" << std::endl;
-            std::cerr << "Please ensure your camera is connected or provide test image at:" << std::endl;
-            std::cerr << "  " << test_image_path << std::endl;
+            std::cerr << "\nTip: Provide a test image using:" << std::endl;
+            std::cerr << "  faceid bench --image /path/to/face.jpg " << test_dir << std::endl;
             return 1;
         }
         
@@ -358,6 +388,12 @@ int cmd_bench(const std::string& test_dir, bool show_detail) {
             return 1;
         }
         camera.close();
+        image_source = "camera capture";
+    } else {
+        // Load image data into Image object
+        test_frame = Image(img_w, img_h, 3);
+        memcpy(test_frame.data(), img_data, img_w * img_h * 3);
+        stbi_image_free(img_data);
     }
     
     std::cout << "Test frame: " << test_frame.width() << "x" << test_frame.height() 
@@ -390,10 +426,10 @@ int cmd_bench(const std::string& test_dir, bool show_detail) {
             Image processed = test_detector.preprocessFrame(test_frame.view());
             auto test_faces = test_detector.detectFaces(processed.view());
             if (test_faces.empty()) {
-                std::cerr << "\nWARNING: No faces detected in captured frame with installed model!" << std::endl;
+                std::cerr << "\nWARNING: No faces detected in test image with installed model!" << std::endl;
                 std::cerr << "This usually means:" << std::endl;
-                std::cerr << "  1. No face visible in camera view" << std::endl;
-                std::cerr << "  2. Frame is too dark" << std::endl;
+                std::cerr << "  1. No face visible in the image" << std::endl;
+                std::cerr << "  2. Image is too dark or low quality" << std::endl;
                 std::cerr << "  3. Detection threshold is too high" << std::endl;
                 std::cerr << "\nBenchmark will likely show all failures.\n" << std::endl;
             } else {
@@ -402,9 +438,6 @@ int cmd_bench(const std::string& test_dir, bool show_detail) {
             }
         }
     }
-    
-    std::cout << "Using " << (using_static_image ? "static test image" : "captured frame") 
-              << " for all benchmarks (more consistent results)\n" << std::endl;
     
     // Benchmark detection models first
     if (!detection_models.empty()) {
@@ -917,18 +950,8 @@ int cmd_bench(const std::string& test_dir, bool show_detail) {
     
     std::cout << "Benchmark complete!" << std::endl;
     
-    if (!detection_models.empty()) {
-        std::cout << "\nTo install a detection model:" << std::endl;
-        std::cout << "  sudo cp " << test_dir << "/<model>.param /etc/faceid/models/detection.param" << std::endl;
-        std::cout << "  sudo cp " << test_dir << "/<model>.bin /etc/faceid/models/detection.bin" << std::endl;
-    }
-    
-    if (!recognition_models.empty()) {
-        std::cout << "\nTo install a recognition model:" << std::endl;
-        std::cout << "  sudo cp " << test_dir << "/<model>.ncnn.param /etc/faceid/models/recognition.param" << std::endl;
-        std::cout << "  sudo cp " << test_dir << "/<model>.ncnn.bin /etc/faceid/models/recognition.bin" << std::endl;
-        std::cout << "  sudo faceid add $(whoami)  # Re-enroll after changing models" << std::endl;
-    }
+    std::cout << "\nTo install a model:" << std::endl;
+    std::cout << "  sudo faceid use " << test_dir << "/<model_file>" << std::endl;
     
     return 0;
 }

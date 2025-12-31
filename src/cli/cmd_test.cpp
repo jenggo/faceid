@@ -697,26 +697,73 @@ int cmd_test(const std::string& username, bool auto_adjust) {
 
         if (!faces.empty()) {
             auto encodings = detector.encodeFaces(processed_frame.view(), faces);
+            
+            // Deduplicate faces - filter out multiple detections of the same person
+            // This prevents false positives from the same face detected at different angles/positions
+            auto unique_indices = FaceDetector::deduplicateFaces(faces, encodings, 0.15);
+            
+            // Filter faces and encodings to only unique ones
+            std::vector<Rect> unique_faces;
+            std::vector<FaceEncoding> unique_encodings;
+            for (size_t idx : unique_indices) {
+                if (idx < faces.size() && idx < encodings.size()) {
+                    unique_faces.push_back(faces[idx]);
+                    unique_encodings.push_back(encodings[idx]);
+                }
+            }
+            
+            // Replace original faces/encodings with deduplicated ones
+            faces = unique_faces;
+            encodings = unique_encodings;
+            
+            // Update matched arrays to match new size
+            matched_names.resize(faces.size(), "");
+            matched_distances.resize(faces.size(), 999.0);
 
             // Match each face against all enrolled users
             for (size_t i = 0; i < encodings.size() && i < faces.size(); i++) {
                 double best_distance = 999.0;
+                double second_best_distance = 999.0;
                 std::string best_match = "";
+                std::string second_best_match = "";
 
                 // Compare with all users
                 for (const auto& model : all_models) {
                     for (const auto& stored_encoding : model.encodings) {
                         double distance = detector.compareFaces(stored_encoding, encodings[i]);
                         if (distance < best_distance) {
+                            // Shift best to second best
+                            second_best_distance = best_distance;
+                            second_best_match = best_match;
+                            // Update best
                             best_distance = distance;
                             best_match = model.username;
+                        } else if (distance < second_best_distance) {
+                            // Update second best
+                            second_best_distance = distance;
+                            second_best_match = model.username;
                         }
                     }
                 }
 
                 matched_distances[i] = best_distance;
-                if (best_distance < threshold) {
+                
+                // Only accept match if:
+                // 1. Best distance is below threshold
+                // 2. For safety: if multiple users, ensure there's a margin between best and second best
+                bool is_unique_match = true;
+                
+                // Check uniqueness only if we have a second match from a DIFFERENT user
+                if (!second_best_match.empty() && second_best_match != best_match && second_best_distance < 999.0) {
+                    const double MARGIN = 0.05; // 5% margin to ensure clear winner
+                    is_unique_match = (second_best_distance - best_distance) > MARGIN;
+                }
+                
+                if (best_distance < threshold && is_unique_match) {
                     matched_names[i] = best_match;
+                } else if (best_distance < threshold && !is_unique_match) {
+                    // Ambiguous match - too close to multiple users
+                    matched_names[i] = ""; // Reject match
                 }
             }
         }
@@ -744,6 +791,25 @@ int cmd_test(const std::string& username, bool auto_adjust) {
             // Draw rectangle at ORIGINAL position (SDL will flip it correctly)
             faceid::drawRectangle(display_frame, face.x, face.y,
                                  face.width, face.height, color, 2);
+
+            // Draw facial landmarks if available (5-point landmarks from YOLO/YuNet)
+            if (face.hasLandmarks()) {
+                // Define colors for each landmark
+                faceid::Color landmark_colors[] = {
+                    faceid::Color(0, 255, 255),    // Left eye - Cyan
+                    faceid::Color(0, 255, 255),    // Right eye - Cyan  
+                    faceid::Color(255, 0, 0),      // Nose - Blue
+                    faceid::Color(255, 0, 255),    // Left mouth - Magenta
+                    faceid::Color(255, 0, 255)     // Right mouth - Magenta
+                };
+                
+                for (size_t j = 0; j < face.landmarks.size() && j < 5; j++) {
+                    const auto& pt = face.landmarks[j];
+                    int px = static_cast<int>(pt.x);
+                    int py = static_cast<int>(pt.y);
+                    faceid::drawCircle(display_frame, px, py, 3, landmark_colors[j]);
+                }
+            }
 
             // Reverse text for SDL horizontal flip and position it above the box
             std::reverse(label.begin(), label.end());

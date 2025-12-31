@@ -7,10 +7,12 @@ Tested on T14 Gen4 Ryzen (Manjaro Plasma Wayland)
 ## Key Features
 
 - **Parallel Biometric Auth**: Face + fingerprint run simultaneously, first to succeed wins (~50-500ms)
-- **Fast Face Detection**: SCRFD/RetinaFace/YuNet (pluggable models) + multi-model recognition support
+- **Fast Face Detection**: RetinaFace/YuNet/YOLO (pluggable models) + multi-model recognition support
+- **Facial Landmarks**: Real-time visualization of 5-point landmarks (eyes, nose, mouth) in preview and test modes
+- **Smart Face Matching**: Deduplicates multiple detections and validates uniqueness with margin check to prevent false positives
 - **Smart Lid Detection**: Skips biometric auth when lid closed, saves 5-second timeout
 - **Shoulder Surfing Detection**: Detects multiple faces and blanks screen if someone looks over your shoulder
-- **Live Camera Preview**: `faceid show` command displays real-time face detection visualization with SDL2 hardware acceleration
+- **Live Camera Preview**: `faceid show` command displays real-time face detection with landmarks and SDL2 hardware acceleration
 - **Auto-Optimization**: Enrollment automatically finds optimal detection confidence and recognition threshold
 - **Single Binary**: C++20, no Python dependencies, low memory footprint (~50-100 MB)
 - **D-Bus Fingerprint**: Integrates with fprintd, uses existing enrollments
@@ -37,13 +39,7 @@ make build && sudo make install
 
 **Detection Models** (choose one):
 
-**SCRFD (Recommended)**:
-```bash
-cd /etc/faceid/models
-sudo wget https://github.com/nihui/ncnn-assets/raw/master/models/scrfd_500m-opt2.{param,bin}
-```
-
-**RetinaFace**:
+**RetinaFace (Recommended for accuracy)**:
 ```bash
 cd /etc/faceid/models
 sudo wget https://github.com/nihui/ncnn-assets/raw/master/models/mnet.25-opt.{param,bin}
@@ -51,10 +47,18 @@ sudo mv mnet.25-opt.param mnet-retinaface.param
 sudo mv mnet.25-opt.bin mnet-retinaface.bin
 ```
 
-**YuNet**:
+**YuNet (Good balance)**:
 ```bash
 cd /etc/faceid/models
 sudo wget https://github.com/nihui/ncnn-assets/raw/master/models/yunet_2023mar.ncnn.{param,bin}
+```
+
+**YOLOv8-Face (Fast)**:
+```bash
+cd /etc/faceid/models
+# Download YOLOv8-Face NCNN models from github.com/derronqi/yolov8-face
+sudo wget <yolov8-face.param> -O yolov8-face.param
+sudo wget <yolov8-face.bin> -O yolov8-face.bin
 ```
 
 **Recognition Models** (SFace - convert from ONNX):
@@ -76,6 +80,9 @@ FaceID supports multiple recognition models with different trade-offs between sp
 # Download test models to /tmp/models/
 # Then benchmark them:
 faceid bench /tmp/models
+
+# Or with a custom test image:
+faceid bench --image face.jpg /tmp/models
 ```
 
 #### Performance Comparison
@@ -129,7 +136,8 @@ sudo faceid add $(whoami)
 # This automatically:
 # - Finds optimal detection confidence for your face
 # - Captures 5 diverse samples with guided prompts
-# - Calculates optimal recognition threshold
+# - Calculates optimal recognition threshold based on face matching
+# - Validates matches with margin check to prevent false positives
 # - Updates /etc/faceid/faceid.conf
 
 # Enroll fingerprint (optional)
@@ -146,8 +154,9 @@ sudo ls
 
 ```bash
 faceid devices              # List cameras
-faceid show                 # Live preview with face detection
-faceid bench <directory>    # Benchmark recognition models
+faceid show                 # Live preview with face detection and landmarks
+faceid bench <directory>    # Benchmark recognition models (uses embedded image)
+faceid bench --image <path> <directory>  # Benchmark with custom test image
 faceid image test           # Test with static images (auto-finds optimal thresholds)
 sudo faceid add <user>      # Enroll face (auto-optimizes settings)
 sudo faceid test <user>     # Test authentication with timing metrics
@@ -155,13 +164,37 @@ sudo faceid list            # List enrolled users
 sudo faceid remove <user>   # Remove user enrollment
 ```
 
+## Face Matching Algorithm
+
+FaceID uses a robust two-stage matching algorithm to prevent false positives:
+
+1. **Distance Threshold Check**: Compares detected face encoding against all enrolled users
+2. **Uniqueness Validation**: When multiple enrolled users exist, ensures the best match has a significant margin (≥5%) over the second-best match to confirm a unique, unambiguous match
+3. **Deduplication**: Filters duplicate detections of the same face at different angles/positions before matching
+
+This prevents scenarios where:
+- Similar faces from different users are confused
+- Multiple detections of the same face create false positives
+- Border cases between two enrolled users are incorrectly accepted
+
+## Facial Landmarks Visualization
+
+When using `faceid show` or `faceid test`, detected facial landmarks are displayed:
+- **Cyan circles**: Left and right eyes
+- **Blue circle**: Nose tip
+- **Magenta circles**: Left and right mouth corners
+
+Landmarks help validate face detection quality and show which facial features are being tracked.
+
 ## Troubleshooting
 
 **Camera not detected**: `ls -l /dev/video* && sudo usermod -aG video $USER`  
 **Face not recognized**: Good lighting, re-enroll, or adjust threshold in config  
-**Model loading failed**: Check `/etc/faceid/models/` for `mnet.25-opt.{param,bin}` and `sface.{param,bin}`  
+**Model loading failed**: Check `/etc/faceid/models/` for detection model files (e.g., `mnet-retinaface.{param,bin}`) and recognition model files (e.g., `sface.{param,bin}`)  
 **Fingerprint issues**: `systemctl status fprintd && fprintd-verify`  
-**Locked out**: Boot recovery, mount root, edit `/mnt/etc/pam.d/sudo`, remove pam_faceid.so line
+**Locked out**: Boot recovery, mount root, edit `/mnt/etc/pam.d/sudo`, remove pam_faceid.so line  
+**False positives**: Re-enroll to update threshold, or manually decrease threshold in `/etc/faceid/faceid.conf`  
+**Multiple faces detected**: Use `faceid show` to verify face detection is working correctly; deduplication filters duplicate detections
 
 ## Configuration
 
@@ -178,18 +211,21 @@ Edit `/etc/faceid/faceid.conf`:
 
 **Enrollment**: Face and/or fingerprint (any combo works, both = faster)  
 **Speed**: Face ~48ms, fingerprint ~200-400ms (parallel, first wins)  
-**Models**: NCNN format only (RetinaFace from [ncnn-assets](https://github.com/nihui/ncnn-assets), SFace convert with PNNX)  
+**Models**: NCNN format only (RetinaFace, YuNet, YOLO from [ncnn-assets](https://github.com/nihui/ncnn-assets), SFace convert with PNNX)  
 **SSH**: Falls back to password (no camera)  
-**Unenroll**: `sudo faceid remove <user>` or `fprintd-delete <user>`
+**Unenroll**: `sudo faceid remove <user>` or `fprintd-delete <user>`  
+**Landmarks**: 5-point landmarks (eyes, nose, mouth) shown in preview and test modes for visual verification  
+**Matching robustness**: Deduplication + margin check prevents false positives with similar faces
 
 ## Technical Details
 
 **Pipeline**: Lid check → parallel (face detection + recognition | fprintd) → first success wins  
-**Detection Models**: SCRFD/RetinaFace/YuNet/UltraFace (pluggable, auto-detected from NCNN structure)  
+**Detection Models**: RetinaFace/YuNet/YOLO (pluggable, auto-detected from NCNN structure)  
 **Recognition Models**: SFace/MobileFaceNet/ArcFace variants (128D-512D encodings)  
-**Performance**: ~7-15ms detection (SCRFD fastest), ~20-33ms recognition, ~50-100MB memory  
+**Performance**: ~7-15ms detection (YOLO fastest), ~20-33ms recognition, ~50-100MB memory  
 **Storage**: Face models in `/var/lib/faceid/faces/<user>.<faceid>.bin`, logs in `/var/log/faceid.log`  
-**Enrollment**: Binary search for optimal confidence (0.01 precision), 5 samples with 1s intervals, automatic threshold calculation
+**Enrollment**: Binary search for optimal confidence (0.01 precision), 5 samples with 1s intervals, automatic threshold calculation with deduplication and margin validation  
+**Face Matching**: Two-stage algorithm with threshold check + uniqueness validation + deduplication
 
 **Zero OpenCV Stack**:
 - Camera: V4L2 + TurboJPEG (2x faster than cv::VideoCapture)

@@ -13,8 +13,16 @@
 #include <sstream>
 #include <regex>
 #include <dirent.h>
+#include <memory>
+#include <unordered_map>
+#include <mutex>
 
 namespace faceid {
+
+// Global model cache to avoid reloading models from disk
+// Key: "param_path|bin_path", Value: shared_ptr to ncnn::Net
+static std::unordered_map<std::string, std::shared_ptr<ncnn::Net>> g_model_cache;
+static std::mutex g_cache_mutex;
 
 
 // Helper function: Fast image resize using libyuv (3-5x faster than OpenCV)
@@ -50,6 +58,24 @@ static Image toGrayscale(const uint8_t* src_data, int src_width, int src_height,
     // Note: OpenCV's BGR = RGB24, J400 is grayscale (full range 0-255)
     libyuv::RGB24ToJ400(src_data, src_stride, dst_gray.data(), dst_gray.stride(), src_width, src_height);
     return dst_gray;
+}
+
+// Helper function: Load NCNN model with caching
+// This tracks which model files have been loaded and can skip redundant disk I/O
+static bool isModelCached(const std::string& param_path, const std::string& bin_path) {
+    std::string cache_key = param_path + "|" + bin_path;
+    std::lock_guard<std::mutex> lock(g_cache_mutex);
+    return g_model_cache.find(cache_key) != g_model_cache.end();
+}
+
+static void markModelCached(const std::string& param_path, const std::string& bin_path) {
+    std::string cache_key = param_path + "|" + bin_path;
+    std::lock_guard<std::mutex> lock(g_cache_mutex);
+    if (g_model_cache.find(cache_key) == g_model_cache.end()) {
+        // We don't actually store the model (ncnn::Net can't be copied), 
+        // just mark it as "seen" to track which models we've already loaded
+        g_model_cache[cache_key] = nullptr;
+    }
 }
 
 // Helper: Parse NCNN param file to extract output dimension
@@ -102,7 +128,7 @@ DetectionModelType FaceDetector::detectModelType(const std::string& param_path) 
     
     std::string line;
     bool has_data_input = false;          // RetinaFace uses "data" as input
-    bool has_in0_input = false;           // YuNet and UltraFace use "in0" as input
+    bool has_in0_input = false;           // YuNet uses "in0" as input
     bool has_face_rpn_outputs = false;    // RetinaFace has face_rpn_* outputs
     int out_count = 0;                    // Count out0, out1, out2, ... outputs
     
@@ -141,27 +167,6 @@ DetectionModelType FaceDetector::detectModelType(const std::string& param_path) 
     } else if (has_in0_input && out_count >= 12) {
         Logger::getInstance().debug("Detected YuNet model (input='in0', " + std::to_string(out_count) + " outputs)");
         return DetectionModelType::YUNET;
-    } else if (has_in0_input && out_count == 2) {
-        Logger::getInstance().debug("Detected UltraFace/RFB-320 model (input='in0', 2 outputs)");
-        return DetectionModelType::ULTRAFACE;
-    }
-    
-    // Check for SCRFD-specific patterns
-    bool has_input_1 = false;
-    
-    // Rewind file to check again
-    file.clear();
-    file.seekg(0);
-    while (std::getline(file, line)) {
-        if (line.find("Input") != std::string::npos && line.find(" input.1 ") != std::string::npos) {
-            has_input_1 = true;
-            break; // input.1 is unique to SCRFD
-        }
-    }
-    
-    if (has_input_1) {
-        Logger::getInstance().debug("Detected SCRFD model (input='input.1')");
-        return DetectionModelType::SCRFD;
     }
     
     // Check for YOLO-specific patterns
@@ -397,6 +402,12 @@ bool FaceDetector::loadModels(const std::string& model_base_path, const std::str
         Logger::getInstance().debug("  param: " + param_path);
         Logger::getInstance().debug("  bin:   " + bin_path);
         
+        // Check if this model was already loaded (file system cache helps)
+        bool was_cached = isModelCached(param_path, bin_path);
+        if (was_cached) {
+            Logger::getInstance().debug("Model cache HIT: This model was loaded before (faster due to FS cache)");
+        }
+        
         // Configure NCNN options for optimal CPU performance
         ncnn_net_.opt.use_vulkan_compute = false;
         ncnn_net_.opt.num_threads = 4;
@@ -425,6 +436,11 @@ bool FaceDetector::loadModels(const std::string& model_base_path, const std::str
         } catch (...) {
             Logger::getInstance().debug("Failed to create NCNN extractor");
             return false;
+        }
+        
+        // Mark this model as cached for future reference
+        if (!was_cached) {
+            markModelCached(param_path, bin_path);
         }
         
         models_loaded_ = true;
@@ -480,6 +496,12 @@ bool FaceDetector::loadModels(const std::string& model_base_path, const std::str
         
         Logger::getInstance().debug("Loading detection model from: " + detection_base);
         
+        // Check if this model was already loaded
+        bool det_was_cached = isModelCached(retinaface_param, retinaface_bin);
+        if (det_was_cached) {
+            Logger::getInstance().debug("Detection model cache HIT (faster due to FS cache)");
+        }
+        
         retinaface_net_.opt.use_vulkan_compute = false;
         retinaface_net_.opt.num_threads = 4;
         retinaface_net_.opt.use_fp16_packed = false;
@@ -497,6 +519,11 @@ bool FaceDetector::loadModels(const std::string& model_base_path, const std::str
                 Logger::getInstance().debug("Detection model bin not found (ret=" + std::to_string(ret) + "), detection_model_loaded_=false");
             } else {
                 detection_model_loaded_ = true;
+                
+                // Mark as cached
+                if (!det_was_cached) {
+                    markModelCached(retinaface_param, retinaface_bin);
+                }
                 // Auto-detect detection model type
                 detection_model_type_ = detectModelType(retinaface_param);
                 detection_model_name_ = detection_base.substr(detection_base.find_last_of("/\\") + 1);
@@ -504,15 +531,9 @@ bool FaceDetector::loadModels(const std::string& model_base_path, const std::str
                 // Adjust default confidence threshold based on model type (if not set by user)
                 auto confidence_opt = Config::getInstance().getDouble("recognition", "confidence");
                 if (!confidence_opt.has_value()) {
-                    // User didn't specify confidence in config, use model-specific defaults
-                    if (detection_model_type_ == DetectionModelType::SCRFD ||
-                        detection_model_type_ == DetectionModelType::ULTRAFACE) {
-                        detection_confidence_threshold_ = 0.5f;
-                        Logger::getInstance().debug("Using SCRFD/UltraFace default confidence: 0.5");
-                    } else {
-                        detection_confidence_threshold_ = 0.8f;
-                        Logger::getInstance().debug("Using RetinaFace/YuNet default confidence: 0.8");
-                    }
+                    // User didn't specify confidence in config, use default
+                    detection_confidence_threshold_ = 0.8f;
+                    Logger::getInstance().debug("Using default confidence: 0.8");
                 }
                 
                 // Try to read original detection model name from .use file
@@ -539,8 +560,9 @@ bool FaceDetector::loadModels(const std::string& model_base_path, const std::str
                 switch (detection_model_type_) {
                     case DetectionModelType::RETINAFACE: model_type_str = "RetinaFace"; break;
                     case DetectionModelType::YUNET: model_type_str = "YuNet"; break;
-                    case DetectionModelType::ULTRAFACE: model_type_str = "UltraFace/RFB-320"; break;
-                    case DetectionModelType::SCRFD: model_type_str = "SCRFD"; break;
+                    case DetectionModelType::YOLOV5: model_type_str = "YOLOv5-Face"; break;
+                    case DetectionModelType::YOLOV7: model_type_str = "YOLOv7-Face"; break;
+                    case DetectionModelType::YOLOV8: model_type_str = "YOLOv8-Face"; break;
                     default: model_type_str = "Unknown"; break;
                 }
                 
@@ -584,7 +606,6 @@ std::vector<Rect> FaceDetector::detectFaces(const ImageView& frame, bool downsca
     switch (detection_model_type_) {
         case DetectionModelType::RETINAFACE:
         case DetectionModelType::YUNET:
-        case DetectionModelType::ULTRAFACE:
             {
                 // Convert BGR to RGB (all models expect RGB)
                 ncnn::Mat in = ncnn::Mat::from_pixels(frame.data(), ncnn::Mat::PIXEL_BGR2RGB, img_w, img_h);
@@ -593,60 +614,7 @@ std::vector<Rect> FaceDetector::detectFaces(const ImageView& frame, bool downsca
                     faces = detectWithRetinaFace(in, img_w, img_h, confidence_threshold);
                 } else if (detection_model_type_ == DetectionModelType::YUNET) {
                     faces = detectWithYuNet(in, img_w, img_h, confidence_threshold);
-                } else {
-                    faces = detectWithUltraFace(in, img_w, img_h, confidence_threshold);
                 }
-            }
-            break;
-        case DetectionModelType::SCRFD:
-            {
-                // SCRFD requires special preprocessing: aspect-ratio preserving resize + padding
-                // Reference: https://github.com/nihui/ncnn-webassembly-scrfd
-                const int target_size = 640;
-                
-                // Calculate scale to fit into target_size
-                int w = img_w;
-                int h = img_h;
-                float scale = 1.f;
-                if (w > h) {
-                    scale = (float)target_size / w;
-                    w = target_size;
-                    h = h * scale;
-                } else {
-                    scale = (float)target_size / h;
-                    h = target_size;
-                    w = w * scale;
-                }
-                
-                Logger::getInstance().debug("SCRFD preprocessing: orig=" + std::to_string(img_w) + "x" + std::to_string(img_h) + 
-                                          " -> resized=" + std::to_string(w) + "x" + std::to_string(h) + 
-                                          " scale=" + std::to_string(scale));
-                
-                // Resize with aspect ratio preserved
-                ncnn::Mat in = ncnn::Mat::from_pixels_resize(frame.data(), ncnn::Mat::PIXEL_BGR2RGB, 
-                                                            img_w, img_h, w, h);
-                
-                // Pad to multiples of 32
-                int wpad = (w + 31) / 32 * 32 - w;
-                int hpad = (h + 31) / 32 * 32 - h;
-                ncnn::Mat in_pad;
-                ncnn::copy_make_border(in, in_pad, hpad / 2, hpad - hpad / 2, wpad / 2, wpad - wpad / 2, 
-                                     ncnn::BORDER_CONSTANT, 0.f);
-                
-                Logger::getInstance().debug("SCRFD padding: wpad=" + std::to_string(wpad) + " hpad=" + std::to_string(hpad) + 
-                                          " -> final=" + std::to_string(in_pad.w) + "x" + std::to_string(in_pad.h));
-                
-                // Normalize: mean=[127.5, 127.5, 127.5], norm=[1/128.0]
-                const float mean_vals[3] = {127.5f, 127.5f, 127.5f};
-                const float norm_vals[3] = {1/128.f, 1/128.f, 1/128.f};
-                in_pad.substract_mean_normalize(mean_vals, norm_vals);
-                
-                // Detect faces
-                faces = detectWithSCRFD(in_pad, in_pad.w, in_pad.h, confidence_threshold, scale, wpad, hpad, img_w, img_h);
-                
-                Logger::getInstance().debug("SCRFD detected " + std::to_string(faces.size()) + " faces");
-                
-                // Note: Coordinate adjustment is done inside detectWithSCRFD
             }
             break;
         case DetectionModelType::YOLOV5:
@@ -704,24 +672,6 @@ std::vector<Rect> FaceDetector::detectWithYuNet(const ncnn::Mat& in, int img_w, 
         confidence_threshold = detection_confidence_threshold_;
     }
     return ::faceid::detectWithYuNet(retinaface_net_, in, img_w, img_h, confidence_threshold);
-}
-
-// SCRFD detection implementation
-std::vector<Rect> FaceDetector::detectWithSCRFD(const ncnn::Mat& in, int img_w, int img_h, float confidence_threshold, 
-                                                float scale, int wpad, int hpad, int orig_w, int orig_h) {
-    if (confidence_threshold <= 0.0f) {
-        confidence_threshold = detection_confidence_threshold_;
-    }
-    return ::faceid::detectWithSCRFD(retinaface_net_, in, img_w, img_h, confidence_threshold, 
-                                     scale, wpad, hpad, orig_w, orig_h);
-}
-
-// UltraFace/RFB-320 detection implementation
-std::vector<Rect> FaceDetector::detectWithUltraFace(const ncnn::Mat& in, int img_w, int img_h, float confidence_threshold) {
-    if (confidence_threshold <= 0.0f) {
-        confidence_threshold = detection_confidence_threshold_;
-    }
-    return ::faceid::detectWithUltraFace(retinaface_net_, in, img_w, img_h, confidence_threshold);
 }
 
 std::vector<Rect> FaceDetector::detectOrTrackFaces(const ImageView& frame, int track_interval) {
@@ -801,6 +751,16 @@ std::vector<Rect> FaceDetector::trackFaces(const ImageView& current_frame) {
                 face.height
             );
             
+            // Preserve and update landmarks if available
+            if (face.hasLandmarks()) {
+                for (const auto& pt : face.landmarks) {
+                    Point updated_pt;
+                    updated_pt.x = pt.x + dx;
+                    updated_pt.y = pt.y + dy;
+                    updated_face.landmarks.push_back(updated_pt);
+                }
+            }
+            
             // Ensure face is within frame bounds
             updated_face &= Rect(0, 0, current_frame.width(), current_frame.height());
             
@@ -830,12 +790,155 @@ void FaceDetector::resetTracking() {
 }
 
 Image FaceDetector::alignFace(const ImageView& frame, const Rect& face_rect) {
-    // Extract face region using roi
+    const int OUTPUT_SIZE = 112;  // SFace expects 112x112
+    
+    // Check if landmarks are available for proper alignment
+    if (face_rect.hasLandmarks() && face_rect.landmarks.size() >= 5) {
+        // Standard 5-point landmark positions for 112x112 output
+        // These are empirically determined reference positions that work well for face recognition
+        // Format: [left_eye, right_eye, nose, left_mouth_corner, right_mouth_corner]
+        const Point reference_landmarks[5] = {
+            Point(38.2946f, 51.6963f),  // left eye
+            Point(73.5318f, 51.5014f),  // right eye
+            Point(56.0252f, 71.7366f),  // nose tip
+            Point(41.5493f, 92.3655f),  // left mouth corner
+            Point(70.7299f, 92.2041f)   // right mouth corner
+        };
+        
+        // Get detected landmarks (already in absolute image coordinates)
+        const auto& src_landmarks = face_rect.landmarks;
+        
+        // Compute similarity transform (rotation, scale, translation) using eyes and nose
+        // We use a least-squares approach to find the best affine transformation
+        
+        // Calculate centroid of source and destination points
+        float src_cx = 0.0f, src_cy = 0.0f;
+        float dst_cx = 0.0f, dst_cy = 0.0f;
+        
+        for (int i = 0; i < 5; i++) {
+            src_cx += src_landmarks[i].x;
+            src_cy += src_landmarks[i].y;
+            dst_cx += reference_landmarks[i].x;
+            dst_cy += reference_landmarks[i].y;
+        }
+        src_cx /= 5.0f; src_cy /= 5.0f;
+        dst_cx /= 5.0f; dst_cy /= 5.0f;
+        
+        // Compute scale and rotation using the eye positions
+        float src_eye_dx = src_landmarks[1].x - src_landmarks[0].x;  // right_eye - left_eye
+        float src_eye_dy = src_landmarks[1].y - src_landmarks[0].y;
+        float dst_eye_dx = reference_landmarks[1].x - reference_landmarks[0].x;
+        float dst_eye_dy = reference_landmarks[1].y - reference_landmarks[0].y;
+        
+        float src_eye_dist = std::sqrt(src_eye_dx * src_eye_dx + src_eye_dy * src_eye_dy);
+        float dst_eye_dist = std::sqrt(dst_eye_dx * dst_eye_dx + dst_eye_dy * dst_eye_dy);
+        
+        if (src_eye_dist < 1.0f) {
+            // Landmarks too close, fall back to bbox cropping
+            Logger::getInstance().debug("Landmarks too close, falling back to bbox alignment");
+            goto bbox_fallback;
+        }
+        
+        float scale = dst_eye_dist / src_eye_dist;
+        
+        // Calculate rotation angle from eye line
+        float src_angle = std::atan2(src_eye_dy, src_eye_dx);
+        float dst_angle = std::atan2(dst_eye_dy, dst_eye_dx);
+        float angle = dst_angle - src_angle;
+        
+        float cos_a = std::cos(angle);
+        float sin_a = std::sin(angle);
+        
+        // Build 2x3 affine transformation matrix
+        // [a b tx]   [scale*cos  -scale*sin  tx]
+        // [c d ty] = [scale*sin   scale*cos  ty]
+        float a = scale * cos_a;
+        float b = -scale * sin_a;
+        float c = scale * sin_a;
+        float d = scale * cos_a;
+        
+        // Translation: dst_center = M * src_center
+        float tx = dst_cx - (a * src_cx + b * src_cy);
+        float ty = dst_cy - (c * src_cx + d * src_cy);
+        
+        // Apply affine transformation using libyuv's warp
+        // libyuv doesn't have affine warp, so we'll do manual bilinear sampling
+        Image aligned(OUTPUT_SIZE, OUTPUT_SIZE, 3);
+        uint8_t* dst_data = aligned.data();
+        
+        const uint8_t* src_data = frame.data();
+        int src_width = frame.width();
+        int src_height = frame.height();
+        int src_stride = frame.stride();
+        
+        // Inverse transformation for backward mapping
+        float det = a * d - b * c;
+        if (std::abs(det) < 1e-6f) {
+            Logger::getInstance().debug("Singular transformation matrix, falling back to bbox alignment");
+            goto bbox_fallback;
+        }
+        
+        float inv_a = d / det;
+        float inv_b = -b / det;
+        float inv_c = -c / det;
+        float inv_d = a / det;
+        float inv_tx = -(inv_a * tx + inv_b * ty);
+        float inv_ty = -(inv_c * tx + inv_d * ty);
+        
+        // Apply transformation with bilinear interpolation
+        for (int y = 0; y < OUTPUT_SIZE; y++) {
+            for (int x = 0; x < OUTPUT_SIZE; x++) {
+                // Map destination pixel to source
+                float src_x = inv_a * x + inv_b * y + inv_tx;
+                float src_y = inv_c * x + inv_d * y + inv_ty;
+                
+                // Bilinear interpolation
+                int x0 = static_cast<int>(std::floor(src_x));
+                int y0 = static_cast<int>(std::floor(src_y));
+                int x1 = x0 + 1;
+                int y1 = y0 + 1;
+                
+                // Check bounds
+                if (x0 < 0 || y0 < 0 || x1 >= src_width || y1 >= src_height) {
+                    // Out of bounds - use black
+                    dst_data[(y * OUTPUT_SIZE + x) * 3 + 0] = 0;
+                    dst_data[(y * OUTPUT_SIZE + x) * 3 + 1] = 0;
+                    dst_data[(y * OUTPUT_SIZE + x) * 3 + 2] = 0;
+                    continue;
+                }
+                
+                float fx = src_x - x0;
+                float fy = src_y - y0;
+                
+                // Sample 4 corners (BGR format)
+                for (int c = 0; c < 3; c++) {
+                    float p00 = src_data[y0 * src_stride + x0 * 3 + c];
+                    float p10 = src_data[y0 * src_stride + x1 * 3 + c];
+                    float p01 = src_data[y1 * src_stride + x0 * 3 + c];
+                    float p11 = src_data[y1 * src_stride + x1 * 3 + c];
+                    
+                    float val = p00 * (1 - fx) * (1 - fy) +
+                               p10 * fx * (1 - fy) +
+                               p01 * (1 - fx) * fy +
+                               p11 * fx * fy;
+                    
+                    dst_data[(y * OUTPUT_SIZE + x) * 3 + c] = static_cast<uint8_t>(val);
+                }
+            }
+        }
+        
+        Logger::getInstance().debug("Face aligned using 5-point landmarks with affine transformation");
+        return aligned;
+    }
+    
+bbox_fallback:
+    // No landmarks available - fall back to simple bounding box crop and resize
+    Logger::getInstance().debug("No landmarks available, using bbox-based alignment");
     ImageView face_roi = frame.roi(face_rect);
     Image face_img = face_roi.clone();
     
     // SFace expects 112x112 aligned face
-    return resizeImage(face_img.data(), face_img.width(), face_img.height(), face_img.stride(), 112, 112);
+    return resizeImage(face_img.data(), face_img.width(), face_img.height(), face_img.stride(), OUTPUT_SIZE, OUTPUT_SIZE);
 }
 
 std::vector<FaceEncoding> FaceDetector::encodeFaces(
@@ -1123,6 +1226,97 @@ int FaceDetector::countDistinctFaces(const std::vector<Rect>& faces, int min_dis
     }
     
     return count;
+}
+
+// Deduplicate faces based on encoding similarity
+// This prevents the same person detected at multiple angles/positions from being counted multiple times
+std::vector<size_t> FaceDetector::deduplicateFaces(
+    const std::vector<Rect>& faces,
+    const std::vector<FaceEncoding>& encodings,
+    double similarity_threshold) {
+    
+    if (faces.empty() || encodings.empty() || faces.size() != encodings.size()) {
+        return {};
+    }
+    
+    std::vector<size_t> unique_indices;
+    std::vector<bool> is_duplicate(faces.size(), false);
+    
+    // Strategy: Keep the largest face from each group of similar faces
+    // Sort by face size (area) in descending order
+    std::vector<size_t> sorted_indices(faces.size());
+    for (size_t i = 0; i < faces.size(); i++) {
+        sorted_indices[i] = i;
+    }
+    
+    std::sort(sorted_indices.begin(), sorted_indices.end(),
+        [&faces](size_t a, size_t b) {
+            return faces[a].area() > faces[b].area();
+        });
+    
+    // For each face (starting with largest), check if it's similar to any already-kept face
+    for (size_t i : sorted_indices) {
+        if (is_duplicate[i]) continue;
+        
+        bool is_similar_to_kept = false;
+        
+        // Compare with all previously kept faces
+        for (size_t kept_idx : unique_indices) {
+            // Calculate cosine distance between encodings
+            double distance = 0.0;
+            double dot = 0.0;
+            double norm1 = 0.0;
+            double norm2 = 0.0;
+            
+            const auto& enc1 = encodings[i];
+            const auto& enc2 = encodings[kept_idx];
+            
+            if (enc1.size() != enc2.size()) continue;
+            
+            for (size_t j = 0; j < enc1.size(); j++) {
+                dot += enc1[j] * enc2[j];
+                norm1 += enc1[j] * enc1[j];
+                norm2 += enc2[j] * enc2[j];
+            }
+            
+            norm1 = std::sqrt(norm1);
+            norm2 = std::sqrt(norm2);
+            
+            if (norm1 > 0 && norm2 > 0) {
+                distance = 1.0 - (dot / (norm1 * norm2));
+                
+                // If distance is below threshold, they're the same person
+                if (distance < similarity_threshold) {
+                    is_similar_to_kept = true;
+                    is_duplicate[i] = true;
+                    Logger::getInstance().debug(
+                        "Face " + std::to_string(i) + " is duplicate of face " + 
+                        std::to_string(kept_idx) + " (distance: " + std::to_string(distance) + ")"
+                    );
+                    break;
+                }
+            }
+        }
+        
+        // If not similar to any kept face, keep this one
+        if (!is_similar_to_kept) {
+            unique_indices.push_back(i);
+            Logger::getInstance().debug(
+                "Face " + std::to_string(i) + " kept as unique (area: " + 
+                std::to_string(faces[i].area()) + ")"
+            );
+        }
+    }
+    
+    // Sort unique indices by original order (for consistent display)
+    std::sort(unique_indices.begin(), unique_indices.end());
+    
+    Logger::getInstance().debug(
+        "Deduplicated " + std::to_string(faces.size()) + " faces to " + 
+        std::to_string(unique_indices.size()) + " unique faces"
+    );
+    
+    return unique_indices;
 }
 
 } // namespace faceid

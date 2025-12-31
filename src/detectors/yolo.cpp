@@ -137,6 +137,20 @@ static void generate_proposals_yolov5(
                 obj.rect.height = pb_h;
                 obj.prob = box_confidence;
                 
+                // Extract landmarks if available (5 points after box + confidence = offset 5)
+                // YOLOv5 format: 10 values (x1, y1, x2, y2, ..., x5, y5)
+                // Landmarks are scaled by anchor size and offset by grid position
+                const float* ptr_kps = featptr + 5;
+                for (int k = 0; k < 5; k++) {
+                    float kps_x = ptr_kps[k * 2];
+                    float kps_y = ptr_kps[k * 2 + 1];
+                    
+                    Point pt;
+                    pt.x = kps_x * anchor_w + j * stride;
+                    pt.y = kps_y * anchor_h + i * stride;
+                    obj.rect.landmarks.push_back(pt);
+                }
+                
                 objects.push_back(obj);
             }
         }
@@ -217,6 +231,21 @@ static void generate_proposals_yolov7(
                 obj.rect.height = pb_h;
                 obj.prob = confidence;
                 
+                // Extract landmarks if available (5 points after box + confidence + class = offset 6)
+                // YOLOv7 format: 15 values (5 landmarks × 3: x, y, visibility)
+                const float* ptr_kps = featptr + 6;
+                for (int k = 0; k < 5; k++) {
+                    float kps_x = ptr_kps[k * 3];
+                    float kps_y = ptr_kps[k * 3 + 1];
+                    // float kps_vis = ptr_kps[k * 3 + 2];  // visibility (unused)
+                    
+                    Point pt;
+                    // YOLOv7: Use raw values directly (no sigmoid), same formula as reference
+                    pt.x = (kps_x * 2.0f - 0.5f + j) * stride;
+                    pt.y = (kps_y * 2.0f - 0.5f + i) * stride;
+                    obj.rect.landmarks.push_back(pt);
+                }
+                
                 objects.push_back(obj);
             }
         }
@@ -236,9 +265,16 @@ static void generate_proposals_yolov8(
     int fea_w = feat_blob.w;
     int spacial_size = fea_w * fea_h;
     
+    // YOLOv8-face output structure:
+    // - Box predictions: 64 values (4 sides × 16 DFL bins)
+    // - Class confidence: 1 value
+    // - Landmarks: 10 values (5 keypoints × 2 coordinates)
+    // Total: 75 values per position
+    
     // Data pointers
     const float* ptr_b = (const float*)feat_blob.data;  // Box predictions (64 values)
     const float* ptr_c = ptr_b + spacial_size * reg_max * 4;  // Class confidence (1 value)
+    const float* ptr_kps = ptr_c + spacial_size;  // Landmarks (10 values)
     
     for (int i = 0; i < fea_h; i++) {
         for (int j = 0; j < fea_w; j++) {
@@ -295,6 +331,20 @@ static void generate_proposals_yolov8(
             obj.rect.width = pb_w;
             obj.rect.height = pb_h;
             obj.prob = box_confidence;
+            
+            // Decode 5-point landmarks (2 eyes, nose, 2 mouth corners)
+            // YOLOv8-face format: 15 values (5 landmarks × 3 values: x, y, visibility)
+            // Channel-first layout: [x1, x2, ..., x5, y1, y2, ..., y5, vis1, vis2, ..., vis5]
+            for (int k = 0; k < 5; k++) {
+                float kps_x = ptr_kps[(k * 3 + 0) * spacial_size + index];
+                float kps_y = ptr_kps[(k * 3 + 1) * spacial_size + index];
+                // float kps_vis = ptr_kps[(k * 3 + 2) * spacial_size + index];  // visibility (unused)
+                
+                Point pt;
+                pt.x = (kps_x * 2.0f + j) * stride;
+                pt.y = (kps_y * 2.0f + i) * stride;
+                obj.rect.landmarks.push_back(pt);
+            }
             
             objects.push_back(obj);
         }
@@ -451,6 +501,18 @@ std::vector<Rect> detectWithYOLO(ncnn::Net& net, const ncnn::Mat& in, int img_w,
         face.y = static_cast<int>(y);
         face.width = static_cast<int>(w);
         face.height = static_cast<int>(h);
+        
+        // Map landmarks back to original image coordinates
+        for (const auto& lm : obj.rect.landmarks) {
+            float lm_x = (lm.x - wpad) / scale;
+            float lm_y = (lm.y - hpad) / scale;
+            
+            // Clamp to image bounds
+            lm_x = std::max(0.0f, std::min(lm_x, (float)img_w));
+            lm_y = std::max(0.0f, std::min(lm_y, (float)img_h));
+            
+            face.landmarks.push_back(Point(lm_x, lm_y));
+        }
         
         faces.push_back(face);
     }

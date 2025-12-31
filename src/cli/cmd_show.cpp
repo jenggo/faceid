@@ -85,6 +85,25 @@ int cmd_show() {
             faceid::drawRectangle(display_frame, face.x, face.y, 
                                  face.width, face.height, color, 2);
             
+            // Draw facial landmarks if available (5-point landmarks)
+            if (face.hasLandmarks()) {
+                // Define colors for each landmark
+                faceid::Color landmark_colors[] = {
+                    faceid::Color(0, 255, 255),    // Left eye - Cyan
+                    faceid::Color(0, 255, 255),    // Right eye - Cyan  
+                    faceid::Color(255, 0, 0),      // Nose - Blue
+                    faceid::Color(255, 0, 255),    // Left mouth - Magenta
+                    faceid::Color(255, 0, 255)     // Right mouth - Magenta
+                };
+                
+                for (size_t j = 0; j < face.landmarks.size() && j < 5; j++) {
+                    const auto& pt = face.landmarks[j];
+                    int px = static_cast<int>(pt.x);
+                    int py = static_cast<int>(pt.y);
+                    faceid::drawCircle(display_frame, px, py, 3, landmark_colors[j]);
+                }
+            }
+            
             // Label faces - reverse text and calculate position
             std::string label = (i == 0) ? "Face 1 (Primary)" : "Face " + std::to_string(i + 1);
             std::reverse(label.begin(), label.end());

@@ -113,15 +113,23 @@ inline ncnn::Mat generate_anchors(int base_size, const ncnn::Mat& ratios, const 
 
 // Generate detection proposals from anchors and model outputs (RetinaFace-style)
 inline void generate_proposals(const ncnn::Mat& anchors, int feat_stride, const ncnn::Mat& score_blob, 
-                               const ncnn::Mat& bbox_blob, float prob_threshold, std::vector<FaceObject>& faceobjects) {
+                               const ncnn::Mat& bbox_blob, float prob_threshold, std::vector<FaceObject>& faceobjects,
+                               const ncnn::Mat& landmark_blob = ncnn::Mat()) {
     int w = score_blob.w;
     int h = score_blob.h;
     const int num_anchors = anchors.h;
+    const bool has_landmarks = !landmark_blob.empty();
     
     for (int q = 0; q < num_anchors; q++) {
         const float* anchor = anchors.row(q);
         const ncnn::Mat score = score_blob.channel(q + num_anchors);
         const ncnn::Mat bbox = bbox_blob.channel_range(q * 4, 4);
+        
+        // Landmark blob: 10 channels per anchor (5 points × 2 coords)
+        ncnn::Mat landmark;
+        if (has_landmarks) {
+            landmark = landmark_blob.channel_range(q * 10, 10);
+        }
         
         float anchor_y = anchor[1];
         float anchor_w = anchor[2] - anchor[0];
@@ -159,6 +167,19 @@ inline void generate_proposals(const ncnn::Mat& anchors, int feat_stride, const 
                     obj.rect.width = (int)(x1 - x0 + 1);
                     obj.rect.height = (int)(y1 - y0 + 1);
                     obj.prob = prob;
+                    
+                    // Extract landmarks if available (5 points)
+                    if (has_landmarks) {
+                        for (int k = 0; k < 5; k++) {
+                            float lm_x = landmark.channel(k * 2)[index];
+                            float lm_y = landmark.channel(k * 2 + 1)[index];
+                            
+                            Point pt;
+                            pt.x = cx + anchor_w * lm_x;
+                            pt.y = cy + anchor_h * lm_y;
+                            obj.rect.landmarks.push_back(pt);
+                        }
+                    }
                     
                     faceobjects.push_back(obj);
                 }
