@@ -135,6 +135,31 @@ int main(int argc, char* argv[]) {
     
     std::cout << "Found " << user_values.size() << " existing user settings" << std::endl;
     
+    // Build a set of valid keys from source config
+    std::map<std::string, bool> valid_keys;
+    current_section = "";
+    
+    std::ifstream source_scan(source_path);
+    while (std::getline(source_scan, line)) {
+        ConfigLine parsed = parseLine(line);
+        
+        if (parsed.type == ConfigLine::SECTION) {
+            current_section = parsed.section;
+        } else if (parsed.type == ConfigLine::KEYVALUE) {
+            std::string lookup_key = current_section + "|" + parsed.key;
+            valid_keys[lookup_key] = true;
+        }
+    }
+    source_scan.close();
+    
+    // Detect obsolete keys (exist in user config but not in source)
+    std::vector<std::string> obsolete_keys;
+    for (const auto& kv : user_values) {
+        if (valid_keys.find(kv.first) == valid_keys.end()) {
+            obsolete_keys.push_back(kv.first);
+        }
+    }
+    
     // First pass: Check if there are any changes (new keys or different values)
     bool has_changes = false;
     int potential_new_keys = 0;
@@ -156,6 +181,11 @@ int main(int argc, char* argv[]) {
     }
     source_precheck.close();
     
+    // Check if there are obsolete keys to remove
+    if (!obsolete_keys.empty()) {
+        has_changes = true;
+    }
+    
     // If no changes, just report and exit
     if (!has_changes) {
         std::cout << "No configuration changes detected - backup skipped" << std::endl;
@@ -163,7 +193,13 @@ int main(int argc, char* argv[]) {
         return 0;
     }
     
-    std::cout << "Detected " << potential_new_keys << " new configuration keys" << std::endl;
+    if (potential_new_keys > 0) {
+        std::cout << "Detected " << potential_new_keys << " new configuration keys" << std::endl;
+    }
+    
+    if (!obsolete_keys.empty()) {
+        std::cout << "Detected " << obsolete_keys.size() << " obsolete configuration keys (will be removed)" << std::endl;
+    }
     
     // Create backup only if there are changes
     std::time_t now = std::time(nullptr);
@@ -222,6 +258,9 @@ int main(int argc, char* argv[]) {
     std::cout << "Configuration merge complete:" << std::endl;
     std::cout << "  - Preserved user values: " << preserved_keys << std::endl;
     std::cout << "  - Added new keys: " << added_keys << std::endl;
+    if (!obsolete_keys.empty()) {
+        std::cout << "  - Removed obsolete keys: " << obsolete_keys.size() << std::endl;
+    }
     std::cout << "Config updated: " << dest_path << std::endl;
     
     if (!new_keys.empty()) {
@@ -229,6 +268,18 @@ int main(int argc, char* argv[]) {
         std::cout << "New configuration options added:" << std::endl;
         for (const auto& key : new_keys) {
             std::cout << key << std::endl;
+        }
+    }
+    
+    if (!obsolete_keys.empty()) {
+        std::cout << std::endl;
+        std::cout << "Obsolete configuration options removed:" << std::endl;
+        for (const auto& key : obsolete_keys) {
+            // Parse section|key format
+            size_t pipe_pos = key.find('|');
+            std::string section = key.substr(0, pipe_pos);
+            std::string keyname = key.substr(pipe_pos + 1);
+            std::cout << "  - [" << section << "] " << keyname << std::endl;
         }
     }
     

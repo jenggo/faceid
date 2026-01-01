@@ -23,6 +23,9 @@ core_sources = files(
     'presence/presence_detector.cpp',
     'models/binary_model.cpp',
     'models/model_cache.cpp',
+    'detectors/retinaface.cpp',
+    'detectors/yunet.cpp',
+    'detectors/yolo.cpp',
 )
 
 core_lib = static_library(
@@ -58,6 +61,9 @@ cli_sources = files(
     'cli/cmd_list.cpp',
     'cli/cmd_show.cpp',
     'cli/cmd_test.cpp',
+    'cli/cmd_test_image.cpp',
+    'cli/cmd_bench.cpp',
+    'cli/cmd_use.cpp',
     'cli/cmd_help.cpp',
     'display.cpp'
 )

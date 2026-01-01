@@ -22,8 +22,21 @@ bool BinaryModelLoader::loadUserModel(const std::string& path, BinaryFaceModel& 
         return false;
     }
 
-    // Skip reserved (16 + 32 = 48 bytes)
-    file.seekg(48, std::ios::cur);
+    // Read encoding dimension from reserved space (uint32_t at offset 16)
+    uint32_t encoding_dim = readUint32LE(file);
+    if (!file) return false;
+    
+    // If dimension is 0 or invalid, assume legacy format with hardcoded ENCODING_DIM
+    if (encoding_dim == 0 || encoding_dim > 2048) {
+        encoding_dim = ENCODING_DIM;
+        faceid::Logger::getInstance().warning("Model file uses legacy format, assuming " + 
+                                             std::to_string(encoding_dim) + "D encodings: " + path);
+    }
+    
+    size_t dynamic_encoding_size = encoding_dim * sizeof(float);
+
+    // Skip remaining reserved (44 bytes = 48 - 4 already read)
+    file.seekg(44, std::ios::cur);
     if (!file) return false;
 
     // Read timestamp (uint32_t, little-endian)
@@ -57,8 +70,8 @@ bool BinaryModelLoader::loadUserModel(const std::string& path, BinaryFaceModel& 
     // Note: face_count is not the number of encodings, but metadata field
     model.encodings.reserve(50);  // Reserve for typical case
     while (file) {
-        FaceEncoding encoding(ENCODING_DIM);
-        file.read(reinterpret_cast<char*>(encoding.data()), ENCODING_SIZE);
+        FaceEncoding encoding(encoding_dim);
+        file.read(reinterpret_cast<char*>(encoding.data()), dynamic_encoding_size);
         if (!file) {
             // Handle partial encoding at end of file
             if (file.gcount() > 0 && file.eof()) {
@@ -93,9 +106,13 @@ bool BinaryModelLoader::saveUserModel(const std::string& path, const BinaryFaceM
     // Write username (16 bytes, null-padded)
     writeNullPaddedString(file, model.username, 16);
 
-    // Write reserved (48 bytes, zeros)
-    char zeros[48] = {0};
-    file.write(zeros, 48);
+    // Write encoding dimension at offset 16 (4 bytes)
+    size_t encoding_dim = model.encodings.empty() ? ENCODING_DIM : model.encodings[0].size();
+    writeUint32LE(file, static_cast<uint32_t>(encoding_dim));
+    
+    // Write remaining reserved (44 bytes = 48 - 4 already written)
+    char zeros[44] = {0};
+    file.write(zeros, 44);
 
     // Write timestamp
     writeUint32LE(file, model.timestamp);
@@ -114,12 +131,14 @@ bool BinaryModelLoader::saveUserModel(const std::string& path, const BinaryFaceM
     file.write(zeros, 8);
 
     // Write encodings
+    size_t encoding_size = encoding_dim * sizeof(float);
+    
     for (const auto& encoding : model.encodings) {
-        if (encoding.size() != ENCODING_DIM) {
-            faceid::Logger::getInstance().error("Invalid encoding dimension in model: " + path);
+        if (encoding.size() != encoding_dim) {
+            faceid::Logger::getInstance().error("Inconsistent encoding dimensions in model: " + path);
             return false;
         }
-        file.write(reinterpret_cast<const char*>(encoding.data()), ENCODING_SIZE);
+        file.write(reinterpret_cast<const char*>(encoding.data()), encoding_size);
     }
 
     return file.good();
@@ -169,8 +188,14 @@ bool BinaryModelLoader::validateBinaryFile(const std::string& path) {
     // Check file size
     file.seekg(0, std::ios::end);
     size_t file_size = file.tellg();
-    size_t expected_size = HEADER_SIZE + model.encodings.size() * ENCODING_SIZE;
+    
+    // Calculate expected size based on actual encoding dimension
+    size_t actual_encoding_dim = model.encodings.empty() ? ENCODING_DIM : model.encodings[0].size();
+    size_t expected_size = HEADER_SIZE + model.encodings.size() * actual_encoding_dim * sizeof(float);
+    
     if (file_size != expected_size) {
+        faceid::Logger::getInstance().warning("File size mismatch: expected " + std::to_string(expected_size) + 
+                                            " bytes, got " + std::to_string(file_size) + " bytes for " + path);
         return false;
     }
 
@@ -178,7 +203,11 @@ bool BinaryModelLoader::validateBinaryFile(const std::string& path) {
 }
 
 size_t BinaryModelLoader::getModelFileSize(const BinaryFaceModel& model) {
-    return HEADER_SIZE + model.encodings.size() * ENCODING_SIZE;
+    if (model.encodings.empty()) {
+        return HEADER_SIZE;
+    }
+    size_t actual_encoding_dim = model.encodings[0].size();
+    return HEADER_SIZE + model.encodings.size() * actual_encoding_dim * sizeof(float);
 }
 
 uint32_t BinaryModelLoader::readUint32LE(std::ifstream& file) {

@@ -205,6 +205,10 @@ static bool authenticate_user(const char* username) {
                     return false;
                 }
                 
+                // Load ALL users' models for verification (prevent false positives)
+                std::vector<BinaryFaceModel> all_users = cache.loadAllUsersParallel(4);
+                logger.debug("Loaded " + std::to_string(all_users.size()) + " user models for verification");
+                
                 // Initialize camera
                 auto device = config.getString("camera", "device").value_or("/dev/video0");
                 Camera camera(device);
@@ -228,7 +232,7 @@ static bool authenticate_user(const char* username) {
                 }
                 
                 double threshold = config.getDouble("recognition", "threshold").value_or(0.6);
-                int tracking_interval = config.getInt("face_detection", "tracking_interval").value_or(10);
+                // tracking_interval no longer needed - cascade detection handles optimization
                 
                 auto start = std::chrono::steady_clock::now();
                 while (!cancel_flag.load() && std::chrono::duration_cast<std::chrono::seconds>(
@@ -239,36 +243,60 @@ static bool authenticate_user(const char* username) {
                         continue;
                     }
                     
-                    // Preprocess for better detection
-                    faceid::Image processed_frame = detector.preprocessFrame(frame.view());
+                    // Use cascading detection for robust face detection in all lighting conditions
+                    // This automatically falls back through multiple stages if needed
+                    auto cascade_result = detector.detectFacesCascade(frame.view(), false);
                     
-                    // Detect faces (with tracking optimization)
-                    auto faces = detector.detectOrTrackFaces(processed_frame.view(), tracking_interval);
-                    if (faces.empty()) {
+                    if (cascade_result.faces.empty()) {
                         continue;
                     }
                     
-                    // Encode faces
-                    auto encodings = detector.encodeFaces(processed_frame.view(), faces);
+                    // Use the preprocessed frame from cascade for encoding
+                    auto encodings = detector.encodeFaces(cascade_result.processed_frame.view(), cascade_result.faces);
                     if (encodings.empty()) {
                         continue;
                     }
                     
-                    // Compare with stored encodings from binary model
-                    std::vector<faceid::FaceEncoding> stored_encodings = model.encodings;
+                    // Deduplicate faces - filter out multiple detections of the same person
+                    // This prevents false positives from the same face detected at different angles/positions
+                    auto unique_indices = FaceDetector::deduplicateFaces(cascade_result.faces, encodings, 0.15);
                     
-                    // Compare detected faces with all stored encodings
-                    for (const auto& stored_encoding : stored_encodings) {
-                        for (const auto& detected_encoding : encodings) {
-                            double distance = detector.compareFaces(detected_encoding, stored_encoding);
-                            
-                            // SFace compareFaces returns distance (lower = more similar)
-                            // Default threshold 0.6 works well
-                            if (distance < threshold) {
-                                logger.info(std::string("Face matched for user ") + username + 
-                                          " (distance: " + std::to_string(distance) + ")");
-                                return true;
+                    // Filter to only unique faces
+                    std::vector<FaceEncoding> unique_encodings;
+                    for (size_t idx : unique_indices) {
+                        if (idx < encodings.size()) {
+                            unique_encodings.push_back(encodings[idx]);
+                        }
+                    }
+                    
+                    // Compare detected faces against ALL users to find best match
+                    for (const auto& detected_encoding : unique_encodings) {
+                        double best_distance = 999.0;
+                        std::string best_match_user = "";
+                        
+                        // Compare against all enrolled users
+                        for (const auto& user_model : all_users) {
+                            for (const auto& stored_encoding : user_model.encodings) {
+                                double distance = detector.compareFaces(detected_encoding, stored_encoding);
+                                if (distance < best_distance) {
+                                    best_distance = distance;
+                                    best_match_user = user_model.username;
+                                }
                             }
+                        }
+                        
+                        // Only accept if:
+                        // 1. Distance is below threshold
+                        // 2. Best match is the current user (not another user)
+                        if (best_distance < threshold && best_match_user == username) {
+                            logger.info(std::string("Face matched for user ") + username + 
+                                      " (distance: " + std::to_string(best_distance) + ")");
+                            return true;
+                        } else if (best_distance < threshold && best_match_user != username) {
+                            // Face matched a different user - log security event
+                            logger.warning(std::string("Face matched different user '") + best_match_user + 
+                                         "' instead of '" + username + "' (distance: " + 
+                                         std::to_string(best_distance) + "), rejecting authentication");
                         }
                     }
                 }

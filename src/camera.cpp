@@ -61,19 +61,37 @@ bool Camera::open(int width, int height) {
         return false;
     }
     
-    // Set format to MJPEG
+    // Set format - try GREY first (IR cameras are superior), then MJPEG (RGB), then YUYV (fallback)
     struct v4l2_format fmt;
     memset(&fmt, 0, sizeof(fmt));
     fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     fmt.fmt.pix.width = width_;
     fmt.fmt.pix.height = height_;
-    fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_MJPEG;
     fmt.fmt.pix.field = V4L2_FIELD_NONE;
     
-    if (ioctl(fd_, VIDIOC_S_FMT, &fmt) < 0) {
-        Logger::getInstance().error("VIDIOC_S_FMT failed (MJPEG format) for device: " + device_path_);
-        close();
-        return false;
+    // Try GREY first (IR cameras - best for face recognition!)
+    fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_GREY;
+    if (ioctl(fd_, VIDIOC_S_FMT, &fmt) == 0) {
+        format_ = FORMAT_GREY;
+        Logger::getInstance().info("Camera format: GREY (IR camera) - Optimal for face recognition!");
+    } else {
+        // Try MJPEG (RGB cameras)
+        fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_MJPEG;
+        if (ioctl(fd_, VIDIOC_S_FMT, &fmt) == 0) {
+            format_ = FORMAT_MJPEG;
+            Logger::getInstance().info("Camera format: MJPEG (RGB camera)");
+        } else {
+            // Try YUYV as fallback (uncompressed RGB)
+            fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_YUYV;
+            if (ioctl(fd_, VIDIOC_S_FMT, &fmt) == 0) {
+                format_ = FORMAT_YUYV;
+                Logger::getInstance().info("Camera format: YUYV (RGB camera, uncompressed)");
+            } else {
+                Logger::getInstance().error("No supported format found for device: " + device_path_);
+                close();
+                return false;
+            }
+        }
     }
     
     // Update actual resolution
@@ -161,12 +179,14 @@ bool Camera::open(int width, int height) {
     }
     streaming_ = true;
     
-    // Initialize TurboJPEG decompressor
-    tjhandle_ = tjInitDecompress();
-    if (!tjhandle_) {
-        Logger::getInstance().error("Failed to initialize TurboJPEG for device: " + device_path_);
-        close();
-        return false;
+    // Initialize TurboJPEG decompressor (only for MJPEG format)
+    if (format_ == FORMAT_MJPEG) {
+        tjhandle_ = tjInitDecompress();
+        if (!tjhandle_) {
+            Logger::getInstance().error("Failed to initialize TurboJPEG for device: " + device_path_);
+            close();
+            return false;
+        }
     }
     
     return true;
@@ -227,34 +247,108 @@ bool Camera::read(Image& frame) {
         return false;
     }
     
-    // Decompress MJPEG using TurboJPEG
-    int jpeg_width, jpeg_height, jpeg_subsamp, jpeg_colorspace;
-    if (tjDecompressHeader3(tjhandle_, 
-                           (unsigned char*)buffers_[buf.index].start,
-                           buf.bytesused,
-                           &jpeg_width, &jpeg_height, 
-                           &jpeg_subsamp, &jpeg_colorspace) < 0) {
-        Logger::getInstance().debug("tjDecompressHeader3 failed: " + std::string(tjGetErrorStr()));
-        ioctl(fd_, VIDIOC_QBUF, &buf);
-        return false;
-    }
+    bool success = false;
     
-    // Allocate/reallocate frame if needed (reuses memory if same size)
-    if (frame.empty() || frame.width() != jpeg_width || frame.height() != jpeg_height) {
-        frame = Image(jpeg_width, jpeg_height, 3);  // BGR = 3 channels
-    }
-    
-    // Decompress to RGB directly into our aligned Image buffer
-    if (tjDecompress2(tjhandle_,
-                     (unsigned char*)buffers_[buf.index].start,
-                     buf.bytesused,
-                     frame.data(),
-                     jpeg_width, 0, jpeg_height,
-                     TJPF_BGR,
-                     TJFLAG_FASTDCT) < 0) {
-        Logger::getInstance().debug("tjDecompress2 failed: " + std::string(tjGetErrorStr()));
-        ioctl(fd_, VIDIOC_QBUF, &buf);
-        return false;
+    // Handle different camera formats
+    if (format_ == FORMAT_MJPEG) {
+        // Decompress MJPEG using TurboJPEG
+        int jpeg_width, jpeg_height, jpeg_subsamp, jpeg_colorspace;
+        if (tjDecompressHeader3(tjhandle_, 
+                               (unsigned char*)buffers_[buf.index].start,
+                               buf.bytesused,
+                               &jpeg_width, &jpeg_height, 
+                               &jpeg_subsamp, &jpeg_colorspace) < 0) {
+            Logger::getInstance().debug("tjDecompressHeader3 failed: " + std::string(tjGetErrorStr()));
+            ioctl(fd_, VIDIOC_QBUF, &buf);
+            return false;
+        }
+        
+        // Allocate/reallocate frame if needed (reuses memory if same size)
+        if (frame.empty() || frame.width() != jpeg_width || frame.height() != jpeg_height) {
+            frame = Image(jpeg_width, jpeg_height, 3);  // BGR = 3 channels
+        }
+        
+        // Decompress to BGR directly into our aligned Image buffer
+        if (tjDecompress2(tjhandle_,
+                         (unsigned char*)buffers_[buf.index].start,
+                         buf.bytesused,
+                         frame.data(),
+                         jpeg_width, 0, jpeg_height,
+                         TJPF_BGR,
+                         TJFLAG_FASTDCT) < 0) {
+            Logger::getInstance().debug("tjDecompress2 failed: " + std::string(tjGetErrorStr()));
+            ioctl(fd_, VIDIOC_QBUF, &buf);
+            return false;
+        }
+        success = true;
+        
+    } else if (format_ == FORMAT_GREY) {
+        // IR camera - 8-bit grayscale, convert to BGR for compatibility
+        // Allocate/reallocate frame if needed
+        if (frame.empty() || frame.width() != width_ || frame.height() != height_) {
+            frame = Image(width_, height_, 3);  // BGR = 3 channels
+        }
+        
+        // Copy grayscale data and replicate to all 3 channels (B=G=R for grayscale)
+        unsigned char* grey_data = (unsigned char*)buffers_[buf.index].start;
+        unsigned char* bgr_data = frame.data();
+        
+        for (int i = 0; i < width_ * height_; i++) {
+            unsigned char grey_value = grey_data[i];
+            bgr_data[i * 3 + 0] = grey_value;  // B
+            bgr_data[i * 3 + 1] = grey_value;  // G
+            bgr_data[i * 3 + 2] = grey_value;  // R
+        }
+        success = true;
+        
+    } else if (format_ == FORMAT_YUYV) {
+        // YUV 4:2:2 format - convert to BGR
+        // Allocate/reallocate frame if needed
+        if (frame.empty() || frame.width() != width_ || frame.height() != height_) {
+            frame = Image(width_, height_, 3);  // BGR = 3 channels
+        }
+        
+        // Convert YUYV to BGR
+        unsigned char* yuyv_data = (unsigned char*)buffers_[buf.index].start;
+        unsigned char* bgr_data = frame.data();
+        
+        for (int i = 0; i < width_ * height_ / 2; i++) {
+            int y0 = yuyv_data[i * 4 + 0];
+            int u  = yuyv_data[i * 4 + 1];
+            int y1 = yuyv_data[i * 4 + 2];
+            int v  = yuyv_data[i * 4 + 3];
+            
+            // Convert YUV to RGB (simplified, fast conversion)
+            int c = y0 - 16;
+            int d = u - 128;
+            int e = v - 128;
+            
+            int r0 = (298 * c + 409 * e + 128) >> 8;
+            int g0 = (298 * c - 100 * d - 208 * e + 128) >> 8;
+            int b0 = (298 * c + 516 * d + 128) >> 8;
+            
+            c = y1 - 16;
+            int r1 = (298 * c + 409 * e + 128) >> 8;
+            int g1 = (298 * c - 100 * d - 208 * e + 128) >> 8;
+            int b1 = (298 * c + 516 * d + 128) >> 8;
+            
+            // Clamp values
+            r0 = r0 < 0 ? 0 : (r0 > 255 ? 255 : r0);
+            g0 = g0 < 0 ? 0 : (g0 > 255 ? 255 : g0);
+            b0 = b0 < 0 ? 0 : (b0 > 255 ? 255 : b0);
+            r1 = r1 < 0 ? 0 : (r1 > 255 ? 255 : r1);
+            g1 = g1 < 0 ? 0 : (g1 > 255 ? 255 : g1);
+            b1 = b1 < 0 ? 0 : (b1 > 255 ? 255 : b1);
+            
+            // Store as BGR
+            bgr_data[i * 6 + 0] = b0;
+            bgr_data[i * 6 + 1] = g0;
+            bgr_data[i * 6 + 2] = r0;
+            bgr_data[i * 6 + 3] = b1;
+            bgr_data[i * 6 + 4] = g1;
+            bgr_data[i * 6 + 5] = r1;
+        }
+        success = true;
     }
     
     // Requeue buffer
@@ -263,7 +357,7 @@ bool Camera::read(Image& frame) {
         return false;
     }
     
-    return true;
+    return success;
 }
 
 std::vector<std::string> Camera::listDevices() {
