@@ -1,4 +1,4 @@
-#include "presence_guard.h"
+#include "guard.h"
 #include "../systemd_helper.h"
 #include "../lid_detector.h"
 #include <unistd.h>

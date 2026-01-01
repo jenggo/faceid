@@ -7,7 +7,7 @@
 #include <mutex>
 #include <chrono>
 #include <memory>
-#include "presence_guard.h"
+#include "guard.h"
 #include "../camera.h"
 #include "../image.h"
 #include "../face_detector.h"  // For face tracking support

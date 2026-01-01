@@ -7,6 +7,9 @@
 #include <unistd.h>
 #include <systemd/sd-login.h>
 #include <string.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <errno.h>
 #include "../config.h"
 #include "../logger.h"
 #include "../fingerprint_auth.h"
@@ -25,21 +28,156 @@
 
 using namespace faceid;
 
-// Simplified locking: No file-based lock needed
-// PAM authentication is inherently serialized by the PAM stack
+// System-wide file-based lock to prevent concurrent authentication attempts
+// Uses POSIX file locking (fcntl) for robust cross-process synchronization
 class SystemWideLock {
-public:
-    SystemWideLock() = default;
-    ~SystemWideLock() = default;
+private:
+    int lock_fd;
+    bool is_locked;
+    static constexpr const char* LOCK_FILE_PATH = "/var/run/faceid.lock";
     
-    bool acquireWithTimeout(int /*timeout_seconds*/ = 10) { 
-        return true; 
+public:
+    SystemWideLock() : lock_fd(-1), is_locked(false) {}
+    
+    ~SystemWideLock() {
+        if (is_locked) {
+            release();
+        }
+    }
+    
+    // Acquire lock with blocking wait (returns true on success, false on error)
+    // This will WAIT until the lock is available (no timeout)
+    bool acquire() {
+        // Open or create lock file
+        lock_fd = open(LOCK_FILE_PATH, O_CREAT | O_RDWR, 0666);
+        if (lock_fd == -1) {
+            syslog(LOG_ERR, "pam_faceid: Failed to open lock file %s: %s", 
+                   LOCK_FILE_PATH, strerror(errno));
+            return false;
+        }
+        
+        // Write current PID to lock file for debugging
+        pid_t pid = getpid();
+        std::string pid_str = std::to_string(pid) + "\n";
+        if (write(lock_fd, pid_str.c_str(), pid_str.length()) == -1) {
+            syslog(LOG_WARNING, "pam_faceid: Failed to write PID to lock file: %s", 
+                   strerror(errno));
+        }
+        
+        // Set up file lock structure
+        struct flock fl;
+        fl.l_type = F_WRLCK;    // Exclusive write lock
+        fl.l_whence = SEEK_SET; // Lock from beginning of file
+        fl.l_start = 0;         // Start at byte 0
+        fl.l_len = 0;           // Lock entire file
+        fl.l_pid = pid;
+        
+        syslog(LOG_INFO, "pam_faceid: Attempting to acquire system-wide lock (PID: %d)", pid);
+        
+        // F_SETLKW: Set lock and WAIT (blocks until lock is available)
+        if (fcntl(lock_fd, F_SETLKW, &fl) == -1) {
+            syslog(LOG_ERR, "pam_faceid: Failed to acquire lock: %s", strerror(errno));
+            close(lock_fd);
+            lock_fd = -1;
+            return false;
+        }
+        
+        is_locked = true;
+        syslog(LOG_INFO, "pam_faceid: System-wide lock acquired successfully (PID: %d)", pid);
+        return true;
+    }
+    
+    // Acquire lock with timeout (for backwards compatibility)
+    // timeout_seconds: Maximum time to wait for lock
+    bool acquireWithTimeout(int timeout_seconds = 10) {
+        // Open or create lock file
+        lock_fd = open(LOCK_FILE_PATH, O_CREAT | O_RDWR, 0666);
+        if (lock_fd == -1) {
+            syslog(LOG_ERR, "pam_faceid: Failed to open lock file %s: %s", 
+                   LOCK_FILE_PATH, strerror(errno));
+            return false;
+        }
+        
+        pid_t pid = getpid();
+        std::string pid_str = std::to_string(pid) + "\n";
+        if (write(lock_fd, pid_str.c_str(), pid_str.length()) == -1) {
+            syslog(LOG_WARNING, "pam_faceid: Failed to write PID to lock file: %s", 
+                   strerror(errno));
+        }
+        
+        // Set up file lock structure
+        struct flock fl;
+        fl.l_type = F_WRLCK;
+        fl.l_whence = SEEK_SET;
+        fl.l_start = 0;
+        fl.l_len = 0;
+        fl.l_pid = pid;
+        
+        syslog(LOG_INFO, "pam_faceid: Attempting to acquire lock with %d second timeout (PID: %d)", 
+               timeout_seconds, pid);
+        
+        // Try to acquire lock with polling (for timeout support)
+        auto start_time = std::chrono::steady_clock::now();
+        while (true) {
+            // F_SETLK: Try to set lock without blocking
+            if (fcntl(lock_fd, F_SETLK, &fl) != -1) {
+                is_locked = true;
+                syslog(LOG_INFO, "pam_faceid: Lock acquired successfully (PID: %d)", pid);
+                return true;
+            }
+            
+            if (errno != EACCES && errno != EAGAIN) {
+                syslog(LOG_ERR, "pam_faceid: Lock acquisition failed: %s", strerror(errno));
+                close(lock_fd);
+                lock_fd = -1;
+                return false;
+            }
+            
+            // Check timeout
+            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::steady_clock::now() - start_time).count();
+            if (elapsed >= timeout_seconds) {
+                syslog(LOG_WARNING, "pam_faceid: Lock acquisition timeout after %ld seconds", elapsed);
+                close(lock_fd);
+                lock_fd = -1;
+                return false;
+            }
+            
+            // Sleep briefly before retrying
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+    }
+    
+    // Release the lock
+    void release() {
+        if (!is_locked || lock_fd == -1) {
+            return;
+        }
+        
+        // Set up unlock structure
+        struct flock fl;
+        fl.l_type = F_UNLCK;    // Unlock
+        fl.l_whence = SEEK_SET;
+        fl.l_start = 0;
+        fl.l_len = 0;
+        fl.l_pid = getpid();
+        
+        // Release the lock
+        if (fcntl(lock_fd, F_SETLK, &fl) == -1) {
+            syslog(LOG_ERR, "pam_faceid: Failed to release lock: %s", strerror(errno));
+        } else {
+            syslog(LOG_INFO, "pam_faceid: System-wide lock released (PID: %d)", getpid());
+        }
+        
+        close(lock_fd);
+        lock_fd = -1;
+        is_locked = false;
     }
 };
 
 // Check if we should skip biometric authentication
 // Returns true if biometric should be skipped, false if it should proceed
-static bool should_skip_biometric(pam_handle_t *pamh, const char* username) {
+static bool should_skip_biometric(pam_handle_t *pamh, const char* username, const std::string& camera_device) {
     // Check 1: Password already in PAM stack?
     // This happens when:
     // - SDDM/GDM pre-provided password
@@ -62,13 +200,16 @@ static bool should_skip_biometric(pam_handle_t *pamh, const char* username) {
     }
     
     // Check 3: Camera device accessible?
-    // Polkit and other restricted contexts may not have /dev/video0 visible
-    if (access("/dev/video0", F_OK) != 0) {
-        syslog(LOG_INFO, "pam_faceid: Camera device not accessible (namespace/permission issue), skipping biometric for user %s", username);
+    // Check the configured camera device (from config), not hardcoded /dev/video0
+    // Polkit and other restricted contexts may not have camera visible
+    if (access(camera_device.c_str(), F_OK) != 0) {
+        syslog(LOG_INFO, "pam_faceid: Camera device %s not accessible (in use or permission issue), skipping biometric for user %s", 
+               camera_device.c_str(), username);
         return true;
     }
     
     // Proceed with biometric authentication
+    syslog(LOG_DEBUG, "pam_faceid: Camera device %s accessible, proceeding with biometric", camera_device.c_str());
     return false;
 }
 
@@ -232,7 +373,13 @@ static bool authenticate_user(const char* username) {
                 }
                 
                 double threshold = config.getDouble("recognition", "threshold").value_or(0.6);
-                // tracking_interval no longer needed - cascade detection handles optimization
+                
+                // Get detection confidence threshold from config
+                float detection_confidence = config.getDouble("face_detection", "confidence").value_or(0.31);
+                
+                logger.debug(std::string("Starting face detection with cascading detection (confidence: ") + 
+                           std::to_string(detection_confidence) + ")");
+                syslog(LOG_DEBUG, "pam_faceid: Using cascading detection with confidence: %.3f", detection_confidence);
                 
                 auto start = std::chrono::steady_clock::now();
                 while (!cancel_flag.load() && std::chrono::duration_cast<std::chrono::seconds>(
@@ -243,16 +390,26 @@ static bool authenticate_user(const char* username) {
                         continue;
                     }
                     
-                    // Use cascading detection for robust face detection in all lighting conditions
-                    // This automatically falls back through multiple stages if needed
-                    auto cascade_result = detector.detectFacesCascade(frame.view(), false);
+                    // Use cascading detection for robust face detection across all lighting conditions
+                    // This automatically tries 3 stages: standard CLAHE, aggressive CLAHE, and fallback detector
+                    auto cascade_result = detector.detectFacesCascade(frame.view(), false, detection_confidence);
                     
                     if (cascade_result.faces.empty()) {
                         continue;
                     }
                     
-                    // Use the preprocessed frame from cascade for encoding
-                    auto encodings = detector.encodeFaces(cascade_result.processed_frame.view(), cascade_result.faces);
+                    // Log which cascade stage was used for detection
+                    if (cascade_result.stage_used > 1) {
+                        logger.debug(std::string("Face detected using cascade stage ") + 
+                                   std::to_string(cascade_result.stage_used) + 
+                                   " (brightness: " + std::to_string(cascade_result.avg_brightness) + ")");
+                        syslog(LOG_DEBUG, "pam_faceid: Cascade stage %d used (brightness: %.2f)", 
+                               cascade_result.stage_used, cascade_result.avg_brightness);
+                    }
+                    
+                    // Encode faces using the preprocessed frame from cascade
+                    auto encodings = detector.encodeFaces(cascade_result.processed_frame.view(), 
+                                                         cascade_result.faces);
                     if (encodings.empty()) {
                         continue;
                     }
@@ -290,7 +447,10 @@ static bool authenticate_user(const char* username) {
                         // 2. Best match is the current user (not another user)
                         if (best_distance < threshold && best_match_user == username) {
                             logger.info(std::string("Face matched for user ") + username + 
-                                      " (distance: " + std::to_string(best_distance) + ")");
+                                      " (distance: " + std::to_string(best_distance) + 
+                                      ", cascade stage: " + std::to_string(cascade_result.stage_used) + ")");
+                            syslog(LOG_INFO, "pam_faceid: Face match success (distance: %.3f, cascade stage: %d)", 
+                                   best_distance, cascade_result.stage_used);
                             return true;
                         } else if (best_distance < threshold && best_match_user != username) {
                             // Face matched a different user - log security event
@@ -450,12 +610,44 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags,
     syslog(LOG_INFO, "pam_faceid: authenticate called (PID: %d, UID: %d, GID: %d, exe: %s)", 
            getpid(), getuid(), getgid(), len != -1 ? exe_path : "unknown");
     
-    // Try to acquire system-wide lock with timeout
+    // Get username first (before lock acquisition)
+    const char* username = nullptr;
+    int ret = pam_get_user(pamh, &username, nullptr);
+    
+    if (ret != PAM_SUCCESS || username == nullptr) {
+        closelog();
+        return PAM_USER_UNKNOWN;
+    }
+    
+    // Load configuration EARLY (before skip checks) to read camera device
+    Config& config = Config::getInstance();
+    const std::string config_path = std::string(CONFIG_DIR) + "/faceid.conf";
+    if (!config.load(config_path)) {
+        syslog(LOG_ERR, "pam_faceid: Failed to load configuration from %s", config_path.c_str());
+        closelog();
+        return PAM_AUTH_ERR;
+    }
+    
+    // Get configured camera device
+    auto camera_device = config.getString("camera", "device").value_or("/dev/video0");
+    syslog(LOG_DEBUG, "pam_faceid: Using camera device: %s", camera_device.c_str());
+    
+    // Check if we should skip biometric authentication (before acquiring lock)
+    // This allows fast-path exit for SSH, no camera, password already provided, etc.
+    if (should_skip_biometric(pamh, username, camera_device)) {
+        syslog(LOG_INFO, "pam_faceid: Skipping biometric auth (no lock acquired)");
+        closelog();
+        return PAM_AUTH_ERR;  // Let next PAM module handle authentication
+    }
+    
+    // Only acquire lock if we're actually going to perform biometric authentication
+    // This prevents unnecessary lock contention for cases where biometric is not needed
+    syslog(LOG_DEBUG, "pam_faceid: Biometric auth required, acquiring system-wide lock");
     SystemWideLock lock;
-    if (!lock.acquireWithTimeout(10)) {
-        syslog(LOG_WARNING, "pam_faceid: failed to acquire lock - another authentication may be in progress or timed out");
+    if (!lock.acquire()) {
+        syslog(LOG_ERR, "pam_faceid: Failed to acquire system-wide lock (error: %s)", strerror(errno));
         
-        // Send message to user via PAM conversation
+        // Send error message to user via PAM conversation
         struct pam_conv *conv;
         if (pam_get_item(pamh, PAM_CONV, (const void **)&conv) == PAM_SUCCESS && conv && conv->conv) {
             struct pam_message msg;
@@ -463,7 +655,7 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags,
             struct pam_response *resp = nullptr;
             
             msg.msg_style = PAM_ERROR_MSG;
-            msg.msg = const_cast<char*>("FaceID: Another authentication is in progress. Please wait and try again.");
+            msg.msg = const_cast<char*>("FaceID: Failed to acquire authentication lock. Please try again.");
             
             conv->conv(1, &msgp, &resp, conv->appdata_ptr);
             if (resp) {
@@ -476,20 +668,7 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags,
     }
     
     // Don't close syslog yet - authenticate_user() needs it
-    
-    const char* username = nullptr;
-    int ret = pam_get_user(pamh, &username, nullptr);
-    
-    if (ret != PAM_SUCCESS || username == nullptr) {
-        closelog();
-        return PAM_USER_UNKNOWN;
-    }
-    
-    // Check if we should skip biometric authentication
-    if (should_skip_biometric(pamh, username)) {
-        closelog();
-        return PAM_AUTH_ERR;  // Let next PAM module handle authentication
-    }
+    syslog(LOG_DEBUG, "pam_faceid: Lock acquired, proceeding with authentication");
     
     bool success = authenticate_user(username);
     

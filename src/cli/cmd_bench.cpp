@@ -892,9 +892,8 @@ int cmd_bench(const std::string& test_dir, bool show_detail, const std::string& 
                   << std::setw(10) << "Size (MB)"
                   << std::setw(10) << "Thresh"
                   << std::setw(12) << "Encoding"
-                  << std::setw(12) << "Total"
                   << std::setw(10) << "FPS" << std::endl;
-        std::cout << std::string(109, '-') << std::endl;
+        std::cout << std::string(97, '-') << std::endl;
 
         for (const auto& model : recognition_models) {
             if (model.success) {
@@ -903,7 +902,6 @@ int cmd_bench(const std::string& test_dir, bool show_detail, const std::string& 
                           << std::setw(10) << model.file_size_mb
                           << std::setw(10) << (std::to_string(static_cast<int>(model.optimal_threshold * 100)) + "%")
                           << std::setw(12) << (formatMs(model.encoding_time_ms) + " ms")
-                          << std::setw(12) << (formatMs(model.total_time_ms) + " ms")
                           << std::setw(10) << (std::to_string(static_cast<int>(model.fps)) + " fps")
                           << std::endl;
             }

@@ -1,4 +1,4 @@
-#include "presence_detector.h"
+#include "detector.h"
 #include "../logger.h"
 #include "../face_detector.h"
 #include "../image.h"
@@ -14,7 +14,8 @@
 #include <atomic>
 
 // Lock file path for detecting PAM authentication
-static const char* PAM_LOCK_FILE = "/run/lock/pam_faceid.lock";
+// Must match the path used in pam/pam_faceid.cpp SystemWideLock class
+static const char* PAM_LOCK_FILE = "/var/run/faceid.lock";
 
 namespace faceid {
 

@@ -12,8 +12,8 @@
  * 3. AWAY_CONFIRMED: User away (3 failures or 15 min) - LOCK & STOP
  */
 
-#include "presence_detector.h"
-#include "presence_guard.h"
+#include "detector.h"
+#include "guard.h"
 #include "../config.h"
 #include "../logger.h"
 #include <csignal>

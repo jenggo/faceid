@@ -19,8 +19,8 @@ core_sources = files(
     'lid_detector.cpp',
     'display_detector.cpp',
     'systemd_helper.cpp',
-    'presence/presence_guard.cpp',
-    'presence/presence_detector.cpp',
+    'presence/guard.cpp',
+    'presence/detector.cpp',
     'models/binary_model.cpp',
     'models/model_cache.cpp',
     'detectors/retinaface.cpp',
@@ -79,7 +79,7 @@ cli_exe = executable(
 )
 
 # Presence detection daemon
-presence_daemon_sources = files('presence/presence_daemon.cpp')
+presence_daemon_sources = files('presence/daemon.cpp')
 
 presence_daemon_exe = executable(
     'faceid-presence',
