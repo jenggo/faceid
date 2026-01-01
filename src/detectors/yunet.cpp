@@ -45,31 +45,101 @@ std::vector<Rect> detectWithYuNet(ncnn::Net& net, const ncnn::Mat& in, int img_w
         const ncnn::Mat& bbox = bboxes[scale_idx];
         const ncnn::Mat& kps = kpss[scale_idx];
         
-        // YuNet outputs are flattened - reshape to proper grid
-        int total_elements = cls.w * cls.h;
-        int feat_w = (int)std::sqrt(total_elements);
-        int feat_h = feat_w;
+        // DEBUG: Log tensor shapes
+        Logger::getInstance().debug("YuNet scale " + std::to_string(scale_idx) + " (stride=" + std::to_string(stride) + "):");
+        Logger::getInstance().debug("  cls: dims=" + std::to_string(cls.dims) + " w=" + std::to_string(cls.w) + " h=" + std::to_string(cls.h) + " c=" + std::to_string(cls.c));
+        Logger::getInstance().debug("  obj: dims=" + std::to_string(obj.dims) + " w=" + std::to_string(obj.w) + " h=" + std::to_string(obj.h) + " c=" + std::to_string(obj.c));
+        Logger::getInstance().debug("  bbox: dims=" + std::to_string(bbox.dims) + " w=" + std::to_string(bbox.w) + " h=" + std::to_string(bbox.h) + " c=" + std::to_string(bbox.c));
+        Logger::getInstance().debug("  kps: dims=" + std::to_string(kps.dims) + " w=" + std::to_string(kps.w) + " h=" + std::to_string(kps.h) + " c=" + std::to_string(kps.c));
+        
+        // Calculate feature map grid dimensions from input size and stride
+        // This correctly handles both square (320x320, 640x640) and non-square (640x360) inputs
+        // For dynamic models, the grid adapts to input size
+        int feat_w = in.w / stride;  // e.g., 640/8 = 80
+        int feat_h = in.h / stride;  // e.g., 360/8 = 45
+        
+        Logger::getInstance().debug("  feat_grid: " + std::to_string(feat_w) + "x" + std::to_string(feat_h) + 
+                                   " = " + std::to_string(feat_w * feat_h) + " cells");
         
         for (int i = 0; i < feat_h; i++) {
             for (int j = 0; j < feat_w; j++) {
                 int idx = i * feat_w + j;
                 
                 // Score = cls * obj (both already sigmoid activated)
-                float cls_score = cls.channel(0)[idx];
-                float obj_score = obj.channel(0)[idx];
+                // Access pattern depends on tensor layout
+                float cls_score, obj_score;
+                
+                if (cls.dims == 1) {
+                    // 1D tensor: direct index
+                    cls_score = cls[idx];
+                    obj_score = obj[idx];
+                } else if (cls.dims == 2) {
+                    if (cls.w == 1) {
+                        // Shape (1, H*W): stored as H*W rows with 1 column each
+                        // Access: cls.row(idx)[0] - row idx, column 0
+                        cls_score = cls.row(idx)[0];
+                        obj_score = obj.row(idx)[0];
+                    } else if (cls.h == 1) {
+                        // Shape (W*H, 1): w-major, access as cls[idx]
+                        cls_score = ((const float*)cls.data)[idx];
+                        obj_score = ((const float*)obj.data)[idx];
+                    } else {
+                        // Shape (W, H): use row-col access
+                        cls_score = cls.row(i)[j];
+                        obj_score = obj.row(i)[j];
+                    }
+                } else {
+                    // 3D: use row-col access
+                    cls_score = cls.row(i)[j];
+                    obj_score = obj.row(i)[j];
+                }
+                
                 float score = cls_score * obj_score;
                 
                 if (score < conf_threshold) continue;
                 
-                // Decode bbox - YuNet uses center+size format (libfacedetection compatible)
-                // NCNN bbox shape (4, H*W) is stored row-major: [cx, cy, w, h] interleaved
-                const float* bbox_ptr = (const float*)bbox.data;
+                // Decode bbox - YuNet uses center+size format
+                // Bbox shapes: (4, H*W) or (1, 4*H*W) or (4*H*W, 1) or (H, W, 4)
+                float cx_offset, cy_offset, w_log, h_log;
                 
-                // Row-major access: each position has 4 consecutive values
-                float cx_offset = bbox_ptr[idx * 4 + 0];
-                float cy_offset = bbox_ptr[idx * 4 + 1];
-                float w_log = bbox_ptr[idx * 4 + 2];
-                float h_log = bbox_ptr[idx * 4 + 3];
+                if (bbox.dims == 1) {
+                    // 1D: (4*H*W) flattened - [cx, cy, w, h] interleaved
+                    const float* bbox_ptr = (const float*)bbox.data;
+                    cx_offset = bbox_ptr[idx * 4 + 0];
+                    cy_offset = bbox_ptr[idx * 4 + 1];
+                    w_log = bbox_ptr[idx * 4 + 2];
+                    h_log = bbox_ptr[idx * 4 + 3];
+                } else if (bbox.dims == 2) {
+                    if (bbox.w == 4) {
+                        // Shape (4, H*W): stored as H*W rows with 4 columns each
+                        // NCNN uses row-major: bbox.row(idx) gives row idx, then [0..3] for columns
+                        cx_offset = bbox.row(idx)[0];
+                        cy_offset = bbox.row(idx)[1];
+                        w_log = bbox.row(idx)[2];
+                        h_log = bbox.row(idx)[3];
+                    } else if (bbox.h == 1) {
+                        // Shape (4*H*W, 1): fully flattened
+                        const float* bbox_ptr = (const float*)bbox.data;
+                        cx_offset = bbox_ptr[idx * 4 + 0];
+                        cy_offset = bbox_ptr[idx * 4 + 1];
+                        w_log = bbox_ptr[idx * 4 + 2];
+                        h_log = bbox_ptr[idx * 4 + 3];
+                    } else {
+                        // Shape (W, H) with implicit c=4
+                        const float* bbox_row = bbox.row(i);
+                        cx_offset = bbox_row[j * 4 + 0];
+                        cy_offset = bbox_row[j * 4 + 1];
+                        w_log = bbox_row[j * 4 + 2];
+                        h_log = bbox_row[j * 4 + 3];
+                    }
+                } else {
+                    // 3D: (W, H) with c=4 - row-col with channels
+                    const float* bbox_row = bbox.row(i);
+                    cx_offset = bbox_row[j * 4 + 0];
+                    cy_offset = bbox_row[j * 4 + 1];
+                    w_log = bbox_row[j * 4 + 2];
+                    h_log = bbox_row[j * 4 + 3];
+                }
                 
                 float anchor_x = (j + 0.5f) * stride;
                 float anchor_y = (i + 0.5f) * stride;
@@ -105,12 +175,38 @@ std::vector<Rect> detectWithYuNet(ncnn::Net& net, const ncnn::Mat& in, int img_w
                     faceobj.prob = score;
                     
                     // Decode 5-point landmarks (2 eyes, nose, 2 mouth corners)
-                    // YuNet outputs landmarks in normalized format relative to the feature map
-                    // Data layout: (w=10, h=grid_size, c=1) - row-major with 10 values per cell
-                    const float* kps_ptr = (const float*)kps.data;
+                    // Kps shape: (10, H*W) for fixed, or (H, W, 10) for dynamic
                     for (int k = 0; k < 5; k++) {
-                        float kps_x_raw = kps_ptr[idx * 10 + k * 2];
-                        float kps_y_raw = kps_ptr[idx * 10 + k * 2 + 1];
+                        float kps_x_raw, kps_y_raw;
+                        
+                        if (kps.dims == 1) {
+                            // Fixed: (10*H*W) flattened - [x0,y0,x1,y1,...] interleaved
+                            const float* kps_ptr = (const float*)kps.data;
+                            kps_x_raw = kps_ptr[idx * 10 + k * 2];
+                            kps_y_raw = kps_ptr[idx * 10 + k * 2 + 1];
+                        } else if (kps.dims == 2) {
+                            if (kps.w == 10) {
+                                // Shape (10, H*W): stored as H*W rows with 10 columns each
+                                // NCNN uses row-major: kps.row(idx) gives row idx, then [0..9] for columns
+                                kps_x_raw = kps.row(idx)[k * 2];
+                                kps_y_raw = kps.row(idx)[k * 2 + 1];
+                            } else if (kps.h == 1) {
+                                // Shape (10*H*W, 1): fully flattened
+                                const float* kps_ptr = (const float*)kps.data;
+                                kps_x_raw = kps_ptr[idx * 10 + k * 2];
+                                kps_y_raw = kps_ptr[idx * 10 + k * 2 + 1];
+                            } else {
+                                // Shape (W, H) with implicit c=10
+                                const float* kps_row = kps.row(i);
+                                kps_x_raw = kps_row[j * 10 + k * 2];
+                                kps_y_raw = kps_row[j * 10 + k * 2 + 1];
+                            }
+                        } else {
+                            // 3D: (W, H) with c=10 - row-col with channels
+                            const float* kps_row = kps.row(i);
+                            kps_x_raw = kps_row[j * 10 + k * 2];
+                            kps_y_raw = kps_row[j * 10 + k * 2 + 1];
+                        }
                         
                         // Use grid cell + offset interpretation
                         float kps_x = (j + kps_x_raw) * stride;
@@ -134,28 +230,27 @@ std::vector<Rect> detectWithYuNet(ncnn::Net& net, const ncnn::Mat& in, int img_w
     std::vector<int> picked;
     nms_sorted_bboxes(proposals, picked, nms_threshold);
     
-    // Convert to Rect - keep only largest box if multiple detections
+    // Convert to Rect - return all detected faces (not just largest)
+    // Filter out invalid boxes (must have minimum size)
     std::vector<Rect> faces;
-    FaceObject* best = nullptr;
-    float max_area = 0;
+    const int min_face_size = 20;  // Minimum 20x20 pixels
     
     for (int idx : picked) {
         FaceObject& faceobj = proposals[idx];
-        float area = faceobj.rect.width * faceobj.rect.height;
-        if (area > max_area) {
-            max_area = area;
-            best = &faceobj;
+        
+        // Validate box dimensions
+        int w = (int)faceobj.rect.width;
+        int h = (int)faceobj.rect.height;
+        
+        if (w >= min_face_size && h >= min_face_size) {
+            Rect r;
+            r.x = (int)faceobj.rect.x;
+            r.y = (int)faceobj.rect.y;
+            r.width = w;
+            r.height = h;
+            r.landmarks = faceobj.rect.landmarks;  // Copy landmarks
+            faces.push_back(r);
         }
-    }
-    
-    if (best) {
-        Rect r;
-        r.x = (int)best->rect.x;
-        r.y = (int)best->rect.y;
-        r.width = (int)best->rect.width;
-        r.height = (int)best->rect.height;
-        r.landmarks = best->rect.landmarks;  // Copy landmarks
-        faces.push_back(r);
     }
     
     return faces;

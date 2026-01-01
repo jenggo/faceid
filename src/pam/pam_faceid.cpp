@@ -232,7 +232,7 @@ static bool authenticate_user(const char* username) {
                 }
                 
                 double threshold = config.getDouble("recognition", "threshold").value_or(0.6);
-                int tracking_interval = config.getInt("face_detection", "tracking_interval").value_or(10);
+                // tracking_interval no longer needed - cascade detection handles optimization
                 
                 auto start = std::chrono::steady_clock::now();
                 while (!cancel_flag.load() && std::chrono::duration_cast<std::chrono::seconds>(
@@ -243,24 +243,23 @@ static bool authenticate_user(const char* username) {
                         continue;
                     }
                     
-                    // Preprocess for better detection
-                    faceid::Image processed_frame = detector.preprocessFrame(frame.view());
+                    // Use cascading detection for robust face detection in all lighting conditions
+                    // This automatically falls back through multiple stages if needed
+                    auto cascade_result = detector.detectFacesCascade(frame.view(), false);
                     
-                    // Detect faces (with tracking optimization)
-                    auto faces = detector.detectOrTrackFaces(processed_frame.view(), tracking_interval);
-                    if (faces.empty()) {
+                    if (cascade_result.faces.empty()) {
                         continue;
                     }
                     
-                    // Encode faces
-                    auto encodings = detector.encodeFaces(processed_frame.view(), faces);
+                    // Use the preprocessed frame from cascade for encoding
+                    auto encodings = detector.encodeFaces(cascade_result.processed_frame.view(), cascade_result.faces);
                     if (encodings.empty()) {
                         continue;
                     }
                     
                     // Deduplicate faces - filter out multiple detections of the same person
                     // This prevents false positives from the same face detected at different angles/positions
-                    auto unique_indices = FaceDetector::deduplicateFaces(faces, encodings, 0.15);
+                    auto unique_indices = FaceDetector::deduplicateFaces(cascade_result.faces, encodings, 0.15);
                     
                     // Filter to only unique faces
                     std::vector<FaceEncoding> unique_encodings;

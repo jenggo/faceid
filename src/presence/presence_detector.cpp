@@ -498,21 +498,23 @@ bool PresenceDetector::detectFace() {
          // Convert frame to BGR if needed (Camera might return grayscale)
          Image bgr_frame = std::move(frame);
          if (bgr_frame.channels() != 3) {
-             bgr_frame = convertGrayToBGRLibyuv(bgr_frame.view());
-         }
+          bgr_frame = convertGrayToBGRLibyuv(bgr_frame.view());
+          }
+          
+          // Use cascading detection for robust presence detection in all lighting conditions
+          auto cascade_result = face_detector_->detectFacesCascade(bgr_frame.view(), false);
          
-         // Detect faces with tracking optimization
-         auto faces = face_detector_->detectOrTrackFaces(bgr_frame.view(), tracking_interval_);
-        
-        bool detected = !faces.empty();
-        
-        if (detected) {
-            Logger::getInstance().debug("Face detected in presence check");
-            // Cache frame for peek detection (only if peek enabled)
-            if (no_peek_enabled_) {
-                last_captured_frame_ = bgr_frame.clone();
-            }
-        }
+         bool detected = !cascade_result.faces.empty();
+         
+         if (detected) {
+             Logger::getInstance().debug("Face detected in presence check (stage " + 
+                                       std::to_string(cascade_result.stage_used) + ")");
+             // Cache frame for peek detection (only if peek enabled)
+             if (no_peek_enabled_) {
+                 // Use the preprocessed frame from cascade for consistency
+                 last_captured_frame_ = cascade_result.processed_frame.clone();
+             }
+         }
         
         if (detected) {
             successful_detections_++;
@@ -967,17 +969,23 @@ bool PresenceDetector::detectPeek(const ImageView& frame) {
      Logger& logger = Logger::getInstance();
      
      try {
-         // Use FaceDetector with tracking for peek detection
-         std::vector<Rect> face_rects;
-         
-         if (frame.channels() != 3) {
-             // Convert grayscale to BGR if needed
-             Image bgr_frame = convertGrayToBGRLibyuv(frame);
-             face_rects = face_detector_->detectOrTrackFaces(bgr_frame.view(), tracking_interval_);
-         } else {
-             // Already BGR, just use the frame directly
-             face_rects = face_detector_->detectOrTrackFaces(frame, tracking_interval_);
-         }
+        // Use FaceDetector with tracking for peek detection
+        std::vector<Rect> face_rects;
+        Image processed_frame;
+        
+        if (frame.channels() != 3) {
+            // Convert grayscale to BGR if needed
+            Image bgr_frame = convertGrayToBGRLibyuv(frame);
+            // Use cascading detection for robust peek detection
+            auto cascade_result = face_detector_->detectFacesCascade(bgr_frame.view(), false);
+            processed_frame = std::move(cascade_result.processed_frame);
+            face_rects = cascade_result.faces;
+        } else {
+            // Already BGR, use cascading detection
+            auto cascade_result = face_detector_->detectFacesCascade(frame, false);
+            processed_frame = std::move(cascade_result.processed_frame);
+            face_rects = cascade_result.faces;
+        }
          
          if (face_rects.empty()) {
              return false;  // No faces at all

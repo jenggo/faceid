@@ -16,6 +16,7 @@
 #include <memory>
 #include <unordered_map>
 #include <mutex>
+#include <chrono>
 
 namespace faceid {
 
@@ -570,6 +571,81 @@ bool FaceDetector::loadModels(const std::string& model_base_path, const std::str
             }
         }
         
+        // Load detection2 model (cascade fallback) - Optional
+        std::string detection2_base = std::string(MODELS_DIR) + "/detection2";
+        std::string detection2_param = detection2_base + ".param";
+        std::string detection2_bin = detection2_base + ".bin";
+        
+        std::ifstream det2_param_check(detection2_param);
+        std::ifstream det2_bin_check(detection2_bin);
+        
+        if (det2_param_check.good() && det2_bin_check.good()) {
+            Logger::getInstance().debug("Found detection2 model (cascade fallback): detection2.{param,bin}");
+            
+            bool det2_was_cached = isModelCached(detection2_param, detection2_bin);
+            if (det2_was_cached) {
+                Logger::getInstance().debug("Detection2 model cache HIT");
+            }
+            
+            detection2_net_.opt.use_vulkan_compute = false;
+            detection2_net_.opt.num_threads = 4;
+            detection2_net_.opt.use_fp16_packed = false;
+            detection2_net_.opt.use_fp16_storage = false;
+            
+            ret = detection2_net_.load_param(detection2_param.c_str());
+            if (ret == 0) {
+                ret = detection2_net_.load_model(detection2_bin.c_str());
+                if (ret == 0) {
+                    detection2_model_loaded_ = true;
+                    
+                    if (!det2_was_cached) {
+                        markModelCached(detection2_param, detection2_bin);
+                    }
+                    
+                    // Auto-detect detection2 model type
+                    detection2_model_type_ = detectModelType(detection2_param);
+                    detection2_model_name_ = "detection2";
+                    
+                    // Try to read original detection2 model name from .use file
+                    std::ifstream use_stream2(use_file);
+                    if (use_stream2.good()) {
+                        std::string line;
+                        while (std::getline(use_stream2, line)) {
+                            if (line.empty() || line[0] == '#') continue;
+                            
+                            size_t eq_pos = line.find('=');
+                            if (eq_pos != std::string::npos) {
+                                std::string key = line.substr(0, eq_pos);
+                                std::string value = line.substr(eq_pos + 1);
+                                if (key == "detection2") {
+                                    detection2_model_name_ = value;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    
+                    std::string model_type_str2;
+                    switch (detection2_model_type_) {
+                        case DetectionModelType::RETINAFACE: model_type_str2 = "RetinaFace"; break;
+                        case DetectionModelType::YUNET: model_type_str2 = "YuNet"; break;
+                        case DetectionModelType::YOLOV5: model_type_str2 = "YOLOv5-Face"; break;
+                        case DetectionModelType::YOLOV7: model_type_str2 = "YOLOv7-Face"; break;
+                        case DetectionModelType::YOLOV8: model_type_str2 = "YOLOv8-Face"; break;
+                        default: model_type_str2 = "Unknown"; break;
+                    }
+                    
+                    Logger::getInstance().debug("Detection2 model loaded successfully: " + detection2_model_name_ + " (type: " + model_type_str2 + ")");
+                } else {
+                    Logger::getInstance().debug("Detection2 model bin failed to load (ret=" + std::to_string(ret) + ")");
+                }
+            } else {
+                Logger::getInstance().debug("Detection2 model param failed to load (ret=" + std::to_string(ret) + ")");
+            }
+        } else {
+            Logger::getInstance().debug("Detection2 model not found (optional, will skip cascade stage 3)");
+        }
+        
         return true;
     } catch (const std::exception& e) {
         return false;
@@ -674,16 +750,16 @@ std::vector<Rect> FaceDetector::detectWithYuNet(const ncnn::Mat& in, int img_w, 
     return ::faceid::detectWithYuNet(retinaface_net_, in, img_w, img_h, confidence_threshold);
 }
 
-std::vector<Rect> FaceDetector::detectOrTrackFaces(const ImageView& frame, int track_interval) {
+std::vector<Rect> FaceDetector::detectOrTrackFaces(const ImageView& frame, int track_interval, float confidence_threshold) {
     // Always detect if tracking disabled (track_interval == 0)
     if (track_interval == 0) {
-        return detectFaces(frame);
+        return detectFaces(frame, false, confidence_threshold);
     }
     
     // Detect if we haven't initialized tracking yet or interval reached
     if (!tracking_initialized_ || frames_since_detection_ >= track_interval) {
         // Run full detection
-        std::vector<Rect> faces = detectFaces(frame);
+        std::vector<Rect> faces = detectFaces(frame, false, confidence_threshold);
         
         // Initialize tracking
         if (!faces.empty()) {
@@ -1117,8 +1193,38 @@ Image FaceDetector::preprocessFrame(const ImageView& frame) {
         width, height
     );
     
+    // Calculate average brightness from Y channel for adaptive CLAHE
+    uint64_t sum = 0;
+    const uint8_t* y_data = y_plane.data();
+    int total_pixels = width * height;
+    for (int i = 0; i < total_pixels; i++) {
+        sum += y_data[i];
+    }
+    float avg_brightness = static_cast<float>(sum) / (total_pixels * 255.0f);
+    
+    // Adaptive CLAHE parameters based on brightness
+    // For IR cameras in low-light conditions, we need more aggressive enhancement
+    double clip_limit;
+    if (avg_brightness < 0.15f) {        // Very dark (e.g., IR in low-light)
+        clip_limit = 4.0;                 // Aggressive enhancement
+    } else if (avg_brightness < 0.30f) { // Dark
+        clip_limit = 3.0;
+    } else if (avg_brightness > 0.70f) { // Bright
+        clip_limit = 1.5;                 // Gentle enhancement
+    } else {                              // Normal lighting
+        clip_limit = 2.0;                 // Current default
+    }
+    
+    // Optional debug logging (controlled by config: [debug] log_brightness = true)
+    if (Config::getInstance().getBool("debug", "log_brightness").value_or(false)) {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "Frame brightness: %.2f, CLAHE clip: %.1f", 
+                 avg_brightness, clip_limit);
+        Logger::getInstance().debug(buf);
+    }
+    
     // Apply CLAHE to Y (luminance) channel only using standalone implementation
-    faceid::CLAHE clahe(2.0, 8, 8);
+    faceid::CLAHE clahe(clip_limit, 8, 8);
     Image y_enhanced(width, height, 1);
     clahe.apply(y_plane.data(), y_enhanced.data(), width, height, width, width);
     
@@ -1132,6 +1238,294 @@ Image FaceDetector::preprocessFrame(const ImageView& frame) {
         width, height
     );
     
+    return result;
+}
+
+// Enhanced preprocessing with more aggressive CLAHE (for very dark/difficult images)
+Image FaceDetector::preprocessFrameAggressive(const ImageView& frame) {
+    // Handle RGBA (4 channels) - extract RGB first
+    Image processed;
+    if (frame.channels() == 4) {
+        Image temp(frame.width(), frame.height(), 3);
+        libyuv::ARGBToRGB24(frame.data(), frame.stride(), temp.data(), temp.stride(), frame.width(), frame.height());
+        processed = std::move(temp);
+    } else {
+        processed = frame.clone();
+    }
+    
+    // Enhance contrast using VERY aggressive CLAHE on YUV color space
+    int width = processed.width();
+    int height = processed.height();
+    
+    // Convert BGR to ARGB (libyuv intermediate format)
+    Image argb_temp(width, height, 4);
+    libyuv::RGB24ToARGB(processed.data(), processed.stride(), argb_temp.data(), argb_temp.stride(), width, height);
+    
+    // Allocate YUV I444 planes
+    Image y_plane(width, height, 1);
+    Image u_plane(width, height, 1);
+    Image v_plane(width, height, 1);
+    
+    // Convert ARGB to I444 (YUV 4:4:4)
+    libyuv::ARGBToI444(
+        argb_temp.data(), argb_temp.stride(),
+        y_plane.data(), y_plane.stride(),
+        u_plane.data(), u_plane.stride(),
+        v_plane.data(), v_plane.stride(),
+        width, height
+    );
+    
+    // Calculate average brightness for adaptive parameters
+    uint64_t sum = 0;
+    const uint8_t* y_data = y_plane.data();
+    int total_pixels = width * height;
+    for (int i = 0; i < total_pixels; i++) {
+        sum += y_data[i];
+    }
+    float avg_brightness = static_cast<float>(sum) / (total_pixels * 255.0f);
+    
+    // MORE aggressive CLAHE parameters for cascade fallback
+    // Using smaller tiles (4×4 vs 8×8) for more localized enhancement
+    double clip_limit;
+    int tile_size;
+    if (avg_brightness < 0.15f) {        // Very dark
+        clip_limit = 6.0;                 // Very aggressive enhancement
+        tile_size = 4;
+    } else if (avg_brightness < 0.30f) { // Dark
+        clip_limit = 4.5;
+        tile_size = 4;
+    } else {                              // Moderate
+        clip_limit = 3.0;
+        tile_size = 6;
+    }
+    
+    // Optional debug logging
+    if (Config::getInstance().getBool("debug", "log_brightness").value_or(false)) {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "Aggressive preprocessing: brightness=%.2f, CLAHE clip=%.1f, tile=%dx%d", 
+                 avg_brightness, clip_limit, tile_size, tile_size);
+        Logger::getInstance().debug(buf);
+    }
+    
+    // Apply aggressive CLAHE to Y (luminance) channel
+    faceid::CLAHE clahe(clip_limit, tile_size, tile_size);
+    Image y_enhanced(width, height, 1);
+    clahe.apply(y_plane.data(), y_enhanced.data(), width, height, width, width);
+    
+    // Convert I444 back to RGB24 (BGR)
+    Image result(width, height, 3);
+    libyuv::I444ToRGB24(
+        y_enhanced.data(), y_enhanced.stride(),
+        u_plane.data(), u_plane.stride(),
+        v_plane.data(), v_plane.stride(),
+        result.data(), result.stride(),
+        width, height
+    );
+    
+    return result;
+}
+
+// Motion detection using simple frame differencing
+bool FaceDetector::detectMotion(const ImageView& current_frame, double threshold) {
+    // Convert current frame to grayscale
+    Image current_gray = toGrayscale(
+        current_frame.data(),
+        current_frame.width(),
+        current_frame.height(),
+        current_frame.stride()
+    );
+    
+    // Initialize on first call
+    if (!motion_initialized_) {
+        motion_prev_frame_ = std::move(current_gray);
+        motion_initialized_ = true;
+        return true;  // Assume motion on first frame
+    }
+    
+    // Check if frame sizes match
+    if (motion_prev_frame_.width() != current_gray.width() ||
+        motion_prev_frame_.height() != current_gray.height()) {
+        motion_prev_frame_ = std::move(current_gray);
+        return true;  // Size changed, assume motion
+    }
+    
+    // Calculate frame difference
+    const uint8_t* prev_data = motion_prev_frame_.data();
+    const uint8_t* curr_data = current_gray.data();
+    int total_pixels = current_gray.width() * current_gray.height();
+    
+    uint64_t diff_sum = 0;
+    for (int i = 0; i < total_pixels; i++) {
+        int diff = std::abs(static_cast<int>(curr_data[i]) - static_cast<int>(prev_data[i]));
+        diff_sum += diff;
+    }
+    
+    // Calculate average difference (normalized 0.0-1.0)
+    double avg_diff = static_cast<double>(diff_sum) / (total_pixels * 255.0);
+    
+    // Update previous frame
+    motion_prev_frame_ = std::move(current_gray);
+    
+    // Motion detected if average difference exceeds threshold
+    bool has_motion = avg_diff > threshold;
+    
+    Logger::getInstance().debug("Motion detection: avg_diff=" + 
+                               std::to_string(avg_diff) + 
+                               " threshold=" + std::to_string(threshold) +
+                               " result=" + (has_motion ? "MOTION" : "STATIC"));
+    
+    return has_motion;
+}
+
+FaceDetector::CascadeResult FaceDetector::detectFacesCascade(
+    const ImageView& frame,
+    bool enable_motion_check,
+    float confidence_threshold) {
+    
+    CascadeResult result;
+    result.stage_used = 0;
+    result.has_motion = true;  // Assume motion by default
+    result.avg_brightness = 0.0;
+    result.stage1_time_ms = 0.0;
+    result.stage2_time_ms = 0.0;
+    result.stage3_time_ms = 0.0;
+    
+    // Use default threshold from config if not specified
+    if (confidence_threshold <= 0.0f) {
+        confidence_threshold = detection_confidence_threshold_;
+    }
+    
+    // Motion detection pre-check (optional optimization)
+    if (enable_motion_check) {
+        result.has_motion = detectMotion(frame, 0.02);  // 2% threshold
+        if (!result.has_motion) {
+            Logger::getInstance().debug("Cascade: No motion detected, skipping detection");
+            return result;
+        }
+    }
+    
+    // Calculate brightness for decision making
+    const uint8_t* data = frame.data();
+    int channels = frame.channels();
+    
+    // Quick brightness estimation from first channel (B in BGR)
+    uint64_t sum = 0;
+    int total_pixels = frame.width() * frame.height();
+    if (channels >= 3) {
+        for (int i = 0; i < total_pixels; i++) {
+            sum += data[i * channels];
+        }
+    } else {
+        for (int i = 0; i < total_pixels; i++) {
+            sum += data[i];
+        }
+    }
+    result.avg_brightness = static_cast<double>(sum) / (total_pixels * 255.0);
+    
+    // Stage 1: Standard preprocessing + primary detector
+    Logger::getInstance().debug("Cascade Stage 1: Standard CLAHE + primary detector");
+    auto stage1_start = std::chrono::high_resolution_clock::now();
+    
+    result.processed_frame = preprocessFrame(frame);
+    result.faces = detectFaces(result.processed_frame.view(), false, confidence_threshold);
+    result.stage_used = 1;
+    
+    auto stage1_end = std::chrono::high_resolution_clock::now();
+    result.stage1_time_ms = std::chrono::duration<double, std::milli>(stage1_end - stage1_start).count();
+    
+    if (!result.faces.empty()) {
+        Logger::getInstance().debug("Cascade Stage 1: SUCCESS - detected " + 
+                                   std::to_string(result.faces.size()) + " face(s) in " +
+                                   std::to_string(result.stage1_time_ms) + "ms");
+        return result;
+    }
+    
+    // Check if we should skip cascade for good lighting + no faces
+    // (clearly nobody is there, don't waste CPU)
+    if (result.avg_brightness > 0.40 && !enable_motion_check) {
+        Logger::getInstance().debug("Cascade Stage 1: No faces in good lighting (brightness=" + 
+                                   std::to_string(result.avg_brightness) + ") - skipping cascade");
+        return result;
+    }
+    
+    // Stage 2: Aggressive preprocessing + primary detector
+    Logger::getInstance().debug("Cascade Stage 2: Aggressive CLAHE (4x4 tiles) + primary detector");
+    auto stage2_start = std::chrono::high_resolution_clock::now();
+    
+    result.processed_frame = preprocessFrameAggressive(frame);
+    result.faces = detectFaces(result.processed_frame.view(), false, confidence_threshold);
+    result.stage_used = 2;
+    
+    auto stage2_end = std::chrono::high_resolution_clock::now();
+    result.stage2_time_ms = std::chrono::duration<double, std::milli>(stage2_end - stage2_start).count();
+    
+    if (!result.faces.empty()) {
+        Logger::getInstance().info("Cascade Stage 2: SUCCESS - detected " + 
+                                  std::to_string(result.faces.size()) + " face(s) with aggressive preprocessing in " +
+                                  std::to_string(result.stage2_time_ms) + "ms (total: " +
+                                  std::to_string(result.stage1_time_ms + result.stage2_time_ms) + "ms)");
+        return result;
+    }
+    
+    // Stage 3: Aggressive preprocessing + detection2 fallback (if available)
+    if (detection2_model_loaded_) {
+        Logger::getInstance().debug("Cascade Stage 3: Trying detection2 fallback (" + 
+                                   detection2_model_name_ + ")");
+        auto stage3_start = std::chrono::high_resolution_clock::now();
+        
+        // Use detection2 model directly
+        int img_w = result.processed_frame.width();
+        int img_h = result.processed_frame.height();
+        
+        ncnn::Mat in = ncnn::Mat::from_pixels(result.processed_frame.data(), 
+                                              ncnn::Mat::PIXEL_BGR2RGB, img_w, img_h);
+        
+        // Route to appropriate detector based on detection2 model type
+        std::vector<Rect> stage3_faces;
+        switch (detection2_model_type_) {
+            case DetectionModelType::RETINAFACE:
+                stage3_faces = faceid::detectWithRetinaFace(detection2_net_, in, img_w, img_h, confidence_threshold);
+                break;
+            case DetectionModelType::YUNET:
+                stage3_faces = faceid::detectWithYuNet(detection2_net_, in, img_w, img_h, confidence_threshold);
+                break;
+            case DetectionModelType::YOLOV5:
+                stage3_faces = faceid::detectWithYOLOv5(detection2_net_, in, img_w, img_h, confidence_threshold);
+                break;
+            case DetectionModelType::YOLOV7:
+                stage3_faces = faceid::detectWithYOLOv7(detection2_net_, in, img_w, img_h, confidence_threshold);
+                break;
+            case DetectionModelType::YOLOV8:
+                stage3_faces = faceid::detectWithYOLOv8(detection2_net_, in, img_w, img_h, confidence_threshold);
+                break;
+            default:
+                Logger::getInstance().error("Unknown detection2 model type");
+                break;
+        }
+        
+        auto stage3_end = std::chrono::high_resolution_clock::now();
+        result.stage3_time_ms = std::chrono::duration<double, std::milli>(stage3_end - stage3_start).count();
+        
+        if (!stage3_faces.empty()) {
+            result.faces = stage3_faces;
+            result.stage_used = 3;
+            Logger::getInstance().info("Cascade Stage 3: SUCCESS - detected " + 
+                                      std::to_string(result.faces.size()) + " face(s) with " + 
+                                      detection2_model_name_ + " in " +
+                                      std::to_string(result.stage3_time_ms) + "ms (total: " +
+                                      std::to_string(result.stage1_time_ms + result.stage2_time_ms + result.stage3_time_ms) + "ms)");
+            return result;
+        }
+    } else {
+        Logger::getInstance().debug("Cascade Stage 3: detection2 model not available (install with 'faceid use --detection2')");
+    }
+    
+    // All stages failed
+    double total_time = result.stage1_time_ms + result.stage2_time_ms + result.stage3_time_ms;
+    Logger::getInstance().warning("Cascade detection: All stages failed (total time: " + 
+                                 std::to_string(total_time) + "ms, brightness: " +
+                                 std::to_string(result.avg_brightness) + ")");
+    result.stage_used = detection2_model_loaded_ ? 3 : 2;  // Indicate how many stages were tried
     return result;
 }
 

@@ -85,8 +85,8 @@ int cmd_add(const std::string& username, const std::string& face_id) {
     std::cout << "Please look at the camera and press Enter when ready..." << std::endl;
     std::cin.get();
     
-     // Create preview window
-    faceid::Display display("FaceID - Face Enrollment Preview", 640, 480);
+     // Create preview window with actual camera dimensions
+    faceid::Display display("FaceID - Face Enrollment Preview", width, height);
     
     std::cout << std::endl;
     std::cout << "📷 Preview window opened - adjust your position to show your face clearly" << std::endl;
@@ -100,22 +100,37 @@ int cmd_add(const std::string& username, const std::string& face_id) {
         return 1;
     }
     
-    // Capture and process multiple frames
-    const int num_samples = 5;
-    std::vector<faceid::FaceEncoding> encodings;
-    
-    std::cout << "Capturing " << num_samples << " face samples..." << std::endl;
-    std::cout << "Tip: Move your head slightly between samples for better recognition" << std::endl;
-    std::cout << std::endl;
-    
-    // Prompts to encourage variation
-    const std::string prompts[] = {
-        "(Look straight at camera)",
-        "(Turn head slightly left)",
-        "(Turn head slightly right)",
-        "(Tilt head slightly up)",
-        "(Neutral expression)"
-    };
+     // Get model-aware consistency threshold
+     float consistency_threshold = getConsistencyThreshold(detector);
+     std::cout << "Using consistency threshold: " << std::fixed << std::setprecision(3) 
+               << consistency_threshold << " (model: " << detector.getModelName() << ")" << std::endl;
+     std::cout << std::endl;
+     
+     // Storage for all consistency results
+     struct SampleData {
+         std::vector<std::vector<float>> all_encodings;  // All 5 frames
+         std::vector<faceid::Rect> face_rects;
+         int best_frame_index;
+         float quality_score;
+     };
+     std::vector<SampleData> all_samples;
+     
+     // Capture and process multiple frames
+     const int num_samples = 5;
+     std::vector<faceid::FaceEncoding> encodings;
+     
+     std::cout << "Capturing " << num_samples << " face samples..." << std::endl;
+     std::cout << "Tip: Move your head slightly between samples for better recognition" << std::endl;
+     std::cout << std::endl;
+     
+     // Prompts to encourage variation
+     const std::string prompts[] = {
+         "(Look straight at camera)",
+         "(Turn head slightly left)",
+         "(Turn head slightly right)",
+         "(Tilt head slightly up)",
+         "(Neutral expression)"
+     };
     
     for (int i = 0; i < num_samples; i++) {
         std::cout << "  Sample " << (i + 1) << "/" << num_samples << " " << prompts[i] << "... " << std::flush;
@@ -137,8 +152,8 @@ int cmd_add(const std::string& username, const std::string& face_id) {
             // Preprocess frame
             faceid::Image processed_frame = detector.preprocessFrame(frame.view());
             
-            // Detect faces (with tracking optimization)
-            auto faces = detector.detectOrTrackFaces(processed_frame.view(), tracking_interval);
+            // Detect faces (with tracking optimization, using optimal confidence)
+            auto faces = detector.detectOrTrackFaces(processed_frame.view(), tracking_interval, optimal_confidence);
             
             // Draw visualization on original frame
             faceid::Image display_frame = frame.clone();
@@ -151,6 +166,25 @@ int cmd_add(const std::string& username, const std::string& face_id) {
                 
                 faceid::drawRectangle(display_frame, face.x, face.y, 
                                      face.width, face.height, color, 2);
+                
+                // Draw facial landmarks if available (5-point landmarks)
+                if (face.hasLandmarks()) {
+                    // Define colors for each landmark
+                    faceid::Color landmark_colors[] = {
+                        faceid::Color(0, 255, 255),    // Left eye - Cyan
+                        faceid::Color(0, 255, 255),    // Right eye - Cyan  
+                        faceid::Color(255, 0, 0),      // Nose - Blue
+                        faceid::Color(255, 0, 255),    // Left mouth - Magenta
+                        faceid::Color(255, 0, 255)     // Right mouth - Magenta
+                    };
+                    
+                    for (size_t j = 0; j < face.landmarks.size() && j < 5; j++) {
+                        const auto& pt = face.landmarks[j];
+                        int px = static_cast<int>(pt.x);
+                        int py = static_cast<int>(pt.y);
+                        faceid::drawCircle(display_frame, px, py, 3, landmark_colors[j]);
+                    }
+                }
             }
             
             // Draw status text
@@ -196,7 +230,7 @@ int cmd_add(const std::string& username, const std::string& face_id) {
         }
         
         // Phase 2: Countdown with live preview (3 seconds)
-        // Now that face is detected, give user time to adjust pose
+        // Give user time to adjust pose according to the prompt
         auto countdown_start = std::chrono::steady_clock::now();
         const int prep_time_ms = 3000;  // 3 seconds preparation time
         
@@ -216,14 +250,8 @@ int cmd_add(const std::string& username, const std::string& face_id) {
             // Preprocess frame
             faceid::Image processed_frame = detector.preprocessFrame(frame.view());
             
-            // Detect faces (with tracking optimization)
-            auto faces = detector.detectOrTrackFaces(processed_frame.view(), tracking_interval);
-            
-            // Save this frame as potential capture candidate
-            if (faces.size() == 1) {
-                last_valid_frame = frame.clone();
-                last_valid_faces = faces;
-            }
+            // Detect faces (with tracking optimization, using optimal confidence)
+            auto faces = detector.detectOrTrackFaces(processed_frame.view(), tracking_interval, optimal_confidence);
             
             // Draw visualization on original frame
             faceid::Image display_frame = frame.clone();
@@ -236,6 +264,24 @@ int cmd_add(const std::string& username, const std::string& face_id) {
                 
                 faceid::drawRectangle(display_frame, face.x, face.y, 
                                      face.width, face.height, color, 2);
+                
+                // Draw facial landmarks if available
+                if (face.hasLandmarks()) {
+                    faceid::Color landmark_colors[] = {
+                        faceid::Color(0, 255, 255),    // Left eye - Cyan
+                        faceid::Color(0, 255, 255),    // Right eye - Cyan  
+                        faceid::Color(255, 0, 0),      // Nose - Blue
+                        faceid::Color(255, 0, 255),    // Left mouth - Magenta
+                        faceid::Color(255, 0, 255)     // Right mouth - Magenta
+                    };
+                    
+                    for (size_t j = 0; j < face.landmarks.size() && j < 5; j++) {
+                        const auto& pt = face.landmarks[j];
+                        int px = static_cast<int>(pt.x);
+                        int py = static_cast<int>(pt.y);
+                        faceid::drawCircle(display_frame, px, py, 3, landmark_colors[j]);
+                    }
+                }
             }
             
             // Draw countdown
@@ -266,95 +312,103 @@ int cmd_add(const std::string& username, const std::string& face_id) {
             }
         }
         
-        // Now capture: use the last valid frame we saw during countdown
-        if (last_valid_frame.data() == nullptr || last_valid_faces.empty()) {
-            std::cout << "No valid face detected during countdown, retrying..." << std::endl;
-            i--;  // Retry this sample
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
-            continue;
-        }
-        
-        // Preprocess the captured frame
-        faceid::Image processed_frame = detector.preprocessFrame(last_valid_frame.view());
-        
-        // Use the detected faces from this frame
-        auto faces = last_valid_faces;
-        
-        // If multiple faces, select the largest one (closest to camera)
-        faceid::Rect selected_face;
-        if (faces.size() > 1) {
-            std::cout << "Multiple faces detected (" << faces.size() << "), selecting largest... " << std::flush;
-            
-            // Find the largest face by area
-            int max_area = 0;
-            for (const auto& face : faces) {
-                int area = face.width * face.height;
-                if (area > max_area) {
-                    max_area = area;
-                    selected_face = face;
-                }
-            }
-        } else {
-            selected_face = faces[0];
-        }
-        
-        // Encode the selected face
-        std::vector<faceid::Rect> single_face = {selected_face};
-        auto face_encodings = detector.encodeFaces(processed_frame.view(), single_face);
-        if (face_encodings.empty()) {
-            std::cout << "Failed to encode face, retrying..." << std::endl;
-            i--;  // Retry this sample
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
-            continue;
-        }
-        
-        encodings.push_back(face_encodings[0]);
-        std::cout << "✓ OK" << std::endl;
+        // Phase 3: Consistency validation - capture 5 stable consecutive frames
+        ConsistencyResult consistency_result = validateFrameConsistency(
+             camera, detector, display,
+             consistency_threshold,
+             i,  // sample index
+             prompts[i],
+             num_samples,
+             optimal_confidence,
+             tracking_interval
+         );
+         
+         if (!consistency_result.is_consistent) {
+             std::cout << "Failed to capture consistent frames, retrying..." << std::endl;
+             i--;  // Retry this sample
+             std::this_thread::sleep_for(std::chrono::milliseconds(500));
+             continue;
+         }
+         
+         // Store all 5 encodings from this sample
+         SampleData sample_data;
+         sample_data.all_encodings = consistency_result.encodings;
+         sample_data.face_rects = consistency_result.face_rects;
+         sample_data.best_frame_index = consistency_result.best_frame_index;
+         sample_data.quality_score = consistency_result.best_quality_score;
+         all_samples.push_back(sample_data);
+         
+         std::cout << "✓ OK (quality: " << std::fixed << std::setprecision(2) 
+                   << (consistency_result.best_quality_score * 100) << "%, "
+                   << "avg distance: " << std::setprecision(3) << consistency_result.average_distance << ")" 
+                   << std::endl;
     }
     
-    // Display window will close automatically when display object goes out of scope
-    std::cout << std::endl;
-    
-    if (encodings.empty()) {
-        std::cerr << "Error: Failed to capture any face samples" << std::endl;
-        return 1;
-    }
-    
-    std::cout << "Successfully captured " << encodings.size() << " samples!" << std::endl;
-    
-    // Step 2: Calculate optimal recognition threshold by comparing samples against each other
-    std::cout << std::endl;
-    std::cout << "=== Calculating Optimal Recognition Threshold ===" << std::endl;
-    std::cout << "Comparing samples to find best threshold..." << std::endl;
-    
-    std::vector<float> all_distances;
-    for (size_t i = 0; i < encodings.size(); i++) {
-        for (size_t j = i + 1; j < encodings.size(); j++) {
-            float dist = cosineDistance(encodings[i], encodings[j]);
-            all_distances.push_back(dist);
-        }
-    }
-    
-    // Find the maximum distance between any two samples (same person)
-    // The threshold should be higher than this to accept all variations
-    float max_intra_distance = 0.0f;
-    if (!all_distances.empty()) {
-        max_intra_distance = *std::max_element(all_distances.begin(), all_distances.end());
-    }
-    
-    // Set threshold with safety margin (20% above max intra-distance)
-    // This ensures all your samples will match, while still rejecting different people
-    float optimal_threshold = max_intra_distance * 1.2f;
-    
-    // Clamp to reasonable range
-    if (optimal_threshold < 0.15f) optimal_threshold = 0.15f;  // Minimum safety
-    if (optimal_threshold > 0.6f) optimal_threshold = 0.6f;    // Maximum usability
-    
-    std::cout << "✓ Optimal recognition threshold calculated: " << std::fixed << std::setprecision(2) 
-              << optimal_threshold << std::endl;
-    std::cout << "  Based on variation between your " << encodings.size() << " samples" << std::endl;
-    std::cout << "  Max intra-person distance: " << std::fixed << std::setprecision(4) 
-              << max_intra_distance << std::endl;
+     // Display window will close automatically when display object goes out of scope
+     std::cout << std::endl;
+     
+     if (all_samples.empty()) {
+         std::cerr << "Error: Failed to capture any face samples" << std::endl;
+         return 1;
+     }
+     
+     std::cout << "Successfully captured " << num_samples << " samples with " 
+               << (num_samples * 5) << " total frames!" << std::endl;
+     
+     // Flatten all encodings for storage (all 5 frames from each of 5 samples = 25 encodings)
+     for (const auto& sample : all_samples) {
+         for (const auto& encoding : sample.all_encodings) {
+             encodings.push_back(encoding);
+         }
+     }
+     
+     std::cout << "Total encodings stored: " << encodings.size() << std::endl;
+     std::cout << std::endl;
+     
+     // Step 2: Calculate optimal recognition threshold
+     std::cout << "=== Calculating Optimal Recognition Threshold ===" << std::endl;
+     std::cout << "Comparing samples to find best threshold..." << std::endl;
+     
+     std::vector<float> all_distances;
+     for (size_t i = 0; i < encodings.size(); i++) {
+         for (size_t j = i + 1; j < encodings.size(); j++) {
+             float dist = cosineDistance(encodings[i], encodings[j]);
+             all_distances.push_back(dist);
+         }
+     }
+     
+     // Find the maximum distance between any two samples (same person)
+     float max_intra_distance = 0.0f;
+     if (!all_distances.empty()) {
+         max_intra_distance = *std::max_element(all_distances.begin(), all_distances.end());
+     }
+     
+     // Set threshold with safety margin (20% above max intra-distance)
+     float optimal_threshold = max_intra_distance * 1.2f;
+     
+     // Clamp to reasonable range
+     if (optimal_threshold < 0.15f) optimal_threshold = 0.15f;
+     if (optimal_threshold > 0.65f) {
+         std::cout << "⚠ Warning: High recognition threshold (" << std::fixed << std::setprecision(2) 
+                   << optimal_threshold << ") - enrollment conditions may not be optimal" << std::endl;
+         std::cout << "  Consider re-enrolling with better lighting/camera positioning" << std::endl;
+         optimal_threshold = 0.65f;  // Clamp for usability
+     }
+     
+     std::cout << "✓ Optimal recognition threshold calculated: " << std::fixed << std::setprecision(2) 
+               << optimal_threshold << std::endl;
+     std::cout << "  Based on variation across " << encodings.size() << " frames" << std::endl;
+     std::cout << "  Max intra-person distance: " << std::fixed << std::setprecision(4) 
+               << max_intra_distance << std::endl;
+     
+     // Quality warnings
+     if (max_intra_distance > 0.5f) {
+         std::cout << std::endl;
+         std::cout << "⚠ Warning: Large variation between frames detected (" 
+                   << std::fixed << std::setprecision(3) << max_intra_distance << ")" << std::endl;
+         std::cout << "  This may indicate poor lighting or camera conditions" << std::endl;
+         std::cout << "  Recognition may be less reliable - consider re-enrolling" << std::endl;
+     }
     
     // Create model for this face (save to FACES_DIR)
     std::string model_path = std::string(FACES_DIR) + "/" + username + "." + face_id + ".bin";

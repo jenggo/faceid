@@ -143,16 +143,19 @@ static bool writeUseFile(const std::string& path, const std::map<std::string, st
     return file.good();
 }
 
-int cmd_use(const std::string& model_path) {
+int cmd_use(const std::string& model_path, bool is_detection2) {
     if (model_path.empty()) {
         std::cerr << "Error: absolute model path required" << std::endl;
         std::cerr << "Usage: faceid use <absolute_path_to_model>" << std::endl;
+        std::cerr << "       faceid use --detection2 <absolute_path_to_model>" << std::endl;
         std::cerr << "Example: faceid use /home/user/models/mnet-retinaface.param" << std::endl;
         std::cerr << "         faceid use /etc/faceid/models/sface_2021dec_int8bq.ncnn.param" << std::endl;
+        std::cerr << "         faceid use --detection2 /home/user/models/yunet.param" << std::endl;
         std::cerr << std::endl;
         std::cerr << "This command will:" << std::endl;
         std::cerr << "  1. Auto-detect if the model is for detection or recognition" << std::endl;
         std::cerr << "  2. Copy the model to /etc/faceid/models/detection.* or recognition.*" << std::endl;
+        std::cerr << "  3. With --detection2 flag, install as detection2.* (cascade fallback)" << std::endl;
         return 1;
     }
     
@@ -214,11 +217,21 @@ int cmd_use(const std::string& model_path) {
         return 1;
     }
     
-    std::cout << "✓ Model type: " << getModelPurposeName(model_purpose) << std::endl;
+    // Override model purpose if --detection2 flag is set
+    std::string target_base;
+    if (is_detection2) {
+        if (model_purpose != ModelPurpose::DETECTION) {
+            std::cerr << "Error: --detection2 flag can only be used with detection models" << std::endl;
+            std::cerr << "This model appears to be a " << getModelPurposeName(model_purpose) << " model" << std::endl;
+            return 1;
+        }
+        target_base = "detection2";
+        std::cout << "✓ Model type: Detection (cascade fallback)" << std::endl;
+    } else {
+        target_base = (model_purpose == ModelPurpose::DETECTION) ? "detection" : "recognition";
+        std::cout << "✓ Model type: " << getModelPurposeName(model_purpose) << std::endl;
+    }
     std::cout << std::endl;
-    
-    // Determine target files
-    std::string target_base = (model_purpose == ModelPurpose::DETECTION) ? "detection" : "recognition";
     std::string models_dir = std::string(MODELS_DIR);
     std::string target_param = models_dir + "/" + target_base + ".param";
     std::string target_bin = models_dir + "/" + target_base + ".bin";
@@ -258,11 +271,19 @@ int cmd_use(const std::string& model_path) {
     }
     
     std::cout << std::endl;
-    std::cout << "✓ Successfully switched " << getModelPurposeName(model_purpose) << " model" << std::endl;
+    std::cout << "✓ Successfully switched " << getModelPurposeName(model_purpose) << " model";
+    if (is_detection2) {
+        std::cout << " (cascade fallback)";
+    }
+    std::cout << std::endl;
     std::cout << std::endl;
     std::cout << "Test the new model with:" << std::endl;
     std::cout << "  faceid show         # Live camera test" << std::endl;
-    std::cout << "  faceid test <user>  # Recognition test" << std::endl;
+    if (is_detection2) {
+        std::cout << "  (detection2 will be used automatically when cascade detection is needed)" << std::endl;
+    } else {
+        std::cout << "  faceid test <user>  # Recognition test" << std::endl;
+    }
     
     return 0;
 }

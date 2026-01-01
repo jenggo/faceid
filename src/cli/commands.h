@@ -103,16 +103,17 @@ int cmd_test_image(const std::vector<std::string>& args);
 int cmd_bench(const std::string& test_dir, bool show_detail = false, const std::string& custom_image_path = "");
 
 /**
- * Switch active model (detection or recognition)
+ * Switch active model (detection, detection2, or recognition)
  * 
  * Automatically detects if the model is for detection or recognition,
- * backs up the current model, and symlinks the new model as detection.* or recognition.*
+ * backs up the current model, and copies the new model as detection.*, detection2.*, or recognition.*
  * 
- * @param model_name Model name (with or without extension)
- *                   Examples: "mnet-retinaface", "yunet", "sface_2021dec_int8bq.ncnn"
+ * @param model_path Absolute path to model file (with or without extension)
+ *                   Examples: "/path/to/mnet-retinaface.param", "/path/to/yunet.bin"
+ * @param is_detection2 If true, install as detection2 (cascade fallback), otherwise auto-detect
  * @return 0 on success, 1 on error
  */
-int cmd_use(const std::string& model_name);
+int cmd_use(const std::string& model_path, bool is_detection2 = false);
 
 /**
  * Print usage information and command help

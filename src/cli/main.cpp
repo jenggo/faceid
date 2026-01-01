@@ -149,11 +149,29 @@ int main(int argc, char* argv[]) {
         if (argc < 3) {
             std::cerr << "Error: absolute model path required" << std::endl;
             std::cerr << "Usage: faceid use <absolute_path_to_model>" << std::endl;
+            std::cerr << "       faceid use --detection2 <absolute_path_to_model>" << std::endl;
             std::cerr << "Example: faceid use /home/user/models/mnet-retinaface.param" << std::endl;
             std::cerr << "         faceid use $(pwd)/models/sface_2021dec_int8bq.ncnn.param" << std::endl;
+            std::cerr << "         faceid use --detection2 /home/user/models/yunet.param" << std::endl;
             return 1;
         }
-        return cmd_use(argv[2]);
+        
+        // Check for --detection2 flag
+        bool is_detection2 = false;
+        std::string model_path;
+        
+        if (std::string(argv[2]) == "--detection2") {
+            if (argc < 4) {
+                std::cerr << "Error: model path required after --detection2" << std::endl;
+                return 1;
+            }
+            is_detection2 = true;
+            model_path = argv[3];
+        } else {
+            model_path = argv[2];
+        }
+        
+        return cmd_use(model_path, is_detection2);
     }
     
     std::cerr << "Unknown command: " << command << std::endl;

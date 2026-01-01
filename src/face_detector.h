@@ -41,7 +41,8 @@ public:
     
     // Detect or track faces (automatically uses tracking when possible)
     // track_interval: how many frames to track before re-detecting (0 = always detect)
-    std::vector<Rect> detectOrTrackFaces(const ImageView& frame, int track_interval = 5);
+    // confidence_threshold: minimum detection confidence (0.0-1.0, 0 = use config default)
+    std::vector<Rect> detectOrTrackFaces(const ImageView& frame, int track_interval = 5, float confidence_threshold = 0.0f);
     
     // Force re-detection on next frame (useful after scene change)
     void resetTracking();
@@ -55,6 +56,29 @@ public:
     
     // Performance: Pre-process frame for faster detection (CLAHE enhancement)
     Image preprocessFrame(const ImageView& frame);
+    
+    // Enhanced preprocessing with more aggressive CLAHE (for very dark/difficult images)
+    // Uses 4x4 tiles and higher clip limit for stronger local enhancement
+    Image preprocessFrameAggressive(const ImageView& frame);
+    
+    // Cascading detection with automatic fallback (for PAM/Presence/CLI)
+    // Stage 1: Standard preprocessing + primary detector
+    // Stage 2: Aggressive preprocessing + primary detector
+    // Stage 3: Aggressive preprocessing + detection2 fallback (if available)
+    // Returns: detected faces and cascade stage used (1, 2, or 3)
+    struct CascadeResult {
+        std::vector<Rect> faces;
+        int stage_used;              // Which cascade stage succeeded (1, 2, or 3)
+        Image processed_frame;       // Cached preprocessed frame
+        bool has_motion;             // Motion detected (if pre-check enabled)
+        double avg_brightness;       // Frame brightness (0.0-1.0)
+        double stage1_time_ms;       // Stage 1 execution time
+        double stage2_time_ms;       // Stage 2 execution time
+        double stage3_time_ms;       // Stage 3 execution time
+    };
+    CascadeResult detectFacesCascade(const ImageView& frame, 
+                                     bool enable_motion_check = false,
+                                     float confidence_threshold = 0.0f);
     
     // Enable/disable caching for repeated detections
     void enableCache(bool enable);
@@ -83,6 +107,12 @@ public:
     
     // Get current detection model name
     const std::string& getDetectionModelName() const { return detection_model_name_; }
+    
+    // Get current detection2 model name (fallback)
+    const std::string& getDetection2ModelName() const { return detection2_model_name_; }
+    
+    // Check if detection2 model is loaded
+    bool hasDetection2Model() const { return detection2_model_loaded_; }
     
     // Get current detection model type as string
     std::string getDetectionModelType() const {
@@ -158,13 +188,17 @@ private:
     // NCNN networks
     ncnn::Net ncnn_net_;          // Face recognition model (auto-detected)
     ncnn::Net retinaface_net_;    // Face detection model (auto-detected type)
+    ncnn::Net detection2_net_;    // Face detection2 model (cascade fallback)
     
     bool models_loaded_ = false;
     bool detection_model_loaded_ = false;
+    bool detection2_model_loaded_ = false;
     
     // Detection model information (auto-detected from param file)
     DetectionModelType detection_model_type_ = DetectionModelType::UNKNOWN;
+    DetectionModelType detection2_model_type_ = DetectionModelType::UNKNOWN;
     std::string detection_model_name_;
+    std::string detection2_model_name_;
     
     // Recognition model information (auto-detected from param file)
     size_t current_encoding_dim_ = FACE_ENCODING_DIM;  // Default to 512D
@@ -183,8 +217,15 @@ private:
     int frames_since_detection_ = 0;
     bool tracking_initialized_ = false;
     
+    // Motion detection state (for cascade pre-check)
+    Image motion_prev_frame_;
+    bool motion_initialized_ = false;
+    
     // Hash function for frame caching
     uint64_t hashFrame(const ImageView& frame);
+    
+    // Helper: Detect motion using frame differencing
+    bool detectMotion(const ImageView& current_frame, double threshold = 0.02);
     
     // Helper: Track faces using optical flow
     std::vector<Rect> trackFaces(const ImageView& current_frame);
