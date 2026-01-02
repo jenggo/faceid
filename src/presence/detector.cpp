@@ -10,12 +10,14 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <dirent.h>
+#include <glob.h>
 #include <cmath>
 #include <atomic>
 
-// Lock file path for detecting PAM authentication
+// Lock file pattern for detecting PAM authentication
 // Must match the path used in pam/pam_faceid.cpp SystemWideLock class
-static const char* PAM_LOCK_FILE = "/var/run/faceid.lock";
+// Now using per-user lock files: /run/faceid/faceid-<username>.lock
+static const char* PAM_LOCK_PATTERN = "/run/faceid/faceid-*.lock";
 
 namespace faceid {
 
@@ -184,34 +186,49 @@ void PresenceDetector::resumeAfterAuthentication() {
     }
 }
 
-// Check if PAM authentication is in progress by testing if lock file is locked
+// Check if PAM authentication is in progress by testing if any lock file is locked
 bool PresenceDetector::checkPAMLockFile() {
-    int fd = open(PAM_LOCK_FILE, O_RDONLY);
-    if (fd == -1) {
-        // Lock file doesn't exist, no PAM auth in progress
+    // Check for any lock files matching /tmp/faceid-*.lock
+    // Use glob to find all matching files
+    glob_t glob_result;
+    memset(&glob_result, 0, sizeof(glob_result));
+    
+    int ret = glob(PAM_LOCK_PATTERN, GLOB_TILDE, NULL, &glob_result);
+    if (ret != 0) {
+        // No matching files found
         return false;
     }
     
-    // Try to acquire shared lock (non-blocking)
-    // If PAM has exclusive lock, this will fail with EWOULDBLOCK
-    int result = flock(fd, LOCK_SH | LOCK_NB);
-    bool is_locked = false;
+    bool any_locked = false;
     
-    if (result == -1) {
-        if (errno == EWOULDBLOCK) {
-            // PAM holds exclusive lock, authentication in progress
-            is_locked = true;
+    // Check each lock file
+    for (size_t i = 0; i < glob_result.gl_pathc; i++) {
+        const char* lock_file = glob_result.gl_pathv[i];
+        
+        int fd = open(lock_file, O_RDONLY);
+        if (fd == -1) {
+            continue;
         }
-        // Other errors mean no lock
-    } else {
-        // We got the shared lock successfully, meaning no exclusive lock exists
-        // Release our shared lock immediately
-        flock(fd, LOCK_UN);
-        is_locked = false;
+        
+        // Try to acquire shared lock (non-blocking)
+        // If PAM has exclusive lock, this will fail with EWOULDBLOCK
+        int result = flock(fd, LOCK_SH | LOCK_NB);
+        
+        if (result == -1 && errno == EWOULDBLOCK) {
+            // PAM holds exclusive lock, authentication in progress
+            any_locked = true;
+            close(fd);
+            break;
+        } else if (result == 0) {
+            // We got the shared lock, release it immediately
+            flock(fd, LOCK_UN);
+        }
+        
+        close(fd);
     }
     
-    close(fd);
-    return is_locked;
+    globfree(&glob_result);
+    return any_locked;
 }
 
 void PresenceDetector::detectionLoop() {

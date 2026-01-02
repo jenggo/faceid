@@ -259,6 +259,13 @@ int cmd_use(const std::string& model_path, bool is_detection2) {
     }
     std::cout << "  ✓ Copied: " << source_bin << " -> " << target_bin << std::endl;
     
+    // Set proper permissions for model files (world-readable, root-owned)
+    // This ensures both regular users and PAM (running as root) can access models
+    chmod(target_param.c_str(), 0644);
+    chmod(target_bin.c_str(), 0644);
+    chown(target_param.c_str(), 0, 0);  // root:root
+    chown(target_bin.c_str(), 0, 0);    // root:root
+    
     // Update .use metadata file
     std::string use_file = models_dir + "/.use";
     std::string base_model_name = extractBaseName(source_param);

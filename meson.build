@@ -92,3 +92,10 @@ install_data(
     'systemd/faceid-presence.service',
     install_dir: get_option('prefix') / 'lib' / 'systemd' / 'system',
 )
+
+# Install systemd tmpfiles.d configuration
+# Creates /run/faceid directory with proper permissions for lock files
+install_data(
+    'systemd/faceid-tmpfiles.conf',
+    install_dir: get_option('prefix') / 'lib' / 'tmpfiles.d',
+)

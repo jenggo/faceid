@@ -16,6 +16,9 @@
 #include "guard.h"
 #include "../config.h"
 #include "../logger.h"
+#include "../adaptive_auth.h"
+#include "../face_detector.h"
+#include "../models/model_cache.h"
 #include <csignal>
 #include <atomic>
 #include <thread>
@@ -30,11 +33,13 @@
 namespace {
     std::atomic<bool> g_running{true};
     std::atomic<bool> g_reload_config{false};
+    std::atomic<bool> g_optimization_worker_running{false};
     
     void signalHandler(int signal) {
         if (signal == SIGTERM || signal == SIGINT) {
             faceid::Logger::getInstance().info("Received shutdown signal");
             g_running = false;
+            g_optimization_worker_running = false;
         } else if (signal == SIGHUP) {
             faceid::Logger::getInstance().info("Received reload signal");
             g_reload_config = true;
@@ -154,6 +159,169 @@ namespace {
         
         faceid::Logger::getInstance().info("Configuration loaded from: " + config_path);
         return true;
+    }
+    
+    // Adaptive authentication optimization worker thread
+    // Monitors shared memory for optimization requests from PAM module
+    // Runs optimization algorithm in background and updates config
+    void optimizationWorkerThread(const std::string& config_path) {
+        auto& logger = faceid::Logger::getInstance();
+        logger.info("Adaptive authentication optimization worker started");
+        
+        faceid::AdaptiveAuthManager adaptive_mgr;
+        if (!adaptive_mgr.initialize()) {
+            logger.error("Failed to initialize adaptive auth manager in worker thread");
+            return;
+        }
+        
+        while (g_optimization_worker_running) {
+            // Check for optimization request every second
+            if (adaptive_mgr.hasOptimizationRequest()) {
+                logger.info("Optimization request detected, starting background optimization");
+                adaptive_mgr.startOptimization();
+                
+                try {
+                    // Extract frame from shared memory
+                    uint8_t* frame_buffer = new uint8_t[faceid::MAX_FRAME_SIZE];
+                    int frame_width = 0, frame_height = 0, frame_channels = 0;
+                    
+                    if (!adaptive_mgr.getFrameData(frame_buffer, frame_width, frame_height, frame_channels)) {
+                        logger.error("Failed to extract frame data from shared memory");
+                        adaptive_mgr.failOptimization();
+                        delete[] frame_buffer;
+                        continue;
+                    }
+                    
+                    logger.info("Extracted frame: " + std::to_string(frame_width) + "x" + 
+                               std::to_string(frame_height) + "x" + std::to_string(frame_channels));
+                    
+                    // Initialize face detector
+                    faceid::FaceDetector detector;
+                    if (!detector.loadModels()) {
+                        logger.error("Failed to load face detection models");
+                        adaptive_mgr.failOptimization();
+                        delete[] frame_buffer;
+                        continue;
+                    }
+                    
+                    // Create ImageView from frame buffer
+                    faceid::ImageView frame_view(frame_buffer, frame_width, frame_height, frame_channels);
+                    
+                    // Run binary search for optimal confidence (0.1 - 0.9)
+                    float optimal_confidence = -1.0f;
+                    float low = 0.10f;
+                    float high = 0.90f;
+                    
+                    // Binary search with 0.05 precision (faster for runtime optimization)
+                    while (high - low > 0.05f) {
+                        float mid = (low + high) / 2.0f;
+                        
+                        auto cascade_result = detector.detectFacesCascade(frame_view, false, mid);
+                        
+                        if (cascade_result.faces.size() == 1) {
+                            // Found exactly 1 face - this is good
+                            optimal_confidence = mid;
+                            high = mid;  // Try lower confidence
+                        } else if (cascade_result.faces.size() > 1) {
+                            // Too many faces, increase confidence (be more strict)
+                            low = mid;
+                        } else {
+                            // No faces, decrease confidence (be more lenient)
+                            high = mid;
+                        }
+                    }
+                    
+                    // If we didn't find optimal, use the low value
+                    if (optimal_confidence < 0.0f) {
+                        auto cascade_result = detector.detectFacesCascade(frame_view, false, low);
+                        if (cascade_result.faces.size() >= 1) {
+                            optimal_confidence = low;
+                        } else {
+                            // No face detected even at low confidence - fail
+                            logger.error("No face detected even at confidence " + std::to_string(low));
+                            adaptive_mgr.failOptimization();
+                            delete[] frame_buffer;
+                            continue;
+                        }
+                    }
+                    
+                    logger.info("Found optimal confidence: " + std::to_string(optimal_confidence));
+                    
+                    // Now calculate optimal threshold based on enrolled models
+                    // Load all user models
+                    auto& cache = faceid::ModelCache::getInstance();
+                    std::vector<faceid::BinaryFaceModel> all_users = cache.loadAllUsersParallel(4);
+                    
+                    if (all_users.empty()) {
+                        logger.error("No enrolled users found for threshold calculation");
+                        adaptive_mgr.failOptimization();
+                        delete[] frame_buffer;
+                        continue;
+                    }
+                    
+                    // Detect and encode face with optimal confidence
+                    auto cascade_result = detector.detectFacesCascade(frame_view, false, optimal_confidence);
+                    if (cascade_result.faces.empty()) {
+                        logger.error("Face disappeared after optimization");
+                        adaptive_mgr.failOptimization();
+                        delete[] frame_buffer;
+                        continue;
+                    }
+                    
+                    auto encodings = detector.encodeFaces(cascade_result.processed_frame.view(), 
+                                                         cascade_result.faces);
+                    if (encodings.empty()) {
+                        logger.error("Failed to encode face");
+                        adaptive_mgr.failOptimization();
+                        delete[] frame_buffer;
+                        continue;
+                    }
+                    
+                    // Calculate max intra-user distance (distance between user's own faces)
+                    float max_intra_distance = 0.0f;
+                    for (const auto& user_model : all_users) {
+                        for (size_t i = 0; i < user_model.encodings.size(); i++) {
+                            for (size_t j = i + 1; j < user_model.encodings.size(); j++) {
+                                double dist = detector.compareFaces(user_model.encodings[i], 
+                                                                    user_model.encodings[j]);
+                                if (dist > max_intra_distance) {
+                                    max_intra_distance = dist;
+                                }
+                            }
+                        }
+                    }
+                    
+                    // Set threshold to max_intra_distance * 1.2 (same formula as enrollment)
+                    float optimal_threshold = max_intra_distance * 1.2f;
+                    
+                    // Clamp threshold to reasonable range
+                    if (optimal_threshold < 0.3f) optimal_threshold = 0.3f;
+                    if (optimal_threshold > 0.8f) optimal_threshold = 0.8f;
+                    
+                    logger.info("Calculated optimal threshold: " + std::to_string(optimal_threshold) + 
+                               " (max_intra_distance: " + std::to_string(max_intra_distance) + ")");
+                    
+                    // Update config file atomically
+                    // Note: updateConfigFile is in cli_helpers.h, we need to implement similar logic here
+                    // For now, signal completion with new values (config update will be done separately)
+                    
+                    logger.info("Optimization complete - confidence: " + std::to_string(optimal_confidence) + 
+                               ", threshold: " + std::to_string(optimal_threshold));
+                    
+                    adaptive_mgr.completeOptimization(optimal_confidence, optimal_threshold);
+                    
+                    delete[] frame_buffer;
+                    
+                } catch (const std::exception& e) {
+                    logger.error(std::string("Optimization failed with exception: ") + e.what());
+                    adaptive_mgr.failOptimization();
+                }
+            }
+            
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+        
+        logger.info("Adaptive authentication optimization worker stopped");
     }
 }
 
@@ -318,6 +486,11 @@ int main(int argc, char* argv[]) {
     
     logger.info("Presence detection daemon started successfully");
     
+    // Start adaptive authentication optimization worker thread
+    g_optimization_worker_running = true;
+    std::thread optimization_worker(optimizationWorkerThread, daemon_config.config_path);
+    logger.info("Adaptive authentication optimization worker thread started");
+    
     // Main loop: Monitor guard conditions
     while (g_running) {
         // Check if configuration reload requested
@@ -343,23 +516,34 @@ int main(int argc, char* argv[]) {
         std::this_thread::sleep_for(std::chrono::seconds(2));
         
         // Optionally log statistics periodically (every 5 minutes)
+        // Only log if presence detection is actively running (guard conditions met)
         static auto last_stats_time = std::chrono::steady_clock::now();
         auto now = std::chrono::steady_clock::now();
         if (std::chrono::duration_cast<std::chrono::minutes>(now - last_stats_time).count() >= 5) {
-            auto stats = detector.getStatistics();
-            logger.info("Presence detection statistics:");
-            logger.info("  Total scans: " + std::to_string(stats.totalScans));
-            logger.info("  Successful detections: " + std::to_string(stats.facesDetected));
-            logger.info("  Failed scans: " + std::to_string(stats.failedScans));
-            logger.info("  State transitions: " + std::to_string(stats.stateTransitions));
-            logger.info("  Uptime: " + std::to_string(stats.uptimeSeconds / 3600) + "h " + 
-                       std::to_string((stats.uptimeSeconds % 3600) / 60) + "m");
+            // Only log stats if guard conditions are met (detection is actually running)
+            if (guard.shouldRunPresenceDetection()) {
+                auto stats = detector.getStatistics();
+                logger.info("Presence detection statistics:");
+                logger.info("  Total scans: " + std::to_string(stats.totalScans));
+                logger.info("  Successful detections: " + std::to_string(stats.facesDetected));
+                logger.info("  Failed scans: " + std::to_string(stats.failedScans));
+                logger.info("  State transitions: " + std::to_string(stats.stateTransitions));
+                logger.info("  Uptime: " + std::to_string(stats.uptimeSeconds / 3600) + "h " + 
+                           std::to_string((stats.uptimeSeconds % 3600) / 60) + "m");
+            }
             last_stats_time = now;
         }
     }
     
     // Graceful shutdown
     logger.info("Shutting down presence detection daemon...");
+    
+    // Stop optimization worker thread
+    g_optimization_worker_running = false;
+    if (optimization_worker.joinable()) {
+        optimization_worker.join();
+    }
+    
     detector.stop();
     logger.info("Daemon stopped");
     

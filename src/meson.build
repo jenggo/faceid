@@ -19,6 +19,7 @@ core_sources = files(
     'lid_detector.cpp',
     'display_detector.cpp',
     'systemd_helper.cpp',
+    'adaptive_auth.cpp',
     'presence/guard.cpp',
     'presence/detector.cpp',
     'models/binary_model.cpp',
@@ -34,6 +35,7 @@ core_lib = static_library(
     include_directories: inc,
     dependencies: [ncnn_dep, turbojpeg_dep, libyuv_dep, gio_dep, glib_dep, libsystemd_dep],
     cpp_args: cpp_args,
+    link_args: ['-lpthread', '-lrt'],  # pthread for mutex, rt for shm_open
 )
 
 # PAM module

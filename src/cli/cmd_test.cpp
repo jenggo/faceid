@@ -319,9 +319,9 @@ int cmd_test(const std::string& username, bool auto_adjust) {
                 continue;
             }
             
-            // Preprocess and detect with default confidence
-            faceid::Image processed_frame = detector.preprocessFrame(frame.view());
-            auto test_faces = detector.detectFaces(processed_frame.view(), false, 0.5f);
+            // Use cascading detection for robust face detection in all lighting conditions
+            auto cascade_result = detector.detectFacesCascade(frame.view(), false, 0.5f);
+            auto test_faces = cascade_result.faces;
             
             // Draw visualization
             faceid::Image display_frame = frame.clone();
@@ -336,6 +336,13 @@ int cmd_test(const std::string& username, bool auto_adjust) {
                 // Draw status text
                 std::string status_text = "Face detected! Analyzing optimal settings...";
                 faceid::drawFilledRectangle(display_frame, 0, 0, display_frame.width(), 40, faceid::Color::Black());
+                
+                // Show which cascade stage was used
+                if (cascade_result.stage_used > 1) {
+                    status_text = "Face detected (cascade stage " + std::to_string(cascade_result.stage_used) + 
+                                 ", brightness: " + std::to_string(static_cast<int>(cascade_result.avg_brightness * 100)) + "%)";
+                }
+                
                 std::string status_reversed = status_text;
                 std::reverse(status_reversed.begin(), status_reversed.end());
                 int text_width = status_reversed.length() * 8;
@@ -368,78 +375,28 @@ int cmd_test(const std::string& username, bool auto_adjust) {
         
         std::cout << "detected!" << std::endl;
         
-        // Step 2: Find optimal detection confidence using the captured frame
+        // Step 2: Use cascade detection - no need for manual confidence optimization
         std::cout << std::endl;
-        std::cout << "=== Finding Optimal Detection Confidence ===" << std::endl;
-        std::cout << "Analyzing face detection thresholds..." << std::endl;
+        std::cout << "=== Using Cascading Detection ===" << std::endl;
+        std::cout << "Automatic 3-stage detection with CLAHE enhancement" << std::endl;
+        std::cout << "This adapts automatically to your lighting conditions" << std::endl;
         
-        faceid::Image processed_frame = detector.preprocessFrame(reference_frame.view());
-        int img_width = reference_frame.width();
-        int img_height = reference_frame.height();
+        // Test cascade detection on reference frame
+        auto cascade_result = detector.detectFacesCascade(reference_frame.view(), false, 0.5f);
+        faceid::Image processed_frame = std::move(cascade_result.processed_frame);
         
-        // Helper lambda to count valid faces at a given confidence
-        auto countValidFaces = [&](float conf) -> int {
-            auto faces = detector.detectFaces(processed_frame.view(), false, conf);
-            auto encodings = detector.encodeFaces(processed_frame.view(), faces);
-            
-            int valid_count = 0;
-            for (size_t i = 0; i < faces.size(); i++) {
-                std::vector<float> encoding = (i < encodings.size()) ? encodings[i] : std::vector<float>();
-                if (isValidFace(faces[i], img_width, img_height, encoding)) {
-                    valid_count++;
-                }
-            }
-            return valid_count;
-        };
-        
-        // Binary search for optimal confidence threshold
-        float low = 0.30f;
-        float high = 0.99f;
-        float optimal_confidence = -1.0f;
-        
-        // Coarse linear search first
-        float coarse_step = 0.10f;
-        for (float conf = low; conf <= high; conf += coarse_step) {
-            int valid_count = countValidFaces(conf);
-            if (valid_count == 1) {
-                low = std::max(0.30f, conf - coarse_step);
-                high = std::min(0.99f, conf + coarse_step);
-                break;
-            } else if (valid_count == 0) {
-                high = conf;
-                break;
-            }
+        if (cascade_result.faces.empty()) {
+            std::cerr << "✗ No faces detected in reference frame" << std::endl;
+            return 1;
         }
         
-        // Binary search refinement
-        while (high - low > 0.01f) {
-            float mid = (low + high) / 2.0f;
-            int valid_count = countValidFaces(mid);
-            
-            if (valid_count == 1) {
-                optimal_confidence = mid;
-                high = mid;
-            } else if (valid_count > 1) {
-                low = mid;
-            } else {
-                high = mid;
-            }
-        }
+        std::cout << "✓ Cascade detection successful" << std::endl;
+        std::cout << "  Stage used: " << cascade_result.stage_used << "/3" << std::endl;
+        std::cout << "  Brightness: " << std::fixed << std::setprecision(1) 
+                  << (cascade_result.avg_brightness * 100) << "%" << std::endl;
         
-        if (optimal_confidence < 0.0f) {
-            int valid_count = countValidFaces(low);
-            if (valid_count == 1) {
-                optimal_confidence = low;
-            }
-        }
-        
-        if (optimal_confidence < 0.0f) {
-            std::cerr << "⚠ Could not find optimal confidence" << std::endl;
-            optimal_confidence = 0.5f;  // Fallback
-        }
-        
-        std::cout << "✓ Optimal detection confidence found: " << std::fixed << std::setprecision(2) 
-                  << optimal_confidence << std::endl;
+        // Use default confidence (cascade handles it automatically)
+        float optimal_confidence = 0.5f;
         
         // Step 3: Capture samples in current conditions to calculate optimal threshold
         std::cout << std::endl;
@@ -470,14 +427,13 @@ int cmd_test(const std::string& username, bool auto_adjust) {
                     std::chrono::steady_clock::now() - capture_start).count();
                 
                 if (elapsed >= 3000) {
-                    // Capture now
+                    // Capture now using cascade detection
                     faceid::Image frame;
                     if (camera.read(frame)) {
-                        faceid::Image processed = detector.preprocessFrame(frame.view());
-                        auto faces = detector.detectFaces(processed.view(), false, optimal_confidence);
+                        auto cascade_result = detector.detectFacesCascade(frame.view(), false, optimal_confidence);
                         
-                        if (faces.size() == 1) {
-                            auto encodings = detector.encodeFaces(processed.view(), faces);
+                        if (cascade_result.faces.size() == 1) {
+                            auto encodings = detector.encodeFaces(cascade_result.processed_frame.view(), cascade_result.faces);
                             if (!encodings.empty()) {
                                 captured_encoding = encodings[0];
                                 captured = true;
@@ -491,11 +447,11 @@ int cmd_test(const std::string& username, bool auto_adjust) {
                         capture_start = std::chrono::steady_clock::now();  // Retry
                     }
                 } else {
-                    // Show live preview during countdown
+                    // Show live preview during countdown using cascade
                     faceid::Image frame;
                     if (camera.read(frame)) {
-                        faceid::Image processed = detector.preprocessFrame(frame.view());
-                        auto faces = detector.detectFaces(processed.view(), false, optimal_confidence);
+                        auto cascade_result = detector.detectFacesCascade(frame.view(), false, optimal_confidence);
+                        auto faces = cascade_result.faces;
                         
                         faceid::Image display_frame = frame.clone();
                         
@@ -641,12 +597,11 @@ int cmd_test(const std::string& username, bool auto_adjust) {
             for (int sample = 0; sample < 3; sample++) {
                 faceid::Image adj_frame;
                 if (camera.read(adj_frame)) {
-                    faceid::Image adj_processed = detector.preprocessFrame(adj_frame.view());
-                    auto adj_faces = detector.detectOrTrackFaces(adj_processed.view(), 1);
+                    auto cascade_result = detector.detectFacesCascade(adj_frame.view(), false, 0.5f);
                     
-                    if (adj_faces.size() == 1) {
-                        auto adj_encodings = detector.encodeFaces(adj_processed.view(), adj_faces);
-                        if (!adj_encodings.empty() && isValidFace(adj_faces[0], adj_frame.width(), adj_frame.height(), adj_encodings[0])) {
+                    if (cascade_result.faces.size() == 1) {
+                        auto adj_encodings = detector.encodeFaces(cascade_result.processed_frame.view(), cascade_result.faces);
+                        if (!adj_encodings.empty() && isValidFace(cascade_result.faces[0], adj_frame.width(), adj_frame.height(), adj_encodings[0])) {
                             adjustment_encodings.push_back(adj_encodings[0]);
                         }
                     }
@@ -684,9 +639,10 @@ int cmd_test(const std::string& username, bool auto_adjust) {
             is_adjusting = false;
         }
 
-        // Preprocess and detect faces
-        faceid::Image processed_frame = detector.preprocessFrame(frame.view());
-        auto faces = detector.detectOrTrackFaces(processed_frame.view(), tracking_interval);
+        // Use cascading detection for robust face detection in all lighting conditions
+        auto cascade_result = detector.detectFacesCascade(frame.view(), false, 0.5f);
+        faceid::Image processed_frame = std::move(cascade_result.processed_frame);
+        auto faces = cascade_result.faces;
 
         // Clone frame for drawing
         faceid::Image display_frame = frame.clone();

@@ -178,6 +178,25 @@ install: build
 		printf "$(COLOR_YELLOW)⚠ Systemd service file not found$(COLOR_RESET)\n"; \
 	fi
 	@printf " \n"
+	@printf "$(COLOR_CYAN)Setting up runtime directory...$(COLOR_RESET)\n"
+	@if [ -f "$(INSTALL_PREFIX)/lib/tmpfiles.d/faceid-tmpfiles.conf" ]; then \
+		printf "$(COLOR_GREEN)✓ tmpfiles.d config installed$(COLOR_RESET)\n"; \
+		if [ "$$(id -u)" != "0" ]; then \
+			sudo systemd-tmpfiles --create $(INSTALL_PREFIX)/lib/tmpfiles.d/faceid-tmpfiles.conf 2>/dev/null || \
+			sudo mkdir -p /run/faceid && sudo chmod 1777 /run/faceid; \
+		else \
+			systemd-tmpfiles --create $(INSTALL_PREFIX)/lib/tmpfiles.d/faceid-tmpfiles.conf 2>/dev/null || \
+			mkdir -p /run/faceid && chmod 1777 /run/faceid; \
+		fi; \
+		if [ -d "/run/faceid" ]; then \
+			printf "$(COLOR_GREEN)✓ Runtime directory created: /run/faceid (1777)$(COLOR_RESET)\n"; \
+		else \
+			printf "$(COLOR_YELLOW)⚠ Failed to create /run/faceid$(COLOR_RESET)\n"; \
+		fi; \
+	else \
+		printf "$(COLOR_YELLOW)⚠ tmpfiles.d config not found$(COLOR_RESET)\n"; \
+	fi
+	@printf " \n"
 	@printf "$(COLOR_GREEN)Installation completed!$(COLOR_RESET)\n"
 
 # Install debug version

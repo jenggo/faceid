@@ -16,6 +16,7 @@
 #include "../lid_detector.h"
 #include "../display_detector.h"
 #include "../models/model_cache.h"
+#include "../adaptive_auth.h"
 
 // Suppress external library warnings
 #pragma GCC diagnostic push
@@ -34,10 +35,13 @@ class SystemWideLock {
 private:
     int lock_fd;
     bool is_locked;
-    static constexpr const char* LOCK_FILE_PATH = "/var/run/faceid.lock";
+    std::string lock_file_path;
     
 public:
-    SystemWideLock() : lock_fd(-1), is_locked(false) {}
+    SystemWideLock(const char* username) : lock_fd(-1), is_locked(false) {
+        // Use per-user lock file to avoid permission issues
+        lock_file_path = std::string("/run/faceid/faceid-") + username + ".lock";
+    }
     
     ~SystemWideLock() {
         if (is_locked) {
@@ -48,21 +52,22 @@ public:
     // Acquire lock with blocking wait (returns true on success, false on error)
     // This will WAIT until the lock is available (no timeout)
     bool acquire() {
-        // Open or create lock file
-        lock_fd = open(LOCK_FILE_PATH, O_CREAT | O_RDWR, 0666);
+        // Temporarily set umask to 0 to ensure lock file is world-writable
+        mode_t old_umask = umask(0);
+        
+        // Open or create lock file (mode 0666 = world-readable/writable)
+        lock_fd = open(lock_file_path.c_str(), O_CREAT | O_RDWR, 0666);
+        
+        // Restore original umask
+        umask(old_umask);
+        
         if (lock_fd == -1) {
             syslog(LOG_ERR, "pam_faceid: Failed to open lock file %s: %s", 
-                   LOCK_FILE_PATH, strerror(errno));
+                   lock_file_path.c_str(), strerror(errno));
             return false;
         }
         
-        // Write current PID to lock file for debugging
         pid_t pid = getpid();
-        std::string pid_str = std::to_string(pid) + "\n";
-        if (write(lock_fd, pid_str.c_str(), pid_str.length()) == -1) {
-            syslog(LOG_WARNING, "pam_faceid: Failed to write PID to lock file: %s", 
-                   strerror(errno));
-        }
         
         // Set up file lock structure
         struct flock fl;
@@ -83,6 +88,18 @@ public:
         }
         
         is_locked = true;
+        
+        // Write current PID to lock file for debugging (AFTER acquiring lock)
+        if (ftruncate(lock_fd, 0) == -1) {
+            syslog(LOG_WARNING, "pam_faceid: Failed to truncate lock file: %s", strerror(errno));
+        }
+        lseek(lock_fd, 0, SEEK_SET);
+        std::string pid_str = std::to_string(pid) + "\n";
+        if (write(lock_fd, pid_str.c_str(), pid_str.length()) == -1) {
+            syslog(LOG_WARNING, "pam_faceid: Failed to write PID to lock file: %s", 
+                   strerror(errno));
+        }
+        
         syslog(LOG_INFO, "pam_faceid: System-wide lock acquired successfully (PID: %d)", pid);
         return true;
     }
@@ -90,20 +107,22 @@ public:
     // Acquire lock with timeout (for backwards compatibility)
     // timeout_seconds: Maximum time to wait for lock
     bool acquireWithTimeout(int timeout_seconds = 10) {
-        // Open or create lock file
-        lock_fd = open(LOCK_FILE_PATH, O_CREAT | O_RDWR, 0666);
+        // Temporarily set umask to 0 to ensure lock file is world-writable
+        mode_t old_umask = umask(0);
+        
+        // Open or create lock file (mode 0666 = world-readable/writable)
+        lock_fd = open(lock_file_path.c_str(), O_CREAT | O_RDWR, 0666);
+        
+        // Restore original umask
+        umask(old_umask);
+        
         if (lock_fd == -1) {
             syslog(LOG_ERR, "pam_faceid: Failed to open lock file %s: %s", 
-                   LOCK_FILE_PATH, strerror(errno));
+                   lock_file_path.c_str(), strerror(errno));
             return false;
         }
         
         pid_t pid = getpid();
-        std::string pid_str = std::to_string(pid) + "\n";
-        if (write(lock_fd, pid_str.c_str(), pid_str.length()) == -1) {
-            syslog(LOG_WARNING, "pam_faceid: Failed to write PID to lock file: %s", 
-                   strerror(errno));
-        }
         
         // Set up file lock structure
         struct flock fl;
@@ -122,6 +141,18 @@ public:
             // F_SETLK: Try to set lock without blocking
             if (fcntl(lock_fd, F_SETLK, &fl) != -1) {
                 is_locked = true;
+                
+                // Write current PID to lock file for debugging (AFTER acquiring lock)
+                if (ftruncate(lock_fd, 0) == -1) {
+                    syslog(LOG_WARNING, "pam_faceid: Failed to truncate lock file: %s", strerror(errno));
+                }
+                lseek(lock_fd, 0, SEEK_SET);
+                std::string pid_str = std::to_string(pid) + "\n";
+                if (write(lock_fd, pid_str.c_str(), pid_str.length()) == -1) {
+                    syslog(LOG_WARNING, "pam_faceid: Failed to write PID to lock file: %s", 
+                           strerror(errno));
+                }
+                
                 syslog(LOG_INFO, "pam_faceid: Lock acquired successfully (PID: %d)", pid);
                 return true;
             }
@@ -224,6 +255,12 @@ static bool authenticate_user(const char* username) {
     Logger& logger = Logger::getInstance();
     openlog("pam_faceid", LOG_PID, LOG_AUTH);
     
+    // Initialize adaptive authentication manager
+    AdaptiveAuthManager adaptive_mgr;
+    if (!adaptive_mgr.initialize()) {
+        syslog(LOG_WARNING, "pam_faceid: Failed to initialize adaptive auth manager, continuing without adaptive optimization");
+    }
+    
     // Load configuration
     Config& config = Config::getInstance();
     const std::string config_path = std::string(CONFIG_DIR) + "/faceid.conf";
@@ -314,9 +351,17 @@ static bool authenticate_user(const char* username) {
     }
     
     // Get fingerprint configuration
-    const int fingerprint_delay_ms = config.getInt("authentication", "fingerprint_delay_ms").value_or(500);
+    int fingerprint_delay_ms = config.getInt("authentication", "fingerprint_delay_ms").value_or(500);
     FingerprintAuth fingerprint;
     const bool fingerprint_enabled = config.getBool("authentication", "enable_fingerprint").value_or(true);
+    
+    // Check if optimization is in progress - prioritize fingerprint if so
+    bool optimization_in_progress = adaptive_mgr.isOptimizationInProgress();
+    if (optimization_in_progress && fingerprint_enabled) {
+        fingerprint_delay_ms = 0;  // No delay - start fingerprint immediately
+        logger.info("Adaptive optimization in progress - prioritizing fingerprint authentication");
+        syslog(LOG_INFO, "pam_faceid: Optimization in progress, prioritizing fingerprint (no delay)");
+    }
     
     // If neither method is available, fail early
     if (!face_enrolled && !fingerprint_enabled) {
@@ -331,6 +376,10 @@ static bool authenticate_user(const char* username) {
     std::atomic<bool> face_finished(false);
     std::atomic<bool> fingerprint_finished(false);
     std::string success_method;
+    
+    // Store last captured frame for adaptive optimization
+    std::shared_ptr<faceid::Image> last_frame = std::make_shared<faceid::Image>();
+    std::mutex frame_mutex;
     
     // Launch face authentication in separate thread (if enrolled)
     std::future<bool> face_future;
@@ -377,6 +426,19 @@ static bool authenticate_user(const char* username) {
                 // Get detection confidence threshold from config
                 float detection_confidence = config.getDouble("face_detection", "confidence").value_or(0.31);
                 
+                // Check if adaptive auth has new optimal values (from previous optimization)
+                float opt_confidence, opt_threshold;
+                if (adaptive_mgr.hasNewOptimalValues()) {
+                    adaptive_mgr.getOptimalValues(opt_confidence, opt_threshold);
+                    detection_confidence = opt_confidence;
+                    threshold = opt_threshold;
+                    logger.info(std::string("Using adaptive optimized values: confidence=") + 
+                              std::to_string(detection_confidence) + ", threshold=" + 
+                              std::to_string(threshold));
+                    syslog(LOG_INFO, "pam_faceid: Using adaptive values (confidence: %.3f, threshold: %.3f)", 
+                           detection_confidence, threshold);
+                }
+                
                 logger.debug(std::string("Starting face detection with cascading detection (confidence: ") + 
                            std::to_string(detection_confidence) + ")");
                 syslog(LOG_DEBUG, "pam_faceid: Using cascading detection with confidence: %.3f", detection_confidence);
@@ -388,6 +450,21 @@ static bool authenticate_user(const char* username) {
                     faceid::Image frame;
                     if (!camera.read(frame)) {
                         continue;
+                    }
+                    
+                    // Store frame data for potential adaptive optimization
+                    {
+                        std::lock_guard<std::mutex> lock(frame_mutex);
+                        // Only clone if last_frame is empty or different size
+                        if (last_frame->empty() || 
+                            last_frame->width() != frame.width() || 
+                            last_frame->height() != frame.height()) {
+                            *last_frame = frame.clone();
+                        } else {
+                            // Copy data directly for efficiency
+                            std::memcpy(last_frame->data(), frame.data(), 
+                                       frame.width() * frame.height() * frame.channels());
+                        }
                     }
                     
                     // Use cascading detection for robust face detection across all lighting conditions
@@ -563,8 +640,31 @@ static bool authenticate_user(const char* username) {
     if (auth_success.load()) {
         syslog(LOG_INFO, "Authentication successful for user %s via %s", username, success_method.c_str());
         logger.auditAuthSuccess(username, success_method, duration_ms);
+        
+        // Record success for adaptive auth
+        adaptive_mgr.recordSuccess();
+        
         closelog();
         return true;
+    }
+    
+    // Authentication failed - record failure and potentially trigger optimization
+    adaptive_mgr.recordFailure();
+    
+    // Check if we should trigger optimization (after 5 consecutive failures)
+    if (adaptive_mgr.shouldTriggerOptimization(5) && !last_frame->empty()) {
+        syslog(LOG_INFO, "pam_faceid: Triggering adaptive optimization after 5 consecutive failures");
+        logger.info("Triggering adaptive optimization after repeated failures");
+        
+        // Capture last frame to shared memory for background optimization
+        {
+            std::lock_guard<std::mutex> lock(frame_mutex);
+            adaptive_mgr.captureFrame(last_frame->data(), last_frame->width(), 
+                                     last_frame->height(), last_frame->channels());
+        }
+        
+        syslog(LOG_INFO, "pam_faceid: Frame captured for optimization (size: %dx%dx%d)", 
+               last_frame->width(), last_frame->height(), last_frame->channels());
     }
     
     // Provide detailed failure reason
@@ -643,25 +743,12 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags,
     // Only acquire lock if we're actually going to perform biometric authentication
     // This prevents unnecessary lock contention for cases where biometric is not needed
     syslog(LOG_DEBUG, "pam_faceid: Biometric auth required, acquiring system-wide lock");
-    SystemWideLock lock;
-    if (!lock.acquire()) {
-        syslog(LOG_ERR, "pam_faceid: Failed to acquire system-wide lock (error: %s)", strerror(errno));
+    SystemWideLock lock(username);
+    if (!lock.acquireWithTimeout(10)) {
+        syslog(LOG_WARNING, "pam_faceid: Failed to acquire system-wide lock (timeout or error) - another auth in progress");
         
-        // Send error message to user via PAM conversation
-        struct pam_conv *conv;
-        if (pam_get_item(pamh, PAM_CONV, (const void **)&conv) == PAM_SUCCESS && conv && conv->conv) {
-            struct pam_message msg;
-            const struct pam_message *msgp = &msg;
-            struct pam_response *resp = nullptr;
-            
-            msg.msg_style = PAM_ERROR_MSG;
-            msg.msg = const_cast<char*>("FaceID: Failed to acquire authentication lock. Please try again.");
-            
-            conv->conv(1, &msgp, &resp, conv->appdata_ptr);
-            if (resp) {
-                free(resp);
-            }
-        }
+        // Don't show error to user - just skip and let password auth handle it
+        // This happens when lock screen auth is running while user tries sudo
         
         closelog();
         return PAM_AUTH_ERR;
