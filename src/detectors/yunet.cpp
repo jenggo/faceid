@@ -23,7 +23,7 @@ std::vector<Rect> detectWithYuNet(ncnn::Net& net, const ncnn::Mat& in, int img_w
     ex.input("in0", in);
     
     const float conf_threshold = confidence_threshold;
-    const float nms_threshold = 0.3f;
+    const float nms_threshold = 0.5f;  // Increased from 0.3 to 0.5 for more aggressive merging
     std::vector<FaceObject> proposals;
     
     // Extract all 12 outputs (3 scales × 4 types)

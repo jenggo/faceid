@@ -493,8 +493,8 @@ int cmd_bench(const std::string& test_dir, bool show_detail, const std::string& 
                 base_path = base_path.substr(0, ext_pos);
             }
 
-            // Load with empty recognition model path, but explicit detection model path
-            if (!detector.loadModels("", base_path)) {
+            // Load recognition model (detection models are embedded)
+            if (!detector.loadModels(base_path)) {
                 if (show_detail) {
                     std::cout << "  ✗ Failed to load model" << std::endl;
                 }
@@ -753,7 +753,7 @@ int cmd_bench(const std::string& test_dir, bool show_detail, const std::string& 
                     rec_base = rec_base.substr(0, rec_base.length() - 6);
                 }
 
-                if (!detector.loadModels(rec_base, det_base)) {
+                if (!detector.loadModels(rec_base)) {
                     if (show_detail) {
                         std::cout << "  ✗ Failed to load models" << std::endl;
                     }

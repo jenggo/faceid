@@ -6,6 +6,9 @@
 #include "logger.h"
 #include "detectors/common.h"
 #include "detectors/detectors.h"
+#include "detectors/yunet_model_data.h"
+#include "detectors/retinaface_model_data.h"
+#include <ncnn/datareader.h>
 #include <libyuv.h>
 #include <algorithm>
 #include <cmath>
@@ -119,109 +122,6 @@ size_t FaceDetector::parseModelOutputDim(const std::string& param_path) {
     return 0;
 }
 
-// Helper: Auto-detect detection model type from param file structure
-DetectionModelType FaceDetector::detectModelType(const std::string& param_path) {
-    std::ifstream file(param_path);
-    if (!file.is_open()) {
-        Logger::getInstance().debug("Failed to open detection param file: " + param_path);
-        return DetectionModelType::UNKNOWN;
-    }
-    
-    std::string line;
-    bool has_data_input = false;          // RetinaFace uses "data" as input
-    bool has_in0_input = false;           // YuNet uses "in0" as input
-    bool has_face_rpn_outputs = false;    // RetinaFace has face_rpn_* outputs
-    int out_count = 0;                    // Count out0, out1, out2, ... outputs
-    
-    while (std::getline(file, line)) {
-        // Check for input layer names
-        if (line.find("Input") != std::string::npos) {
-            if (line.find(" data ") != std::string::npos) {
-                has_data_input = true;
-            } else if (line.find(" in0 ") != std::string::npos) {
-                has_in0_input = true;
-            }
-        }
-        
-        // Check for RetinaFace-specific output blobs
-        if (line.find("face_rpn") != std::string::npos) {
-            has_face_rpn_outputs = true;
-        }
-        
-        // Count generic outputs (out0, out1, out2, ...)
-        for (int i = 0; i < 20; i++) {
-            std::string out_name = " out" + std::to_string(i);
-            if (line.find(out_name) != std::string::npos) {
-                // Make sure it's actually an output (appears after layer name)
-                size_t pos = line.find(out_name);
-                if (pos != std::string::npos && pos > 20) {  // Not at the beginning of line
-                    out_count = std::max(out_count, i + 1);
-                }
-            }
-        }
-    }
-    
-    // Determine model type based on structure
-    if (has_data_input && has_face_rpn_outputs) {
-        Logger::getInstance().debug("Detected RetinaFace model (input='data', outputs=face_rpn_*)");
-        return DetectionModelType::RETINAFACE;
-    } else if (has_in0_input && out_count >= 12) {
-        Logger::getInstance().debug("Detected YuNet model (input='in0', " + std::to_string(out_count) + " outputs)");
-        return DetectionModelType::YUNET;
-    }
-    
-    // Check for YOLO-specific patterns
-    bool has_yolov5_outputs = false;  // YOLOv5: outputs "981", "983", "985"
-    bool has_yolov7_outputs = false;  // YOLOv7: outputs "stride_8", "stride_16", "stride_32"
-    bool has_yolov8_outputs = false;  // YOLOv8: outputs "output0", "1076", "1084"
-    bool has_images_input = false;    // YOLOv7/v8 use "images" as input
-    
-    // Rewind file to check again
-    file.clear();
-    file.seekg(0);
-    while (std::getline(file, line)) {
-        // Check for YOLOv5 output layers (appear as outputs at end of line)
-        if (line.find(" 981") != std::string::npos || 
-            line.find(" 983") != std::string::npos || 
-            line.find(" 985") != std::string::npos) {
-            has_yolov5_outputs = true;
-        }
-        // Check for YOLOv7 output layers
-        if (line.find("stride_8") != std::string::npos || 
-            line.find("stride_16") != std::string::npos || 
-            line.find("stride_32") != std::string::npos) {
-            has_yolov7_outputs = true;
-        }
-        // Check for YOLOv8 output layers (appear as outputs at end of line)
-        if (line.find(" output0") != std::string::npos || 
-            line.find(" 1076") != std::string::npos || 
-            line.find(" 1084") != std::string::npos) {
-            has_yolov8_outputs = true;
-        }
-        // Check for "images" input (YOLOv7/v8)
-        if (line.find("Input") != std::string::npos && line.find(" images ") != std::string::npos) {
-            has_images_input = true;
-        }
-    }
-    
-    // Determine YOLO version
-    if (has_data_input && has_yolov5_outputs) {
-        Logger::getInstance().debug("Detected YOLOv5-Face model (input='data', outputs='981', '983', '985')");
-        return DetectionModelType::YOLOV5;
-    } else if (has_images_input && has_yolov7_outputs) {
-        Logger::getInstance().debug("Detected YOLOv7-Face model (input='images', outputs='stride_8', 'stride_16', 'stride_32')");
-        return DetectionModelType::YOLOV7;
-    } else if (has_images_input && has_yolov8_outputs) {
-        Logger::getInstance().debug("Detected YOLOv8-Face model (input='images', outputs='output0', '1076', '1084')");
-        return DetectionModelType::YOLOV8;
-    }
-    
-    Logger::getInstance().debug("Unknown detection model type (data=" + std::to_string(has_data_input) + 
-        ", in0=" + std::to_string(has_in0_input) + ", face_rpn=" + std::to_string(has_face_rpn_outputs) + 
-        ", out_count=" + std::to_string(out_count) + ")");
-    return DetectionModelType::UNKNOWN;
-}
-
 // Helper: Find first available recognition model in models directory
 std::pair<std::string, size_t> FaceDetector::findAvailableModel(const std::string& models_dir) {
     Logger::getInstance().debug("Scanning for models in: " + models_dir);
@@ -293,10 +193,70 @@ std::pair<std::string, size_t> FaceDetector::findAvailableModel(const std::strin
 }
 
 FaceDetector::FaceDetector() {
-    // RetinaFace and SFace models loaded separately via loadModels()
+    // Models (recognition + embedded detection) loaded separately via loadModels()
 }
 
-bool FaceDetector::loadModels(const std::string& model_base_path, const std::string& detection_model_path) {
+// Helper: Load embedded YuNet model from memory (primary detection)
+bool FaceDetector::loadEmbeddedYuNet() {
+    Logger::getInstance().debug("Loading embedded YuNet detection model...");
+    
+    yunet_net_.opt.use_vulkan_compute = false;
+    yunet_net_.opt.num_threads = 4;
+    yunet_net_.opt.use_fp16_packed = false;
+    yunet_net_.opt.use_fp16_storage = false;
+    
+    // Load param from memory (null-terminated string)
+    int ret = yunet_net_.load_param_mem(embedded::yunet_model_param);
+    if (ret != 0) {
+        Logger::getInstance().error("Failed to load YuNet param from memory, ret=" + std::to_string(ret));
+        return false;
+    }
+    
+    // Load binary model from memory using DataReaderFromMemory
+    const unsigned char* model_data = embedded::yunet_model_bin;
+    ncnn::DataReaderFromMemory mem_reader(model_data);
+    ret = yunet_net_.load_model(mem_reader);
+    if (ret != 0) {
+        Logger::getInstance().error("Failed to load YuNet model from memory, ret=" + std::to_string(ret));
+        return false;
+    }
+    
+    Logger::getInstance().info("✓ Embedded YuNet model loaded successfully (" + 
+                               std::to_string(embedded::yunet_model_bin_size / 1024) + " KB)");
+    return true;
+}
+
+// Helper: Load embedded RetinaFace model from memory (fallback detection)
+bool FaceDetector::loadEmbeddedRetinaFace() {
+    Logger::getInstance().debug("Loading embedded RetinaFace detection model...");
+    
+    retinaface_net_.opt.use_vulkan_compute = false;
+    retinaface_net_.opt.num_threads = 4;
+    retinaface_net_.opt.use_fp16_packed = false;
+    retinaface_net_.opt.use_fp16_storage = false;
+    
+    // Load param from memory (null-terminated string)
+    int ret = retinaface_net_.load_param_mem(embedded::retinaface_model_param);
+    if (ret != 0) {
+        Logger::getInstance().error("Failed to load RetinaFace param from memory, ret=" + std::to_string(ret));
+        return false;
+    }
+    
+    // Load binary model from memory using DataReaderFromMemory
+    const unsigned char* model_data = embedded::retinaface_model_bin;
+    ncnn::DataReaderFromMemory mem_reader(model_data);
+    ret = retinaface_net_.load_model(mem_reader);
+    if (ret != 0) {
+        Logger::getInstance().error("Failed to load RetinaFace model from memory, ret=" + std::to_string(ret));
+        return false;
+    }
+    
+    Logger::getInstance().info("✓ Embedded RetinaFace model loaded successfully (" + 
+                               std::to_string(embedded::retinaface_model_bin_size / 1024) + " KB)");
+    return true;
+}
+
+bool FaceDetector::loadModels(const std::string& model_base_path) {
     try {
         // Load detection confidence threshold from config
         auto confidence_opt = Config::getInstance().getDouble("recognition", "confidence");
@@ -448,206 +408,24 @@ bool FaceDetector::loadModels(const std::string& model_base_path, const std::str
         Logger::getInstance().debug("✓ Recognition model loaded: " + current_model_name_ + 
             " (" + std::to_string(current_encoding_dim_) + "D)");
         
-        // Load detection model with priority system
-        std::string detection_base;
-        
-        // If explicit detection path provided, use it
-        if (!detection_model_path.empty()) {
-            detection_base = detection_model_path;
-            Logger::getInstance().debug("Using explicit detection model path: " + detection_base);
-        } else {
-            // Priority 1: Try standard name "detection.{param,bin}"
-            std::string standard_detection = std::string(MODELS_DIR) + "/detection";
-            std::string standard_detection_param = standard_detection + ".param";
-            std::string standard_detection_bin = standard_detection + ".bin";
-            
-            std::ifstream det_param_check(standard_detection_param);
-            std::ifstream det_bin_check(standard_detection_bin);
-            
-            if (det_param_check.good() && det_bin_check.good()) {
-                Logger::getInstance().debug("Found standard detection model: detection.{param,bin}");
-                detection_base = standard_detection;
-            } else {
-                // Priority 2: Try legacy mnet.25-opt (RetinaFace)
-                Logger::getInstance().debug("Standard detection name not found, trying mnet.25-opt");
-                detection_base = std::string(MODELS_DIR) + "/mnet.25-opt";
-                
-                std::string legacy_param = detection_base + ".param";
-                std::string legacy_bin = detection_base + ".bin";
-                std::ifstream legacy_param_check(legacy_param);
-                std::ifstream legacy_bin_check(legacy_bin);
-                
-                if (!legacy_param_check.good() || !legacy_bin_check.good()) {
-                    // Priority 3: Try RFB-320
-                    Logger::getInstance().debug("mnet.25-opt not found, trying RFB-320");
-                    detection_base = std::string(MODELS_DIR) + "/RFB-320";
-                }
-            }
+        // Load embedded detection models
+        if (!loadEmbeddedYuNet()) {
+            Logger::getInstance().error("Failed to load embedded YuNet model");
+            return false;
         }
+        detection_model_loaded_ = true;
+        detection_model_type_ = DetectionModelType::YUNET;
         
-        std::string retinaface_param = detection_base + ".param";
-        std::string retinaface_bin = detection_base + ".bin";
-        
-        // Check if .param exists, if not try .ncnn.param
-        std::ifstream det_param_check(retinaface_param);
-        if (!det_param_check.good()) {
-            retinaface_param = detection_base + ".ncnn.param";
-            retinaface_bin = detection_base + ".ncnn.bin";
+        if (!loadEmbeddedRetinaFace()) {
+            Logger::getInstance().error("Failed to load embedded RetinaFace model");
+            return false;
         }
-        
-        Logger::getInstance().debug("Loading detection model from: " + detection_base);
-        
-        // Check if this model was already loaded
-        bool det_was_cached = isModelCached(retinaface_param, retinaface_bin);
-        if (det_was_cached) {
-            Logger::getInstance().debug("Detection model cache HIT (faster due to FS cache)");
-        }
-        
-        retinaface_net_.opt.use_vulkan_compute = false;
-        retinaface_net_.opt.num_threads = 4;
-        retinaface_net_.opt.use_fp16_packed = false;
-        retinaface_net_.opt.use_fp16_storage = false;
-        
-        ret = retinaface_net_.load_param(retinaface_param.c_str());
-        if (ret != 0) {
-            // Detection model not found - this is OK, will fall back if needed
-            detection_model_loaded_ = false;
-            Logger::getInstance().debug("Detection model param not found (ret=" + std::to_string(ret) + "), detection_model_loaded_=false");
-        } else {
-            ret = retinaface_net_.load_model(retinaface_bin.c_str());
-            if (ret != 0) {
-                detection_model_loaded_ = false;
-                Logger::getInstance().debug("Detection model bin not found (ret=" + std::to_string(ret) + "), detection_model_loaded_=false");
-            } else {
-                detection_model_loaded_ = true;
-                
-                // Mark as cached
-                if (!det_was_cached) {
-                    markModelCached(retinaface_param, retinaface_bin);
-                }
-                // Auto-detect detection model type
-                detection_model_type_ = detectModelType(retinaface_param);
-                detection_model_name_ = detection_base.substr(detection_base.find_last_of("/\\") + 1);
-                
-                // Adjust default confidence threshold based on model type (if not set by user)
-                auto confidence_opt = Config::getInstance().getDouble("recognition", "confidence");
-                if (!confidence_opt.has_value()) {
-                    // User didn't specify confidence in config, use default
-                    detection_confidence_threshold_ = 0.8f;
-                    Logger::getInstance().debug("Using default confidence: 0.8");
-                }
-                
-                // Try to read original detection model name from .use file
-                std::string use_file = std::string(MODELS_DIR) + "/.use";
-                std::ifstream use_stream(use_file);
-                if (use_stream.good()) {
-                    std::string line;
-                    while (std::getline(use_stream, line)) {
-                        if (line.empty() || line[0] == '#') continue;
-                        
-                        size_t eq_pos = line.find('=');
-                        if (eq_pos != std::string::npos) {
-                            std::string key = line.substr(0, eq_pos);
-                            std::string value = line.substr(eq_pos + 1);
-                            if (key == "detection") {
-                                detection_model_name_ = value;
-                                break;
-                            }
-                        }
-                    }
-                }
-                
-                std::string model_type_str;
-                switch (detection_model_type_) {
-                    case DetectionModelType::RETINAFACE: model_type_str = "RetinaFace"; break;
-                    case DetectionModelType::YUNET: model_type_str = "YuNet"; break;
-                    case DetectionModelType::YOLOV5: model_type_str = "YOLOv5-Face"; break;
-                    case DetectionModelType::YOLOV7: model_type_str = "YOLOv7-Face"; break;
-                    case DetectionModelType::YOLOV8: model_type_str = "YOLOv8-Face"; break;
-                    default: model_type_str = "Unknown"; break;
-                }
-                
-                Logger::getInstance().debug("Detection model loaded successfully: " + detection_model_name_ + " (type: " + model_type_str + ")");
-            }
-        }
-        
-        // Load detection2 model (cascade fallback) - Optional
-        std::string detection2_base = std::string(MODELS_DIR) + "/detection2";
-        std::string detection2_param = detection2_base + ".param";
-        std::string detection2_bin = detection2_base + ".bin";
-        
-        std::ifstream det2_param_check(detection2_param);
-        std::ifstream det2_bin_check(detection2_bin);
-        
-        if (det2_param_check.good() && det2_bin_check.good()) {
-            Logger::getInstance().debug("Found detection2 model (cascade fallback): detection2.{param,bin}");
-            
-            bool det2_was_cached = isModelCached(detection2_param, detection2_bin);
-            if (det2_was_cached) {
-                Logger::getInstance().debug("Detection2 model cache HIT");
-            }
-            
-            detection2_net_.opt.use_vulkan_compute = false;
-            detection2_net_.opt.num_threads = 4;
-            detection2_net_.opt.use_fp16_packed = false;
-            detection2_net_.opt.use_fp16_storage = false;
-            
-            ret = detection2_net_.load_param(detection2_param.c_str());
-            if (ret == 0) {
-                ret = detection2_net_.load_model(detection2_bin.c_str());
-                if (ret == 0) {
-                    detection2_model_loaded_ = true;
-                    
-                    if (!det2_was_cached) {
-                        markModelCached(detection2_param, detection2_bin);
-                    }
-                    
-                    // Auto-detect detection2 model type
-                    detection2_model_type_ = detectModelType(detection2_param);
-                    detection2_model_name_ = "detection2";
-                    
-                    // Try to read original detection2 model name from .use file
-                    std::ifstream use_stream2(use_file);
-                    if (use_stream2.good()) {
-                        std::string line;
-                        while (std::getline(use_stream2, line)) {
-                            if (line.empty() || line[0] == '#') continue;
-                            
-                            size_t eq_pos = line.find('=');
-                            if (eq_pos != std::string::npos) {
-                                std::string key = line.substr(0, eq_pos);
-                                std::string value = line.substr(eq_pos + 1);
-                                if (key == "detection2") {
-                                    detection2_model_name_ = value;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    
-                    std::string model_type_str2;
-                    switch (detection2_model_type_) {
-                        case DetectionModelType::RETINAFACE: model_type_str2 = "RetinaFace"; break;
-                        case DetectionModelType::YUNET: model_type_str2 = "YuNet"; break;
-                        case DetectionModelType::YOLOV5: model_type_str2 = "YOLOv5-Face"; break;
-                        case DetectionModelType::YOLOV7: model_type_str2 = "YOLOv7-Face"; break;
-                        case DetectionModelType::YOLOV8: model_type_str2 = "YOLOv8-Face"; break;
-                        default: model_type_str2 = "Unknown"; break;
-                    }
-                    
-                    Logger::getInstance().debug("Detection2 model loaded successfully: " + detection2_model_name_ + " (type: " + model_type_str2 + ")");
-                } else {
-                    Logger::getInstance().debug("Detection2 model bin failed to load (ret=" + std::to_string(ret) + ")");
-                }
-            } else {
-                Logger::getInstance().debug("Detection2 model param failed to load (ret=" + std::to_string(ret) + ")");
-            }
-        } else {
-            Logger::getInstance().debug("Detection2 model not found (optional, will skip cascade stage 3)");
-        }
+        detection2_model_loaded_ = true;
+        detection2_model_type_ = DetectionModelType::RETINAFACE;
         
         return true;
     } catch (const std::exception& e) {
+        Logger::getInstance().error("Exception in loadModels: " + std::string(e.what()));
         return false;
     }
 }
@@ -681,43 +459,17 @@ std::vector<Rect> FaceDetector::detectFaces(const ImageView& frame, bool downsca
     std::vector<Rect> faces;
     switch (detection_model_type_) {
         case DetectionModelType::RETINAFACE:
+            {
+                // Convert BGR to RGB (all models expect RGB)
+                ncnn::Mat in = ncnn::Mat::from_pixels(frame.data(), ncnn::Mat::PIXEL_BGR2RGB, img_w, img_h);
+                faces = detectWithRetinaFace(in, img_w, img_h, confidence_threshold);
+            }
+            break;
         case DetectionModelType::YUNET:
             {
                 // Convert BGR to RGB (all models expect RGB)
                 ncnn::Mat in = ncnn::Mat::from_pixels(frame.data(), ncnn::Mat::PIXEL_BGR2RGB, img_w, img_h);
-                
-                if (detection_model_type_ == DetectionModelType::RETINAFACE) {
-                    faces = detectWithRetinaFace(in, img_w, img_h, confidence_threshold);
-                } else if (detection_model_type_ == DetectionModelType::YUNET) {
-                    faces = detectWithYuNet(in, img_w, img_h, confidence_threshold);
-                }
-            }
-            break;
-        case DetectionModelType::YOLOV5:
-        case DetectionModelType::YOLOV7:
-        case DetectionModelType::YOLOV8:
-            {
-                // Convert BGR to RGB (all YOLO models expect RGB)
-                ncnn::Mat in = ncnn::Mat::from_pixels(frame.data(), ncnn::Mat::PIXEL_BGR2RGB, img_w, img_h);
-                
-                // Apply model-specific default thresholds if not specified
-                float yolo_threshold = confidence_threshold;
-                if (confidence_threshold == detection_confidence_threshold_) {
-                    // User didn't specify threshold, use model-specific default
-                    if (detection_model_type_ == DetectionModelType::YOLOV7) {
-                        yolo_threshold = 0.65f;  // YOLOv7 needs higher threshold
-                    } else {
-                        yolo_threshold = 0.5f;   // YOLOv5 and YOLOv8 use 0.5
-                    }
-                }
-                
-                if (detection_model_type_ == DetectionModelType::YOLOV5) {
-                    faces = detectWithYOLOv5(retinaface_net_, in, img_w, img_h, yolo_threshold);
-                } else if (detection_model_type_ == DetectionModelType::YOLOV7) {
-                    faces = detectWithYOLOv7(retinaface_net_, in, img_w, img_h, yolo_threshold);
-                } else {
-                    faces = detectWithYOLOv8(retinaface_net_, in, img_w, img_h, yolo_threshold);
-                }
+                faces = detectWithYuNet(in, img_w, img_h, confidence_threshold);
             }
             break;
         default:
@@ -747,7 +499,7 @@ std::vector<Rect> FaceDetector::detectWithYuNet(const ncnn::Mat& in, int img_w, 
     if (confidence_threshold <= 0.0f) {
         confidence_threshold = detection_confidence_threshold_;
     }
-    return ::faceid::detectWithYuNet(retinaface_net_, in, img_w, img_h, confidence_threshold);
+    return ::faceid::detectWithYuNet(yunet_net_, in, img_w, img_h, confidence_threshold);
 }
 
 std::vector<Rect> FaceDetector::detectOrTrackFaces(const ImageView& frame, int track_interval, float confidence_threshold) {
@@ -1467,41 +1219,19 @@ FaceDetector::CascadeResult FaceDetector::detectFacesCascade(
         return result;
     }
     
-    // Stage 3: Aggressive preprocessing + detection2 fallback (if available)
+    // Stage 3: Aggressive preprocessing + RetinaFace fallback (if available)
     if (detection2_model_loaded_) {
-        Logger::getInstance().debug("Cascade Stage 3: Trying detection2 fallback (" + 
-                                   detection2_model_name_ + ")");
+        Logger::getInstance().debug("Cascade Stage 3: Trying RetinaFace fallback");
         auto stage3_start = std::chrono::high_resolution_clock::now();
         
-        // Use detection2 model directly
+        // Use RetinaFace model directly
         int img_w = result.processed_frame.width();
         int img_h = result.processed_frame.height();
         
         ncnn::Mat in = ncnn::Mat::from_pixels(result.processed_frame.data(), 
                                               ncnn::Mat::PIXEL_BGR2RGB, img_w, img_h);
         
-        // Route to appropriate detector based on detection2 model type
-        std::vector<Rect> stage3_faces;
-        switch (detection2_model_type_) {
-            case DetectionModelType::RETINAFACE:
-                stage3_faces = faceid::detectWithRetinaFace(detection2_net_, in, img_w, img_h, confidence_threshold);
-                break;
-            case DetectionModelType::YUNET:
-                stage3_faces = faceid::detectWithYuNet(detection2_net_, in, img_w, img_h, confidence_threshold);
-                break;
-            case DetectionModelType::YOLOV5:
-                stage3_faces = faceid::detectWithYOLOv5(detection2_net_, in, img_w, img_h, confidence_threshold);
-                break;
-            case DetectionModelType::YOLOV7:
-                stage3_faces = faceid::detectWithYOLOv7(detection2_net_, in, img_w, img_h, confidence_threshold);
-                break;
-            case DetectionModelType::YOLOV8:
-                stage3_faces = faceid::detectWithYOLOv8(detection2_net_, in, img_w, img_h, confidence_threshold);
-                break;
-            default:
-                Logger::getInstance().error("Unknown detection2 model type");
-                break;
-        }
+        std::vector<Rect> stage3_faces = faceid::detectWithRetinaFace(retinaface_net_, in, img_w, img_h, confidence_threshold);
         
         auto stage3_end = std::chrono::high_resolution_clock::now();
         result.stage3_time_ms = std::chrono::duration<double, std::milli>(stage3_end - stage3_start).count();

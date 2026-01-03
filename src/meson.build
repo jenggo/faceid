@@ -26,7 +26,8 @@ core_sources = files(
     'models/model_cache.cpp',
     'detectors/retinaface.cpp',
     'detectors/yunet.cpp',
-    'detectors/yolo.cpp',
+    'detectors/yunet_model_data.cpp',
+    'detectors/retinaface_model_data.cpp',
 )
 
 core_lib = static_library(

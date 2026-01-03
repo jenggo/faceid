@@ -21,23 +21,19 @@ enum class ModelPurpose {
 };
 
 // Determine if a model is for detection or recognition
-// Uses existing FaceDetector methods (DRY principle)
+// Detection models are now embedded, so we check for recognition model output dimension
 static ModelPurpose determineModelPurpose(const std::string& param_path) {
     FaceDetector detector;
     
-    // Try as detection model first
-    DetectionModelType det_type = detector.detectModelType(param_path);
-    if (det_type != DetectionModelType::UNKNOWN) {
-        return ModelPurpose::DETECTION;
-    }
-    
-    // Try as recognition model
+    // Try as recognition model first - check output dimension
     size_t output_dim = detector.parseModelOutputDim(param_path);
     if (output_dim >= 64 && output_dim <= 2048) {
         return ModelPurpose::RECOGNITION;
     }
     
-    return ModelPurpose::UNKNOWN;
+    // If dimension check failed or dimension is not valid for recognition,
+    // assume it's a detection model
+    return ModelPurpose::DETECTION;
 }
 
 static std::string getModelPurposeName(ModelPurpose purpose) {

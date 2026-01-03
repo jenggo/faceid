@@ -544,12 +544,12 @@ static inline float findOptimalDetectionConfidence(Camera& camera, FaceDetector&
         
         faceid::Image processed_frame = detector.preprocessFrame(frame.view());
         
-        // Quick check if any face is detected at default confidence
-        auto test_faces = detector.detectFaces(processed_frame.view(), false, 0.5f);
+        // Quick check if any face is detected at lower confidence (0.3 to be more lenient)
+        auto test_faces = detector.detectFaces(processed_frame.view(), false, 0.3f);
         if (!test_faces.empty()) {
             frames.push_back(frame.clone());
             processed_frames.push_back(std::move(processed_frame));
-            std::cout << "  Frame " << frames.size() << "/" << NUM_ANALYSIS_FRAMES << "\r" << std::flush;
+            std::cout << "  Frame " << frames.size() << "/" << NUM_ANALYSIS_FRAMES << " (detected " << test_faces.size() << " face(s))\r" << std::flush;
         }
     }
     std::cout << std::endl;

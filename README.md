@@ -7,7 +7,8 @@ Tested on T14 Gen4 Ryzen (Manjaro Plasma Wayland)
 ## Key Features
 
 - **Parallel Biometric Auth**: Face + fingerprint run simultaneously, first to succeed wins (~50-500ms)
-- **Fast Face Detection**: RetinaFace/YuNet/YOLO (pluggable models) + multi-model recognition support
+- **Embedded Face Detection**: YuNet (primary) + RetinaFace (fallback) built into binary - no model downloads needed
+- **Cascading Detection**: 3-stage detection (standard → aggressive preprocessing → fallback model) for robust face detection
 - **Facial Landmarks**: Real-time visualization of 5-point landmarks (eyes, nose, mouth) in preview and test modes
 - **Smart Face Matching**: Deduplicates multiple detections and validates uniqueness with margin check to prevent false positives
 - **Smart Lid Detection**: Skips biometric auth when lid closed, saves 5-second timeout
@@ -29,39 +30,15 @@ Tested on T14 Gen4 Ryzen (Manjaro Plasma Wayland)
 **Debian/Ubuntu**: `sudo apt install build-essential meson ninja-build libncnn-dev libpam0g-dev libturbojpeg0-dev libsdl2-dev libyuv-dev libglib2.0-dev fprintd libsystemd-dev pkg-config`  
 **Fedora**: `sudo dnf install gcc-c++ meson ninja-build ncnn-devel pam-devel turbojpeg-devel SDL2-devel libyuv-devel glib2-devel fprintd systemd-devel pkgconfig`
 
-### Build
+### Build & Install
 
 ```bash
 make build && sudo make install
 ```
 
-### Download Models
+**Note**: Detection models (YuNet + RetinaFace) are embedded in the binary. Only recognition models need to be downloaded separately.
 
-**Detection Models** (choose one):
-
-**RetinaFace (Recommended for accuracy)**:
-```bash
-cd /etc/faceid/models
-sudo wget https://github.com/nihui/ncnn-assets/raw/master/models/mnet.25-opt.{param,bin}
-sudo mv mnet.25-opt.param mnet-retinaface.param
-sudo mv mnet.25-opt.bin mnet-retinaface.bin
-```
-
-**YuNet (Good balance)**:
-```bash
-cd /etc/faceid/models
-sudo wget https://github.com/nihui/ncnn-assets/raw/master/models/yunet_2023mar.ncnn.{param,bin}
-```
-
-**YOLOv8-Face (Fast)**:
-```bash
-cd /etc/faceid/models
-# Download YOLOv8-Face NCNN models from github.com/derronqi/yolov8-face
-sudo wget <yolov8-face.param> -O yolov8-face.param
-sudo wget <yolov8-face.bin> -O yolov8-face.bin
-```
-
-**Recognition Models** (SFace - convert from ONNX):
+### Download Recognition Models
 ```bash
 pip3 install pnnx
 cd /etc/faceid/models
@@ -211,7 +188,7 @@ Edit `/etc/faceid/faceid.conf`:
 
 **Enrollment**: Face and/or fingerprint (any combo works, both = faster)  
 **Speed**: Face ~48ms, fingerprint ~200-400ms (parallel, first wins)  
-**Models**: NCNN format only (RetinaFace, YuNet, YOLO from [ncnn-assets](https://github.com/nihui/ncnn-assets), SFace convert with PNNX)  
+**Models**: Detection models (YuNet + RetinaFace) embedded in binary. Recognition models from NCNN format (SFace via PNNX conversion)  
 **SSH**: Falls back to password (no camera)  
 **Unenroll**: `sudo faceid remove <user>` or `fprintd-delete <user>`  
 **Landmarks**: 5-point landmarks (eyes, nose, mouth) shown in preview and test modes for visual verification  
@@ -220,9 +197,9 @@ Edit `/etc/faceid/faceid.conf`:
 ## Technical Details
 
 **Pipeline**: Lid check → parallel (face detection + recognition | fprintd) → first success wins  
-**Detection Models**: RetinaFace/YuNet/YOLO (pluggable, auto-detected from NCNN structure)  
+**Detection**: YuNet (primary) + RetinaFace (fallback) embedded in binary with 3-stage cascading  
 **Recognition Models**: SFace/MobileFaceNet/ArcFace variants (128D-512D encodings)  
-**Performance**: ~7-15ms detection (YOLO fastest), ~20-33ms recognition, ~50-100MB memory  
+**Performance**: ~7-15ms detection (YuNet), ~20-33ms recognition, ~50-100MB memory  
 **Storage**: Face models in `/var/lib/faceid/faces/<user>.<faceid>.bin`, logs in `/var/log/faceid.log`  
 **Enrollment**: Binary search for optimal confidence (0.01 precision), 5 samples with 1s intervals, automatic threshold calculation with deduplication and margin validation  
 **Face Matching**: Two-stage algorithm with threshold check + uniqueness validation + deduplication

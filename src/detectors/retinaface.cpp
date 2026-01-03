@@ -22,7 +22,7 @@ std::vector<Rect> detectWithRetinaFace(ncnn::Net& net, const ncnn::Mat& in, int 
     std::vector<FaceObject> faceproposals;
     
     const float prob_threshold = confidence_threshold;
-    const float nms_threshold = 0.4f;
+    const float nms_threshold = 0.5f;  // Increased from 0.4 to 0.5 for consistency
     
     // stride 32
     {
