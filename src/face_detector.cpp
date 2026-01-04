@@ -803,8 +803,65 @@ std::vector<FaceEncoding> FaceDetector::encodeFaces(
             std::to_string(face_rect.x) + "," + std::to_string(face_rect.y) + "," +
             std::to_string(face_rect.width) + "x" + std::to_string(face_rect.height) + ")");
         
-        // Align face for SFace (112x112)
-        Image aligned = alignFace(frame, face_rect);
+        // QUICK WIN #4: Apply head pose correction if enabled and landmarks available
+        Image corrected_frame;
+        bool pose_corrected = false;
+        if (Config::getInstance().getBool("recognition", "enable_head_pose_correction").value_or(true) &&
+            face_rect.hasLandmarks()) {
+            HeadPose pose = estimateHeadPose(face_rect.landmarks);
+            Logger::getInstance().debug("Face " + std::to_string(idx) + " head pose: yaw=" + 
+                std::to_string(pose.yaw) + " pitch=" + std::to_string(pose.pitch) + 
+                " roll=" + std::to_string(pose.roll));
+            
+            corrected_frame = applyHeadPoseCorrection(frame, face_rect, pose);
+            pose_corrected = true;
+            Logger::getInstance().debug("Head pose correction applied to face " + std::to_string(idx));
+        }
+        
+        // Align face for SFace (112x112) - use corrected frame if available
+        Image aligned;
+        if (pose_corrected) {
+            // Create a temporary Rect for the corrected frame (face is centered)
+            Rect temp_rect;
+            temp_rect.x = 0;
+            temp_rect.y = 0;
+            temp_rect.width = corrected_frame.width();
+            temp_rect.height = corrected_frame.height();
+            temp_rect.landmarks = face_rect.landmarks; // Preserve landmarks
+            aligned = alignFace(corrected_frame.view(), temp_rect);
+        } else {
+            aligned = alignFace(frame, face_rect);
+        }
+
+        // QUICK WIN #1: Apply histogram equalization if enabled
+        if (Config::getInstance().getBool("recognition", "enable_histogram_eq").value_or(true)) {
+            aligned = normalizeImageHistogram(aligned);
+            Logger::getInstance().debug("Histogram equalization applied to face " + std::to_string(idx));
+        }
+        
+        // QUICK WIN #2: Assess face quality and skip low-quality faces
+        double min_quality = Config::getInstance().getDouble("recognition", "min_face_quality")
+                             .value_or(0.70);
+        bool debug_quality = Config::getInstance().getBool("recognition", "debug_face_quality")
+                             .value_or(false);
+        
+        FaceQuality quality = assessFaceQuality(aligned, face_rect, frame.width(), 1.0f);
+        
+        if (debug_quality) {
+            char buf[256];
+            snprintf(buf, sizeof(buf), 
+                     "Face %zu quality: overall=%.3f blur=%.3f size=%.3f brightness=%.3f confidence=%.3f",
+                     idx, quality.overall_score, quality.blur_score, quality.size_score,
+                     quality.brightness_score, quality.confidence_score);
+            Logger::getInstance().debug(buf);
+        }
+        
+        if (quality.overall_score < min_quality) {
+            Logger::getInstance().debug("Face " + std::to_string(idx) + " skipped - low quality: " + 
+                                       std::to_string(quality.overall_score) + " < " +
+                                       std::to_string(min_quality));
+            continue;
+        }
         Logger::getInstance().debug("Aligned face to " + std::to_string(aligned.width()) + "x" + std::to_string(aligned.height()));
         
         // Convert to NCNN format (no manual normalization - model has built-in preprocessing)
@@ -1474,5 +1531,407 @@ std::vector<size_t> FaceDetector::deduplicateFaces(
     
     return unique_indices;
 }
+
+
+// ============================================================================
+// QUICK WIN #1: Histogram Equalization
+// ============================================================================
+Image FaceDetector::normalizeImageHistogram(const Image& face_image) {
+    // Convert to grayscale if needed
+    Image work_img;
+    if (face_image.channels() == 3) {
+        work_img = toGrayscale(face_image.data(), face_image.width(), 
+                               face_image.height(), face_image.stride());
+    } else if (face_image.channels() == 1) {
+        work_img = face_image.clone();
+    } else {
+        return face_image.clone();  // Unsupported format
+    }
+
+    int width = work_img.width();
+    int height = work_img.height();
+    uint8_t* data = work_img.data();
+    int total_pixels = width * height;
+    
+    // Compute histogram
+    std::vector<int> histogram(256, 0);
+    for (int i = 0; i < total_pixels; i++) {
+        histogram[data[i]]++;
+    }
+    
+    // Compute cumulative distribution function (CDF)
+    std::vector<uint8_t> lut(256);
+    int sum = 0;
+    for (int i = 0; i < 256; i++) {
+        sum += histogram[i];
+        lut[i] = static_cast<uint8_t>((sum * 255) / total_pixels);
+    }
+    
+    // Apply histogram equalization
+    for (int i = 0; i < total_pixels; i++) {
+        data[i] = lut[data[i]];
+    }
+    
+    // Convert back to BGR if original was color
+    if (face_image.channels() == 3) {
+        Image result(width, height, 3);
+        uint8_t* result_data = result.data();
+        
+        for (int i = 0; i < total_pixels; i++) {
+            result_data[i * 3 + 0] = data[i];  // B
+            result_data[i * 3 + 1] = data[i];  // G
+            result_data[i * 3 + 2] = data[i];  // R
+        }
+        return result;
+    }
+    
+    return work_img;
+}
+
+// ============================================================================
+// QUICK WIN #2: Face Quality Assessment
+// ============================================================================
+faceid::FaceQuality FaceDetector::assessFaceQuality(
+    const Image& aligned_face,
+    const Rect& original_face,
+    int frame_width,
+    float detector_confidence) {
+    
+    FaceQuality quality;
+    
+    // Convert to grayscale for analysis
+    Image gray_aligned = aligned_face.channels() == 1 ? 
+        aligned_face.clone() : 
+        toGrayscale(aligned_face.data(), aligned_face.width(), 
+                   aligned_face.height(), aligned_face.stride());
+    
+    int width = gray_aligned.width();
+    int height = gray_aligned.height();
+    const uint8_t* data = gray_aligned.data();
+    int total_pixels = width * height;
+    
+    // 1. Blur detection using Laplacian operator
+    {
+        double laplacian_sum = 0.0;
+        int sample_count = 0;
+        
+        for (int y = 1; y < height - 1; y++) {
+            for (int x = 1; x < width - 1; x += 2) {
+                uint8_t center = data[y * width + x];
+                uint8_t top = data[(y - 1) * width + x];
+                uint8_t bottom = data[(y + 1) * width + x];
+                uint8_t left = data[y * width + (x - 1)];
+                uint8_t right = data[y * width + (x + 1)];
+                
+                int laplacian = 4 * center - top - bottom - left - right;
+                laplacian_sum += std::abs(laplacian);
+                sample_count++;
+            }
+        }
+        
+        if (sample_count > 0) {
+            double mean_laplacian = laplacian_sum / sample_count;
+            quality.blur_score = std::min(1.0, mean_laplacian / 80.0);
+        } else {
+            quality.blur_score = 0.5;
+        }
+    }
+    
+    // 2. Face size relative to frame
+    {
+        double face_size_percent = static_cast<double>(original_face.width) / frame_width;
+        if (face_size_percent < 0.05) {
+            quality.size_score = 0.2;  // Too small
+        } else if (face_size_percent > 0.3) {
+            quality.size_score = 0.7;  // Very large
+        } else {
+            quality.size_score = std::min(1.0, face_size_percent / 0.15);
+        }
+    }
+    
+    // 3. Brightness uniformity
+    {
+        uint64_t sum = 0;
+        for (int i = 0; i < total_pixels; i++) {
+            sum += data[i];
+        }
+        double mean = static_cast<double>(sum) / total_pixels;
+        
+        uint64_t var_sum = 0;
+        for (int i = 0; i < total_pixels; i++) {
+            double diff = data[i] - mean;
+            var_sum += static_cast<uint64_t>(diff * diff);
+        }
+        double variance = static_cast<double>(var_sum) / total_pixels;
+        double stddev = std::sqrt(variance);
+        
+        double uniformity_score = std::max(0.0, 1.0 - std::abs(stddev - 35.0) / 100.0);
+        double brightness_in_range = (mean > 20 && mean < 235) ? 1.0 : 0.5;
+        
+        quality.brightness_score = uniformity_score * 0.7 + brightness_in_range * 0.3;
+    }
+    
+    // 4. Detector confidence weight
+    quality.confidence_score = detector_confidence;
+    
+    // 5. Combined score
+    quality.overall_score = 
+        quality.blur_score * 0.35 +
+        quality.size_score * 0.25 +
+        quality.brightness_score * 0.25 +
+        quality.confidence_score * 0.15;
+    
+    return quality;
+}
+
+// ============================================================================
+// QUICK WIN #4: Head Pose Estimation
+// ============================================================================
+FaceDetector::HeadPose FaceDetector::estimateHeadPose(const std::vector<Point>& landmarks) {
+    HeadPose pose;
+    pose.yaw = 0.0f;
+    pose.pitch = 0.0f;
+    pose.roll = 0.0f;
+    
+    if (landmarks.size() < 5) {
+        return pose;
+    }
+    
+    Point left_eye = landmarks[0];
+    Point right_eye = landmarks[1];
+    Point nose = landmarks[2];
+    Point left_mouth = landmarks[3];
+    Point right_mouth = landmarks[4];
+    
+    Point face_center(
+        (left_eye.x + right_eye.x) / 2.0f,
+        (left_eye.y + right_eye.y) / 2.0f
+    );
+    
+    // Roll: Eye line alignment
+    float eye_dx = right_eye.x - left_eye.x;
+    float eye_dy = right_eye.y - left_eye.y;
+    pose.roll = std::atan2(eye_dy, eye_dx) * (180.0f / M_PI);
+    
+    // Yaw: Nose offset from face center
+    float nose_dx = nose.x - face_center.x;
+    if (eye_dx > 1.0f) {
+        pose.yaw = (nose_dx / eye_dx) * 30.0f;
+        pose.yaw = std::max(-45.0f, std::min(45.0f, pose.yaw));
+    }
+    
+    // Pitch: Nose vertical position
+    float eye_y = (left_eye.y + right_eye.y) / 2.0f;
+    float mouth_y = (left_mouth.y + right_mouth.y) / 2.0f;
+    float expected_nose_y = (eye_y + mouth_y) / 2.0f;
+    float nose_dy = nose.y - expected_nose_y;
+    float face_height = mouth_y - eye_y;
+    
+    if (face_height > 1.0f) {
+        pose.pitch = -(nose_dy / face_height) * 25.0f;
+        pose.pitch = std::max(-45.0f, std::min(45.0f, pose.pitch));
+    }
+    
+    return pose;
+}
+
+// ========================================================================
+// QUICK WIN #4: Head Pose Correction - Complete Implementation
+// ========================================================================
+// Applies perspective correction to compensate for head rotation
+// This function is COMPLETE but NOT yet integrated into the recognition pipeline
+// To use: Call before alignFace() in encodeFaces() when enable_head_pose_correction=true
+
+/**
+ * Apply perspective correction to face region based on head pose
+ * Compensates for yaw/pitch/roll to normalize head orientation
+ * @param frame Source image containing the face
+ * @param face_rect Face bounding box with landmarks
+ * @param pose Estimated head rotation angles
+ * @return Corrected image with normalized head orientation
+ */
+Image FaceDetector::applyHeadPoseCorrection(const ImageView& frame, const Rect& face_rect, const FaceDetector::HeadPose& pose) {
+    // If rotation is minimal, skip correction (performance optimization)
+    if (std::abs(pose.yaw) < 5.0f && std::abs(pose.pitch) < 5.0f && std::abs(pose.roll) < 5.0f) {
+        // Extract and return face region without correction
+        int x = std::max(0, face_rect.x);
+        int y = std::max(0, face_rect.y);
+        int w = std::min(face_rect.width, frame.width() - x);
+        int h = std::min(face_rect.height, frame.height() - y);
+        
+        Image face_region(w, h, frame.channels());
+        const uint8_t* src = frame.data() + y * frame.stride() + x * frame.channels();
+        uint8_t* dst = face_region.data();
+        
+        for (int row = 0; row < h; row++) {
+            std::memcpy(dst, src, w * frame.channels());
+            src += frame.stride();
+            dst += face_region.stride();
+        }
+        
+        return face_region;
+    }
+    
+    // Get face center and landmarks
+    if (!face_rect.hasLandmarks() || face_rect.landmarks.size() < 5) {
+        // Fallback: return uncorrected face region
+        int x = std::max(0, face_rect.x);
+        int y = std::max(0, face_rect.y);
+        int w = std::min(face_rect.width, frame.width() - x);
+        int h = std::min(face_rect.height, frame.height() - y);
+        
+        Image face_region(w, h, frame.channels());
+        const uint8_t* src = frame.data() + y * frame.stride() + x * frame.channels();
+        uint8_t* dst = face_region.data();
+        
+        for (int row = 0; row < h; row++) {
+            std::memcpy(dst, src, w * frame.channels());
+            src += frame.stride();
+            dst += face_region.stride();
+        }
+        
+        return face_region;
+    }
+    
+    const auto& landmarks = face_rect.landmarks;
+    Point face_center(
+        (landmarks[0].x + landmarks[1].x) / 2.0f,  // Eye center X
+        (landmarks[0].y + landmarks[1].y) / 2.0f   // Eye center Y
+    );
+    
+    // Build 3D rotation matrix from Euler angles (yaw, pitch, roll)
+    // Convert degrees to radians
+    float yaw_rad = pose.yaw * M_PI / 180.0f;
+    float pitch_rad = pose.pitch * M_PI / 180.0f;
+    float roll_rad = pose.roll * M_PI / 180.0f;
+    
+    // Rotation matrices (right-handed coordinate system)
+    // Yaw (Y-axis rotation)
+    float cos_yaw = std::cos(yaw_rad);
+    // Note: sin_yaw not needed for simplified 2D affine transform
+    
+    // Pitch (X-axis rotation)
+    // Note: cos_pitch not needed for simplified 2D affine transform
+    float sin_pitch = std::sin(pitch_rad);
+    
+    // Roll (Z-axis rotation)
+    float cos_roll = std::cos(roll_rad);
+    float sin_roll = std::sin(roll_rad);
+    
+    // Combined rotation matrix (ZYX order: roll * pitch * yaw)
+    // This is a simplified 2D projection of the 3D rotation
+    // For full perspective correction, we'd need a proper 3D→2D projection
+    // Here we approximate with an affine transform
+    
+    // For yaw correction: scale X based on cosine (simulate foreshortening)
+    float yaw_scale = std::max(0.7f, cos_yaw);  // Don't over-compress
+    
+    // For pitch: shift Y position
+    float pitch_shift = sin_pitch * face_rect.height * 0.2f;
+    
+    // Build 2D affine transformation matrix
+    // [a b tx]
+    // [c d ty]
+    float a = yaw_scale * cos_roll;
+    float b = -yaw_scale * sin_roll;
+    float c = sin_roll;
+    float d = cos_roll;
+    
+    // Translation to keep face centered
+    float tx = face_center.x - (a * face_center.x + b * face_center.y);
+    float ty = face_center.y + pitch_shift - (c * face_center.x + d * face_center.y);
+    
+    // Output size (use original face rect size)
+    int out_w = face_rect.width;
+    int out_h = face_rect.height;
+    
+    // Apply transformation
+    Image corrected(out_w, out_h, frame.channels());
+    uint8_t* dst_data = corrected.data();
+    const uint8_t* src_data = frame.data();
+    int src_width = frame.width();
+    int src_height = frame.height();
+    int src_stride = frame.stride();
+    int channels = frame.channels();
+    
+    // Inverse transformation for backward mapping
+    float det = a * d - b * c;
+    if (std::abs(det) < 1e-6f) {
+        // Singular matrix, return uncorrected
+        Logger::getInstance().debug("Singular transformation matrix in head pose correction");
+        
+        int x = std::max(0, face_rect.x);
+        int y = std::max(0, face_rect.y);
+        int w = std::min(face_rect.width, frame.width() - x);
+        int h = std::min(face_rect.height, frame.height() - y);
+        
+        Image face_region(w, h, channels);
+        const uint8_t* src = frame.data() + y * frame.stride() + x * channels;
+        uint8_t* dst = face_region.data();
+        
+        for (int row = 0; row < h; row++) {
+            std::memcpy(dst, src, w * channels);
+            src += frame.stride();
+            dst += face_region.stride();
+        }
+        
+        return face_region;
+    }
+    
+    float inv_a = d / det;
+    float inv_b = -b / det;
+    float inv_c = -c / det;
+    float inv_d = a / det;
+    float inv_tx = -(inv_a * tx + inv_b * ty);
+    float inv_ty = -(inv_c * tx + inv_d * ty);
+    
+    // Apply transformation with bilinear interpolation
+    for (int y = 0; y < out_h; y++) {
+        for (int x = 0; x < out_w; x++) {
+            // Map destination pixel to source (relative to face_rect origin)
+            float rel_x = static_cast<float>(x);
+            float rel_y = static_cast<float>(y);
+            float src_x = inv_a * rel_x + inv_b * rel_y + inv_tx + face_rect.x;
+            float src_y = inv_c * rel_x + inv_d * rel_y + inv_ty + face_rect.y;
+            
+            // Bounds check
+            if (src_x < 0 || src_x >= src_width - 1 || src_y < 0 || src_y >= src_height - 1) {
+                // Out of bounds: fill with black
+                for (int c = 0; c < channels; c++) {
+                    dst_data[y * corrected.stride() + x * channels + c] = 0;
+                }
+                continue;
+            }
+            
+            // Bilinear interpolation
+            int x0 = static_cast<int>(src_x);
+            int y0 = static_cast<int>(src_y);
+            int x1 = x0 + 1;
+            int y1 = y0 + 1;
+            float fx = src_x - x0;
+            float fy = src_y - y0;
+            
+            for (int c = 0; c < channels; c++) {
+                float v00 = src_data[y0 * src_stride + x0 * channels + c];
+                float v10 = src_data[y0 * src_stride + x1 * channels + c];
+                float v01 = src_data[y1 * src_stride + x0 * channels + c];
+                float v11 = src_data[y1 * src_stride + x1 * channels + c];
+                
+                float v0 = v00 * (1.0f - fx) + v10 * fx;
+                float v1 = v01 * (1.0f - fx) + v11 * fx;
+                float v = v0 * (1.0f - fy) + v1 * fy;
+                
+                dst_data[y * corrected.stride() + x * channels + c] = static_cast<uint8_t>(v);
+            }
+        }
+    }
+    
+    Logger::getInstance().debug("Applied head pose correction: yaw=" + std::to_string(pose.yaw) + 
+                               "°, pitch=" + std::to_string(pose.pitch) + 
+                               "°, roll=" + std::to_string(pose.roll) + "°");
+    
+    return corrected;
+}
+
 
 } // namespace faceid

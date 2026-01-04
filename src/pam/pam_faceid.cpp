@@ -421,7 +421,21 @@ static bool authenticate_user(const char* username) {
                     return false;
                 }
                 
-                double threshold = config.getDouble("recognition", "threshold").value_or(0.6);
+                // Quick Win #3: Per-User Thresholds
+                // Try to get user-specific threshold first, fallback to global
+                std::string per_user_key = std::string("recognition.") + username + ".threshold";
+                double threshold = config.getDouble(per_user_key, "").value_or(
+                    config.getDouble("recognition", "threshold").value_or(0.6)
+                );
+                
+                // Log which threshold is being used
+                if (config.getDouble(per_user_key, "").has_value()) {
+                    logger.debug(std::string("Using per-user threshold for ") + username + ": " + 
+                               std::to_string(threshold));
+                    syslog(LOG_DEBUG, "pam_faceid: Using per-user threshold for %s: %.3f", username, threshold);
+                } else {
+                    logger.debug(std::string("Using global threshold: ") + std::to_string(threshold));
+                }
                 
                 // Get detection confidence threshold from config
                 float detection_confidence = config.getDouble("face_detection", "confidence").value_or(0.31);
@@ -510,11 +524,26 @@ static bool authenticate_user(const char* username) {
                         
                         // Compare against all enrolled users
                         for (const auto& user_model : all_users) {
-                            for (const auto& stored_encoding : user_model.encodings) {
-                                double distance = detector.compareFaces(detected_encoding, stored_encoding);
-                                if (distance < best_distance) {
-                                    best_distance = distance;
-                                    best_match_user = user_model.username;
+                            // Support both V1 (legacy) and V2 (multi-sample) formats
+                            if (user_model.isMultiSampleFormat()) {
+                                // V2 format: compare against all encodings in sample_encodings
+                                for (const auto& pose_encodings : user_model.sample_encodings) {
+                                    for (const auto& stored_encoding : pose_encodings) {
+                                        double distance = detector.compareFaces(detected_encoding, stored_encoding);
+                                        if (distance < best_distance) {
+                                            best_distance = distance;
+                                            best_match_user = user_model.username;
+                                        }
+                                    }
+                                }
+                            } else {
+                                // V1 format (legacy): compare against encodings vector
+                                for (const auto& stored_encoding : user_model.encodings) {
+                                    double distance = detector.compareFaces(detected_encoding, stored_encoding);
+                                    if (distance < best_distance) {
+                                        best_distance = distance;
+                                        best_match_user = user_model.username;
+                                    }
                                 }
                             }
                         }

@@ -353,24 +353,72 @@ int cmd_add(const std::string& username, const std::string& face_id) {
      std::cout << "Successfully captured " << num_samples << " samples with " 
                << (num_samples * 5) << " total frames!" << std::endl;
      
-     // Flatten all encodings for storage (all 5 frames from each of 5 samples = 25 encodings)
+     // Organize encodings in V2 format: [pose][encoding_variant]
+     // Each of the 5 samples represents a different pose/head position
+     // Each sample has 5 encoding variants (the 5 consecutive frames captured)
+     std::vector<std::vector<FaceEncoding>> sample_encodings;
+     std::vector<std::vector<float>> quality_scores;
+     
+     sample_encodings.reserve(num_samples);
+     quality_scores.reserve(num_samples);
+     
      for (const auto& sample : all_samples) {
-         for (const auto& encoding : sample.all_encodings) {
-             encodings.push_back(encoding);
+         std::vector<FaceEncoding> pose_encodings;
+         std::vector<float> pose_qualities;
+         
+         pose_encodings.reserve(sample.all_encodings.size());
+         pose_qualities.reserve(sample.all_encodings.size());
+         
+         // Calculate quality score for each encoding variant
+         for (size_t i = 0; i < sample.all_encodings.size(); ++i) {
+             const auto& encoding = sample.all_encodings[i];
+             
+             // Calculate encoding norm
+             float norm = 0.0f;
+             for (float val : encoding) {
+                 norm += val * val;
+             }
+             norm = std::sqrt(norm);
+             
+             // Use sharpness if available, otherwise default to 1.0
+             float sharpness = 100.0f;  // Default good sharpness
+             
+             // Calculate quality score (60% norm + 40% sharpness)
+             float quality = calculateFrameQualityScore(norm, sharpness);
+             
+             pose_encodings.push_back(encoding);
+             pose_qualities.push_back(quality);
          }
+         
+         sample_encodings.push_back(pose_encodings);
+         quality_scores.push_back(pose_qualities);
      }
      
-     std::cout << "Total encodings stored: " << encodings.size() << std::endl;
+     size_t total_encodings = 0;
+     for (const auto& pose : sample_encodings) {
+         total_encodings += pose.size();
+     }
+     
+     std::cout << "Organized into V2 format: " << sample_encodings.size() << " poses, " 
+               << total_encodings << " total encodings" << std::endl;
      std::cout << std::endl;
      
      // Step 2: Calculate optimal recognition threshold
      std::cout << "=== Calculating Optimal Recognition Threshold ===" << std::endl;
      std::cout << "Comparing samples to find best threshold..." << std::endl;
      
+     // Flatten encodings for distance calculation
+     std::vector<FaceEncoding> all_encodings_flat;
+     for (const auto& pose : sample_encodings) {
+         for (const auto& encoding : pose) {
+             all_encodings_flat.push_back(encoding);
+         }
+     }
+     
      std::vector<float> all_distances;
-     for (size_t i = 0; i < encodings.size(); i++) {
-         for (size_t j = i + 1; j < encodings.size(); j++) {
-             float dist = cosineDistance(encodings[i], encodings[j]);
+     for (size_t i = 0; i < all_encodings_flat.size(); i++) {
+         for (size_t j = i + 1; j < all_encodings_flat.size(); j++) {
+             float dist = cosineDistance(all_encodings_flat[i], all_encodings_flat[j]);
              all_distances.push_back(dist);
          }
      }
@@ -395,7 +443,7 @@ int cmd_add(const std::string& username, const std::string& face_id) {
      
      std::cout << "✓ Optimal recognition threshold calculated: " << std::fixed << std::setprecision(2) 
                << optimal_threshold << std::endl;
-     std::cout << "  Based on variation across " << encodings.size() << " frames" << std::endl;
+     std::cout << "  Based on variation across " << all_encodings_flat.size() << " frames" << std::endl;
      std::cout << "  Max intra-person distance: " << std::fixed << std::setprecision(4) 
                << max_intra_distance << std::endl;
      
@@ -408,12 +456,14 @@ int cmd_add(const std::string& username, const std::string& face_id) {
          std::cout << "  Recognition may be less reliable - consider re-enrolling" << std::endl;
      }
     
-    // Create model for this face (save to FACES_DIR)
+    // Create model for this face (save to FACES_DIR) in V2 format
     std::string model_path = std::string(FACES_DIR) + "/" + username + "." + face_id + ".bin";
     BinaryFaceModel model_data;
+    model_data.version = 2;  // V2 format with multi-sample encodings
     model_data.username = username;
     model_data.face_ids.push_back(face_id);
-    model_data.encodings = encodings;
+    model_data.sample_encodings = sample_encodings;
+    model_data.quality_scores = quality_scores;
     model_data.timestamp = static_cast<uint32_t>(std::time(nullptr));
     model_data.valid = true;
     
@@ -427,7 +477,9 @@ int cmd_add(const std::string& username, const std::string& face_id) {
     std::cout << "✓ Face model saved successfully!" << std::endl;
     std::cout << "  File: " << model_path << std::endl;
     std::cout << "  Face ID: " << face_id << std::endl;
-    std::cout << "  Samples: " << encodings.size() << std::endl;
+    std::cout << "  Format: V2 (multi-sample)" << std::endl;
+    std::cout << "  Poses: " << sample_encodings.size() << std::endl;
+    std::cout << "  Total encodings: " << total_encodings << std::endl;
     
     // Show total faces for this user
     int total_faces = 1;  // Since we create one file per face
@@ -435,9 +487,17 @@ int cmd_add(const std::string& username, const std::string& face_id) {
     std::cout << std::endl;
     
     // Step 3: Update config file with optimal values
+    // Save global optimal confidence (applies to all users)
     if (!updateConfigFile(config_path, optimal_confidence, optimal_threshold)) {
-        std::cerr << "Warning: Could not update config file" << std::endl;
-        std::cerr << "You may need to manually set these values in " << config_path << std::endl;
+        std::cerr << "Warning: Could not update global config values" << std::endl;
+    }
+    
+    // Save per-user threshold (Quick Win #3: Per-User Thresholds)
+    if (!faceid::savePerUserThreshold(config_path, username, optimal_threshold)) {
+        std::cerr << "Warning: Could not save per-user threshold" << std::endl;
+        std::cerr << "You may need to manually add this to " << config_path << ":" << std::endl;
+        std::cerr << "  " << username << ".threshold = " << std::fixed << std::setprecision(2) 
+                  << optimal_threshold << std::endl;
     }
     
     std::cout << std::endl;

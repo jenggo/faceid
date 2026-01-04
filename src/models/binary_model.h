@@ -11,11 +11,36 @@ namespace faceid {
 
 // Binary face model structure
 struct BinaryFaceModel {
+    uint32_t version = 2;  // Version 2: multi-encoding support, Version 1: legacy single-encoding
     std::string username;
     std::vector<std::string> face_ids;  // Face ID labels (typically one per model)
-    std::vector<FaceEncoding> encodings;  // Face encodings (dimension set by FACE_ENCODING_DIM)
+    
+    // Version 2 (NEW): Multi-sample encoding support - [pose][encoding_variant]
+    std::vector<std::vector<FaceEncoding>> sample_encodings;  // Multiple encodings per pose
+    std::vector<std::vector<float>> quality_scores;           // Quality score for each encoding
+    
+    // Version 1 (LEGACY): Single encoding per pose - kept for backwards compatibility
+    std::vector<FaceEncoding> encodings;  // Deprecated: used only for v1 files
+    
     uint32_t timestamp;
     bool valid;
+    
+    // Helper: Get total number of encodings across all samples
+    size_t getTotalEncodingCount() const {
+        if (version == 2 && !sample_encodings.empty()) {
+            size_t total = 0;
+            for (const auto& sample : sample_encodings) {
+                total += sample.size();
+            }
+            return total;
+        }
+        return encodings.size();  // Legacy format
+    }
+    
+    // Helper: Check if using new multi-sample format
+    bool isMultiSampleFormat() const {
+        return version == 2 && !sample_encodings.empty();
+    }
 };
 
 // Binary model loader class

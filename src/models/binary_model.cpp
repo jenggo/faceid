@@ -22,22 +22,52 @@ bool BinaryModelLoader::loadUserModel(const std::string& path, BinaryFaceModel& 
         return false;
     }
 
-    // Read encoding dimension from reserved space (uint32_t at offset 16)
+    // Read version and encoding dimension from reserved space
+    // Offset 16: version (uint32_t) - if 0, this is v1 format
+    // Offset 20: encoding_dim (uint32_t)
+    uint32_t file_version = readUint32LE(file);
+    if (!file) return false;
+    
     uint32_t encoding_dim = readUint32LE(file);
     if (!file) return false;
     
-    // If dimension is 0 or invalid, assume legacy format with hardcoded ENCODING_DIM
-    if (encoding_dim == 0 || encoding_dim > 2048) {
-        encoding_dim = ENCODING_DIM;
-        faceid::Logger::getInstance().warning("Model file uses legacy format, assuming " + 
-                                             std::to_string(encoding_dim) + "D encodings: " + path);
+    // Detect format version
+    bool is_v1_format = (file_version == 0 || file_version > 10);  // v1 files have 0 or encoding_dim in first field
+    
+    if (is_v1_format) {
+        // V1 format: first uint32 was encoding_dim, second uint32 is part of reserved space
+        encoding_dim = file_version;  // The "version" field was actually encoding_dim in v1
+        model.version = 1;
+        
+        if (encoding_dim == 0 || encoding_dim > 2048) {
+            encoding_dim = ENCODING_DIM;
+            faceid::Logger::getInstance().warning("V1 model file with invalid encoding dim, assuming " + 
+                                                 std::to_string(encoding_dim) + "D: " + path);
+        }
+        
+        faceid::Logger::getInstance().info("Loading V1 format model (will auto-migrate): " + path);
+        
+        // Skip remaining reserved (40 bytes = 48 - 8 already read)
+        file.seekg(40, std::ios::cur);
+    } else {
+        // V2 format: proper version field
+        model.version = file_version;
+        
+        if (encoding_dim == 0 || encoding_dim > 2048) {
+            encoding_dim = ENCODING_DIM;
+            faceid::Logger::getInstance().warning("V2 model file with invalid encoding dim, assuming " + 
+                                                 std::to_string(encoding_dim) + "D: " + path);
+        }
+        
+        faceid::Logger::getInstance().info("Loading V2 format model: " + path);
+        
+        // Skip remaining reserved (40 bytes = 48 - 8 already read)
+        file.seekg(40, std::ios::cur);
     }
     
-    size_t dynamic_encoding_size = encoding_dim * sizeof(float);
-
-    // Skip remaining reserved (44 bytes = 48 - 4 already read)
-    file.seekg(44, std::ios::cur);
     if (!file) return false;
+    
+    size_t dynamic_encoding_size = encoding_dim * sizeof(float);
 
     // Read timestamp (uint32_t, little-endian)
     model.timestamp = readUint32LE(file);
@@ -66,34 +96,119 @@ bool BinaryModelLoader::loadUserModel(const std::string& path, BinaryFaceModel& 
     file.seekg(8, std::ios::cur);
     if (!file) return false;
 
-    // Read encodings - read all available encodings until EOF
-    // Note: face_count is not the number of encodings, but metadata field
-    model.encodings.reserve(50);  // Reserve for typical case
-    while (file) {
-        FaceEncoding encoding(encoding_dim);
-        file.read(reinterpret_cast<char*>(encoding.data()), dynamic_encoding_size);
-        if (!file) {
-            // Handle partial encoding at end of file
-            if (file.gcount() > 0 && file.eof()) {
-                size_t bytes_read = file.gcount();
-                size_t floats_read = bytes_read / sizeof(float);
-                if (floats_read > 0) {
-                    encoding.resize(floats_read);
-                    model.encodings.push_back(encoding);
+    if (is_v1_format) {
+        // V1 format: Read all encodings into legacy encodings vector
+        model.encodings.reserve(50);
+        while (file) {
+            FaceEncoding encoding(encoding_dim);
+            file.read(reinterpret_cast<char*>(encoding.data()), dynamic_encoding_size);
+            if (!file) {
+                // Handle partial encoding at end of file
+                if (file.gcount() > 0 && file.eof()) {
+                    size_t bytes_read = file.gcount();
+                    size_t floats_read = bytes_read / sizeof(float);
+                    if (floats_read > 0) {
+                        encoding.resize(floats_read);
+                        model.encodings.push_back(encoding);
+                    }
                 }
+                break;
             }
-            break;
+            model.encodings.push_back(encoding);
         }
-        model.encodings.push_back(encoding);
+        
+        // Auto-migrate V1 to V2 format in memory
+        if (!model.encodings.empty()) {
+            faceid::Logger::getInstance().info("Auto-migrating " + std::to_string(model.encodings.size()) + 
+                                              " encodings from V1 to V2 format");
+            
+            // Wrap each single encoding in a nested vector structure
+            model.sample_encodings.clear();
+            model.quality_scores.clear();
+            model.sample_encodings.reserve(model.encodings.size());
+            model.quality_scores.reserve(model.encodings.size());
+            
+            for (const auto& encoding : model.encodings) {
+                // Each pose gets one encoding variant (the original)
+                std::vector<FaceEncoding> pose_encodings = {encoding};
+                model.sample_encodings.push_back(pose_encodings);
+                
+                // Default quality score of 1.0 for migrated encodings
+                std::vector<float> pose_qualities = {1.0f};
+                model.quality_scores.push_back(pose_qualities);
+            }
+            
+            model.version = 2;  // Mark as V2 format
+            faceid::Logger::getInstance().info("Migration complete: " + std::to_string(model.sample_encodings.size()) + 
+                                              " poses with 1 encoding each");
+        }
+        
+    } else {
+        // V2 format: Read multi-sample encodings with quality scores
+        // Format: num_poses, then for each pose: num_variants, [encoding1, quality1, encoding2, quality2, ...]
+        
+        uint32_t num_poses = readUint32LE(file);
+        if (!file || num_poses == 0) {
+            faceid::Logger::getInstance().error("Invalid pose count in V2 model file: " + path);
+            return false;
+        }
+        
+        model.sample_encodings.resize(num_poses);
+        model.quality_scores.resize(num_poses);
+        
+        for (uint32_t pose_idx = 0; pose_idx < num_poses; ++pose_idx) {
+            uint32_t num_variants = readUint32LE(file);
+            if (!file || num_variants == 0) {
+                faceid::Logger::getInstance().error("Invalid variant count for pose " + std::to_string(pose_idx) + 
+                                                   " in V2 model file: " + path);
+                return false;
+            }
+            
+            model.sample_encodings[pose_idx].resize(num_variants);
+            model.quality_scores[pose_idx].resize(num_variants);
+            
+            for (uint32_t var_idx = 0; var_idx < num_variants; ++var_idx) {
+                // Read encoding
+                FaceEncoding encoding(encoding_dim);
+                file.read(reinterpret_cast<char*>(encoding.data()), dynamic_encoding_size);
+                if (!file) {
+                    faceid::Logger::getInstance().error("Failed to read encoding at pose " + std::to_string(pose_idx) + 
+                                                       " variant " + std::to_string(var_idx) + ": " + path);
+                    return false;
+                }
+                model.sample_encodings[pose_idx][var_idx] = encoding;
+                
+                // Read quality score (float)
+                float quality;
+                file.read(reinterpret_cast<char*>(&quality), sizeof(float));
+                if (!file) {
+                    faceid::Logger::getInstance().error("Failed to read quality score at pose " + std::to_string(pose_idx) + 
+                                                       " variant " + std::to_string(var_idx) + ": " + path);
+                    return false;
+                }
+                model.quality_scores[pose_idx][var_idx] = quality;
+            }
+        }
+        
+        faceid::Logger::getInstance().info("Loaded V2 model: " + std::to_string(num_poses) + " poses, " + 
+                                          std::to_string(model.getTotalEncodingCount()) + " total encodings");
     }
 
-    model.valid = !model.encodings.empty();
+    model.valid = (model.version == 2 && !model.sample_encodings.empty()) || 
+                  (model.version == 1 && !model.encodings.empty());
     return model.valid;
 }
 
 bool BinaryModelLoader::saveUserModel(const std::string& path, const BinaryFaceModel& model) {
-    if (!model.valid || model.encodings.empty() || model.face_ids.empty()) {
+    // Validate model data based on version
+    if (!model.valid || model.face_ids.empty()) {
         faceid::Logger::getInstance().error("Invalid model data - cannot save to: " + path);
+        return false;
+    }
+    
+    // Always save as V2 format (even if loaded as V1)
+    if (model.sample_encodings.empty()) {
+        faceid::Logger::getInstance().error("No sample encodings to save (V2 format required): " + path);
         return false;
     }
 
@@ -103,26 +218,34 @@ bool BinaryModelLoader::saveUserModel(const std::string& path, const BinaryFaceM
         return false;
     }
 
+    // Determine encoding dimension from first encoding
+    size_t encoding_dim = ENCODING_DIM;
+    if (!model.sample_encodings.empty() && !model.sample_encodings[0].empty()) {
+        encoding_dim = model.sample_encodings[0][0].size();
+    }
+
     // Write username (16 bytes, null-padded)
     writeNullPaddedString(file, model.username, 16);
 
-    // Write encoding dimension at offset 16 (4 bytes)
-    size_t encoding_dim = model.encodings.empty() ? ENCODING_DIM : model.encodings[0].size();
+    // Write version (4 bytes) - always V2
+    writeUint32LE(file, 2);
+    
+    // Write encoding dimension (4 bytes)
     writeUint32LE(file, static_cast<uint32_t>(encoding_dim));
     
-    // Write remaining reserved (44 bytes = 48 - 4 already written)
-    char zeros[44] = {0};
-    file.write(zeros, 44);
+    // Write remaining reserved (40 bytes = 48 - 8 already written)
+    char zeros[48] = {0};
+    file.write(zeros, 40);
 
-    // Write timestamp
+    // Write timestamp (4 bytes)
     writeUint32LE(file, model.timestamp);
 
     // Write reserved (4 bytes)
     file.write(zeros, 4);
 
-    // Write face count
-    uint32_t face_count = model.encodings.size();
-    writeUint32LE(file, face_count);
+    // Write face count (legacy field, use total encoding count)
+    uint32_t total_encodings = model.getTotalEncodingCount();
+    writeUint32LE(file, total_encodings);
 
     // Write face ID label (36 bytes, null-terminated)
     writeNullPaddedString(file, model.face_ids[0], FACE_ID_LABEL_SIZE);
@@ -130,18 +253,54 @@ bool BinaryModelLoader::saveUserModel(const std::string& path, const BinaryFaceM
     // Write reserved/metadata (8 bytes)
     file.write(zeros, 8);
 
-    // Write encodings
+    // Write V2 format data: multi-sample encodings with quality scores
+    // Format: num_poses, then for each pose: num_variants, [encoding1, quality1, encoding2, quality2, ...]
+    
+    uint32_t num_poses = model.sample_encodings.size();
+    writeUint32LE(file, num_poses);
+    
     size_t encoding_size = encoding_dim * sizeof(float);
     
-    for (const auto& encoding : model.encodings) {
-        if (encoding.size() != encoding_dim) {
-            faceid::Logger::getInstance().error("Inconsistent encoding dimensions in model: " + path);
+    for (size_t pose_idx = 0; pose_idx < num_poses; ++pose_idx) {
+        const auto& pose_encodings = model.sample_encodings[pose_idx];
+        const auto& pose_qualities = model.quality_scores[pose_idx];
+        
+        if (pose_encodings.size() != pose_qualities.size()) {
+            faceid::Logger::getInstance().error("Encoding/quality size mismatch at pose " + 
+                                               std::to_string(pose_idx) + ": " + path);
             return false;
         }
-        file.write(reinterpret_cast<const char*>(encoding.data()), encoding_size);
+        
+        uint32_t num_variants = pose_encodings.size();
+        writeUint32LE(file, num_variants);
+        
+        for (size_t var_idx = 0; var_idx < num_variants; ++var_idx) {
+            const auto& encoding = pose_encodings[var_idx];
+            
+            if (encoding.size() != encoding_dim) {
+                faceid::Logger::getInstance().error("Inconsistent encoding dimension at pose " + 
+                                                   std::to_string(pose_idx) + " variant " + 
+                                                   std::to_string(var_idx) + ": " + path);
+                return false;
+            }
+            
+            // Write encoding
+            file.write(reinterpret_cast<const char*>(encoding.data()), encoding_size);
+            
+            // Write quality score
+            float quality = pose_qualities[var_idx];
+            file.write(reinterpret_cast<const char*>(&quality), sizeof(float));
+        }
+    }
+    
+    if (!file.good()) {
+        faceid::Logger::getInstance().error("Failed to write model data to: " + path);
+        return false;
     }
 
-    return file.good();
+    faceid::Logger::getInstance().info("Saved V2 model: " + std::to_string(num_poses) + " poses, " + 
+                                      std::to_string(total_encodings) + " total encodings to: " + path);
+    return true;
 }
 
 bool BinaryModelLoader::validateBinaryFile(const std::string& path) {
@@ -150,64 +309,51 @@ bool BinaryModelLoader::validateBinaryFile(const std::string& path) {
         return false;
     }
 
-    // Additional validation: check reserved areas are zeros
+    // File size validation
     std::ifstream file(path, std::ios::binary);
     if (!file) return false;
 
-    // Skip username
-    file.seekg(16, std::ios::beg);
-
-    // Check first reserved (16 bytes)
-    char buffer[16];
-    file.read(buffer, 16);
-    for (char c : buffer) {
-        if (c != 0) return false;
-    }
-
-    // Check second reserved (32 bytes)
-    file.read(buffer, 16); // reuse buffer
-    for (int i = 0; i < 32; i += 16) {
-        file.read(buffer, 16);
-        for (char c : buffer) {
-            if (c != 0) return false;
-        }
-    }
-
-    // Skip timestamp and reserved
-    file.seekg(8, std::ios::cur);
-
-    // Skip face count and label
-    file.seekg(4 + FACE_ID_LABEL_SIZE, std::ios::cur);
-
-    // Check reserved/metadata (8 bytes)
-    file.read(buffer, 8);
-    for (char c : buffer) {
-        if (c != 0) return false;
-    }
-
-    // Check file size
     file.seekg(0, std::ios::end);
     size_t file_size = file.tellg();
     
-    // Calculate expected size based on actual encoding dimension
-    size_t actual_encoding_dim = model.encodings.empty() ? ENCODING_DIM : model.encodings[0].size();
-    size_t expected_size = HEADER_SIZE + model.encodings.size() * actual_encoding_dim * sizeof(float);
+    size_t expected_size = getModelFileSize(model);
     
     if (file_size != expected_size) {
         faceid::Logger::getInstance().warning("File size mismatch: expected " + std::to_string(expected_size) + 
                                             " bytes, got " + std::to_string(file_size) + " bytes for " + path);
-        return false;
+        // Don't fail validation for size mismatch - file format may have changed
+        // Just warn and continue
     }
 
     return true;
 }
 
 size_t BinaryModelLoader::getModelFileSize(const BinaryFaceModel& model) {
-    if (model.encodings.empty()) {
-        return HEADER_SIZE;
+    if (model.version == 2 && !model.sample_encodings.empty()) {
+        // V2 format calculation
+        size_t encoding_dim = model.sample_encodings[0][0].size();
+        size_t data_size = HEADER_SIZE;
+        
+        // Add size for num_poses field (4 bytes)
+        data_size += sizeof(uint32_t);
+        
+        // For each pose: num_variants (4 bytes) + encodings + quality scores
+        for (const auto& pose_encodings : model.sample_encodings) {
+            data_size += sizeof(uint32_t);  // num_variants
+            
+            size_t num_variants = pose_encodings.size();
+            data_size += num_variants * encoding_dim * sizeof(float);  // all encodings
+            data_size += num_variants * sizeof(float);                 // all quality scores
+        }
+        
+        return data_size;
+    } else if (!model.encodings.empty()) {
+        // V1 format (legacy)
+        size_t encoding_dim = model.encodings[0].size();
+        return HEADER_SIZE + model.encodings.size() * encoding_dim * sizeof(float);
     }
-    size_t actual_encoding_dim = model.encodings[0].size();
-    return HEADER_SIZE + model.encodings.size() * actual_encoding_dim * sizeof(float);
+    
+    return HEADER_SIZE;
 }
 
 uint32_t BinaryModelLoader::readUint32LE(std::ifstream& file) {

@@ -838,6 +838,127 @@ static inline bool updateConfigFile(const std::string& config_path, float confid
     return true;
 }
 
+/**
+ * Save per-user recognition threshold to config file
+ * Implements Quick Win #3: Per-User Thresholds
+ * @param config_path Path to config file
+ * @param username Username to set threshold for
+ * @param threshold Optimal threshold value for this user
+ * @return true if saved successfully
+ */
+static inline bool savePerUserThreshold(const std::string& config_path, const std::string& username, float threshold) {
+    std::cout << std::endl;
+    std::cout << "=== Saving Per-User Threshold ===" << std::endl;
+    
+    // Read the entire config file
+    std::ifstream infile(config_path);
+    if (!infile.is_open()) {
+        std::cerr << "Failed to open config file: " << config_path << std::endl;
+        return false;
+    }
+    
+    std::vector<std::string> lines;
+    std::string line;
+    bool in_recognition_section = false;
+    bool threshold_updated = false;
+    
+    while (std::getline(infile, line)) {
+        // Check if we're in the [recognition] section
+        if (line.find("[recognition]") != std::string::npos) {
+            in_recognition_section = true;
+            lines.push_back(line);
+            continue;
+        }
+        
+        // Check if we're leaving the recognition section
+        if (in_recognition_section && !line.empty() && line[0] == '[') {
+            in_recognition_section = false;
+        }
+        
+        // Update or skip existing per-user threshold for this username
+        if (in_recognition_section && line.find(username + ".threshold") != std::string::npos) {
+            std::ostringstream oss;
+            oss << username << ".threshold = " << std::fixed << std::setprecision(2) << threshold;
+            lines.push_back(oss.str());
+            threshold_updated = true;
+            continue;
+        }
+        
+        lines.push_back(line);
+    }
+    infile.close();
+    
+    // If threshold wasn't found, add it to the [recognition] section
+    if (!threshold_updated) {
+        for (size_t i = 0; i < lines.size(); i++) {
+            if (lines[i].find("[recognition]") != std::string::npos) {
+                // Find the end of the recognition section or a good place to insert
+                size_t insert_pos = i + 1;
+                
+                // Skip past global threshold/timeout settings to add per-user at end
+                while (insert_pos < lines.size() && 
+                       (lines[insert_pos].empty() || 
+                        lines[insert_pos][0] != '[' ||
+                        lines[insert_pos].find("threshold") != std::string::npos ||
+                        lines[insert_pos].find("timeout") != std::string::npos ||
+                        lines[insert_pos].find("num_threads") != std::string::npos ||
+                        lines[insert_pos].find("#") != std::string::npos)) {
+                    insert_pos++;
+                }
+                
+                // Add a comment if this is the first per-user threshold
+                bool has_per_user = false;
+                for (const auto& l : lines) {
+                    if (l.find(".threshold") != std::string::npos) {
+                        has_per_user = true;
+                        break;
+                    }
+                }
+                
+                if (!has_per_user) {
+                    lines.insert(lines.begin() + insert_pos, "");
+                    lines.insert(lines.begin() + insert_pos + 1, "# Per-user thresholds (optimal values from enrollment)");
+                    insert_pos += 2;
+                }
+                
+                std::ostringstream oss;
+                oss << username << ".threshold = " << std::fixed << std::setprecision(2) << threshold;
+                lines.insert(lines.begin() + insert_pos, oss.str());
+                threshold_updated = true;
+                break;
+            }
+        }
+    }
+    
+    // Try to write back to file
+    std::ofstream outfile(config_path);
+    if (!outfile.is_open()) {
+        std::cout << "⚠ Cannot write to config file (no permission)" << std::endl;
+        std::cout << std::endl;
+        std::cout << "=== Recommended Configuration ===" << std::endl;
+        std::cout << "Please add to your config file manually:" << std::endl;
+        std::cout << std::endl;
+        std::cout << "File: " << config_path << std::endl;
+        std::cout << std::endl;
+        std::cout << "[recognition]" << std::endl;
+        std::cout << username << ".threshold = " << std::fixed << std::setprecision(2) << threshold << std::endl;
+        std::cout << std::endl;
+        return false;
+    }
+    
+    for (const auto& l : lines) {
+        outfile << l << std::endl;
+    }
+    outfile.close();
+    
+    std::cout << "✓ Per-user threshold saved successfully!" << std::endl;
+    std::cout << "  User: " << username << std::endl;
+    std::cout << "  Threshold: " << std::fixed << std::setprecision(2) << threshold << std::endl;
+    std::cout << "  File: " << config_path << std::endl;
+    
+    return true;
+}
+
 // ========== Shared Camera View Helpers ==========
 
 /**

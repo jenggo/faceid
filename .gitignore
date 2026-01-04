@@ -1,8 +1,10 @@
 .ignore
 .cache/
 docs/
-tests/
+test*/
 models/
+.beads/
+.gitattributes
 *.*backup
 *.md
 !README.md

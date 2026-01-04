@@ -202,7 +202,6 @@ bool Config::validate() {
     // Authentication validation
     all_valid &= validateInt("authentication", "lock_screen_delay_ms", 0, 10000);
     all_valid &= validateInt("authentication", "fingerprint_delay_ms", 0, 5000);
-    all_valid &= validateInt("authentication", "frame_count", 1, 20);
     
     // Presence detection validation
     all_valid &= validateInt("presence_detection", "inactive_threshold_seconds", 1, 3600);

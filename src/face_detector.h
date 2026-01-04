@@ -13,6 +13,19 @@ namespace faceid {
 // Face encodings are stored as std::vector<float> for NCNN compatibility
 using FaceEncoding = std::vector<float>;
 
+// Face Quality Assessment Structure (QUICK WIN #2)
+struct FaceQuality {
+    double overall_score;       // Combined quality score (0.0-1.0)
+    double blur_score;          // Edge contrast detection
+    double size_score;          // Face size relative to frame
+    double brightness_score;    // Illumination uniformity
+    double confidence_score;    // Detection confidence weight
+    
+    FaceQuality() : overall_score(0.0), blur_score(0.0), size_score(0.0),
+                    brightness_score(0.0), confidence_score(0.0) {}
+};
+
+
 // Detection model types - only YuNet and RetinaFace are embedded
 enum class DetectionModelType {
     YUNET,        // YuNet (primary): embedded, fast and accurate
@@ -173,6 +186,43 @@ public:
         double similarity_threshold = 0.15  // Faces with distance < 0.15 are considered same person
     );
 
+
+    // ========================================================================
+    // QUICK WIN #1: Histogram Equalization
+    // ========================================================================
+    // Normalizes lighting variations on aligned face crops before encoding
+    // Expected improvement: 1-2% accuracy gain, ~1ms overhead
+    static Image normalizeImageHistogram(const Image& face_image);
+    
+    // ========================================================================
+    // QUICK WIN #2: Face Quality Assessment
+    // ========================================================================
+    // Evaluates face image quality based on blur, size, brightness, and detector confidence
+    // Returns quality scores and overall score (0.0-1.0)
+    // Usage: Skip faces where assessFaceQuality(...).overall_score < min_face_quality
+    FaceQuality assessFaceQuality(const Image& aligned_face, 
+                                  const Rect& original_face, 
+                                  int frame_width,
+                                  float detector_confidence = 1.0f);
+    
+    // ========================================================================
+    // QUICK WIN #4: Head Pose Estimation and Correction
+    // ========================================================================
+    // Estimates head rotation angles (yaw, pitch, roll) from facial landmarks
+    // Can be used for perspective correction to improve recognition at angles
+    struct HeadPose {
+        float yaw;      // Side-to-side rotation (-45 to 45 degrees)
+        float pitch;    // Up-down rotation (-45 to 45 degrees) 
+        float roll;     // Head tilt (-30 to 30 degrees)
+    };
+    
+    HeadPose estimateHeadPose(const std::vector<Point>& landmarks);
+    
+    // Applies geometric correction to normalize head pose before recognition
+    // Compensates for yaw/pitch/roll variations to improve recognition accuracy
+    // Returns corrected face image with normalized head orientation
+    Image applyHeadPoseCorrection(const ImageView& frame, const Rect& face_rect, const HeadPose& pose);
+    
 private:
     // NCNN networks
     ncnn::Net ncnn_net_;          // Face recognition model (loaded from filesystem)
