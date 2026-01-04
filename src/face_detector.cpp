@@ -200,8 +200,11 @@ FaceDetector::FaceDetector() {
 bool FaceDetector::loadEmbeddedYuNet() {
     Logger::getInstance().debug("Loading embedded YuNet detection model...");
     
+    // Get num_threads from config (default: 4)
+    int num_threads = Config::getInstance().getInt("recognition", "num_threads").value_or(4);
+    
     yunet_net_.opt.use_vulkan_compute = false;
-    yunet_net_.opt.num_threads = 4;
+    yunet_net_.opt.num_threads = num_threads;
     yunet_net_.opt.use_fp16_packed = false;
     yunet_net_.opt.use_fp16_storage = false;
     
@@ -230,8 +233,11 @@ bool FaceDetector::loadEmbeddedYuNet() {
 bool FaceDetector::loadEmbeddedRetinaFace() {
     Logger::getInstance().debug("Loading embedded RetinaFace detection model...");
     
+    // Get num_threads from config (default: 4)
+    int num_threads = Config::getInstance().getInt("recognition", "num_threads").value_or(4);
+    
     retinaface_net_.opt.use_vulkan_compute = false;
-    retinaface_net_.opt.num_threads = 4;
+    retinaface_net_.opt.num_threads = num_threads;
     retinaface_net_.opt.use_fp16_packed = false;
     retinaface_net_.opt.use_fp16_storage = false;
     
@@ -369,9 +375,13 @@ bool FaceDetector::loadModels(const std::string& model_base_path) {
             Logger::getInstance().debug("Model cache HIT: This model was loaded before (faster due to FS cache)");
         }
         
+        // Get num_threads from config (default: 4)
+        int num_threads = Config::getInstance().getInt("recognition", "num_threads").value_or(4);
+        Logger::getInstance().debug("NCNN num_threads: " + std::to_string(num_threads));
+        
         // Configure NCNN options for optimal CPU performance
         ncnn_net_.opt.use_vulkan_compute = false;
-        ncnn_net_.opt.num_threads = 4;
+        ncnn_net_.opt.num_threads = num_threads;
         ncnn_net_.opt.use_fp16_packed = false;
         ncnn_net_.opt.use_fp16_storage = false;
         
@@ -922,11 +932,44 @@ Image FaceDetector::preprocessFrame(const ImageView& frame) {
         processed = frame.clone();
     }
     
-    // Enhance contrast for better detection using CLAHE on YUV color space
-    // YUV is much faster than Lab and gives similar results for luminance-based CLAHE
+    // Calculate average brightness for adaptive preprocessing
     int width = processed.width();
     int height = processed.height();
     
+    // Quick brightness estimation from first channel (B in BGR)
+    uint64_t sum = 0;
+    const uint8_t* data = processed.data();
+    int channels = processed.channels();
+    int total_pixels = width * height;
+    
+    if (channels >= 3) {
+        // Sample every 4th pixel for speed (statistically sufficient)
+        for (int i = 0; i < total_pixels; i += 4) {
+            sum += data[i * channels];  // B channel
+        }
+        sum *= 4;  // Compensate for sampling
+    } else {
+        for (int i = 0; i < total_pixels; i++) {
+            sum += data[i];
+        }
+    }
+    float avg_brightness = static_cast<float>(sum) / (total_pixels * 255.0f);
+    
+    // OPTIMIZATION: Skip CLAHE entirely in good lighting conditions
+    // CLAHE is for contrast enhancement in low-light/IR cameras
+    // In normal/bright lighting, it's unnecessary CPU work
+    if (avg_brightness >= 0.5f) {
+        // Optional debug logging
+        if (Config::getInstance().getBool("debug", "log_brightness").value_or(false)) {
+            char buf[128];
+            snprintf(buf, sizeof(buf), "Frame brightness: %.2f - SKIPPING CLAHE (good lighting)", 
+                     avg_brightness);
+            Logger::getInstance().debug(buf);
+        }
+        return processed;  // Return original without CLAHE
+    }
+    
+    // Below 0.5 brightness: apply CLAHE for contrast enhancement
     // First convert BGR to ARGB (libyuv intermediate format)
     Image argb_temp(width, height, 4);
     libyuv::RGB24ToARGB(processed.data(), processed.stride(), argb_temp.data(), argb_temp.stride(), width, height);
@@ -945,15 +988,6 @@ Image FaceDetector::preprocessFrame(const ImageView& frame) {
         width, height
     );
     
-    // Calculate average brightness from Y channel for adaptive CLAHE
-    uint64_t sum = 0;
-    const uint8_t* y_data = y_plane.data();
-    int total_pixels = width * height;
-    for (int i = 0; i < total_pixels; i++) {
-        sum += y_data[i];
-    }
-    float avg_brightness = static_cast<float>(sum) / (total_pixels * 255.0f);
-    
     // Adaptive CLAHE parameters based on brightness
     // For IR cameras in low-light conditions, we need more aggressive enhancement
     double clip_limit;
@@ -961,10 +995,8 @@ Image FaceDetector::preprocessFrame(const ImageView& frame) {
         clip_limit = 4.0;                 // Aggressive enhancement
     } else if (avg_brightness < 0.30f) { // Dark
         clip_limit = 3.0;
-    } else if (avg_brightness > 0.70f) { // Bright
-        clip_limit = 1.5;                 // Gentle enhancement
-    } else {                              // Normal lighting
-        clip_limit = 2.0;                 // Current default
+    } else {                              // Dim (0.3-0.5)
+        clip_limit = 2.0;                 // Moderate enhancement
     }
     
     // Optional debug logging (controlled by config: [debug] log_brightness = true)

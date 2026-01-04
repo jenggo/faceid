@@ -158,14 +158,13 @@ int cmd_add(const std::string& username, const std::string& face_id) {
             // Draw visualization on original frame
             faceid::Image display_frame = frame.clone();
             
-            // Draw detected face rectangles
+            // Draw detected face rectangles with centering correction
             for (const auto& face : faces) {
                 faceid::Color color = (faces.size() == 1) 
                     ? faceid::Color::Green()  // Green for good detection
                     : faceid::Color::Red();   // Red for multiple faces
                 
-                faceid::drawRectangle(display_frame, face.x, face.y, 
-                                     face.width, face.height, color, 2);
+                faceid::drawFaceBoundingBox(display_frame, face, color, 2);
                 
                 // Draw facial landmarks if available (5-point landmarks)
                 if (face.hasLandmarks()) {
@@ -256,14 +255,13 @@ int cmd_add(const std::string& username, const std::string& face_id) {
             // Draw visualization on original frame
             faceid::Image display_frame = frame.clone();
             
-            // Draw detected face rectangles
+            // Draw detected face rectangles with centering correction
             for (const auto& face : faces) {
                 faceid::Color color = (faces.size() == 1) 
                     ? faceid::Color::Green()  // Green for good detection
                     : faceid::Color::Red();   // Red for multiple faces
                 
-                faceid::drawRectangle(display_frame, face.x, face.y, 
-                                     face.width, face.height, color, 2);
+                faceid::drawFaceBoundingBox(display_frame, face, color, 2);
                 
                 // Draw facial landmarks if available
                 if (face.hasLandmarks()) {

@@ -8,8 +8,24 @@
 
 namespace faceid {
 
-// Maximum frame size for shared memory (640x480x3)
-constexpr size_t MAX_FRAME_SIZE = 640 * 480 * 3;
+// Maximum frame size for shared memory
+// Production-grade: Use 8 MB to accommodate various resolutions
+// - 640x480x3 = 921,600 bytes (~900 KB)
+// - 640x360x3 = 691,200 bytes (~675 KB) - IR cameras
+// - 1280x720x3 = 2,764,800 bytes (~2.6 MB) - HD cameras
+// - 1920x1080x3 = 6,220,800 bytes (~5.9 MB) - Full HD cameras
+constexpr size_t MAX_FRAME_SIZE = 8 * 1024 * 1024;  // 8 MB
+
+// Helper function to calculate frame size
+inline size_t calculateFrameSize(uint32_t width, uint32_t height, uint32_t channels = 3) {
+    return static_cast<size_t>(width) * height * channels;
+}
+
+// Validate frame size fits in buffer
+inline bool validateFrameSize(uint32_t width, uint32_t height, uint32_t channels = 3) {
+    size_t required = calculateFrameSize(width, height, channels);
+    return required <= MAX_FRAME_SIZE && required > 0;
+}
 
 // Shared memory structure for adaptive authentication
 struct AdaptiveAuthState {

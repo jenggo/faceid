@@ -19,7 +19,10 @@ Logger& Logger::getInstance() {
     return instance;
 }
 
-Logger::Logger() {
+Logger::Logger() : write_buffer_(0), buffer_position_(0) {
+    // Pre-allocate circular buffer to avoid reallocations
+    write_buffer_.reserve(BUFFER_SIZE);
+    
     // Skip log file opening in PAM context to avoid stderr warnings
     // that break pkttyagent (polkit) authentication
     const char* pam_context = std::getenv("FACEID_PAM_CONTEXT");
@@ -31,6 +34,9 @@ Logger::Logger() {
 }
 
 Logger::~Logger() {
+    // Flush any remaining buffered data before closing
+    flush();
+    
     if (log_file_.is_open()) {
         log_file_.close();
     }
@@ -99,8 +105,8 @@ std::string Logger::levelToString(LogLevel level) {
 }
 
 void Logger::rotateLogIfNeeded() {
-    // Only perform rotation check periodically (every 10 writes)
-    if (log_counter_ < 10) {
+    // Only perform rotation check periodically (every 50 writes to reduce overhead)
+    if (log_counter_ < 50) {
         log_counter_++;
         return;
     }
@@ -110,39 +116,83 @@ void Logger::rotateLogIfNeeded() {
         return;
     }
     
-    // Read all lines from the log file
+    // STREAMING APPROACH: Count lines without reading entire file into memory
+    // Phase 1: Count total lines by scanning file
     std::ifstream infile(log_file_path_);
     if (!infile.is_open()) {
         return;
     }
     
-    std::vector<std::string> lines;
+    size_t line_count = 0;
     std::string line;
+    line.reserve(256);  // Pre-allocate to reduce reallocations
+    
     while (std::getline(infile, line)) {
-        lines.push_back(line);
+        line_count++;
     }
     infile.close();
     
     // If we have more than max_log_lines_, keep only the last max_log_lines_
-    if (lines.size() > max_log_lines_) {
-        size_t start_index = lines.size() - max_log_lines_;
+    if (line_count > max_log_lines_) {
+        size_t lines_to_skip = line_count - max_log_lines_;
         
-        // Close the file before rewriting
+        // Phase 2: Copy only the last max_log_lines_ to a temp file
+        std::ifstream infile2(log_file_path_);
+        if (!infile2.is_open()) {
+            return;
+        }
+        
+        std::string temp_path = log_file_path_ + ".tmp";
+        std::ofstream outfile(temp_path, std::ios::trunc);
+        if (!outfile.is_open()) {
+            infile2.close();
+            return;
+        }
+        
+        // Skip old lines
+        size_t current_line = 0;
+        while (current_line < lines_to_skip && std::getline(infile2, line)) {
+            current_line++;
+        }
+        
+        // Copy remaining lines (streaming, no vector allocation)
+        while (std::getline(infile2, line)) {
+            outfile << line << '\n';
+        }
+        
+        infile2.close();
+        outfile.close();
+        
+        // Close the current log file before replacing
         if (log_file_.is_open()) {
             log_file_.close();
         }
         
-        // Rewrite with only the last N lines
-        std::ofstream outfile(log_file_path_, std::ios::trunc);
-        if (outfile.is_open()) {
-            for (size_t i = start_index; i < lines.size(); ++i) {
-                outfile << lines[i] << std::endl;
-            }
-            outfile.close();
+        // Replace old file with rotated file
+        if (rename(temp_path.c_str(), log_file_path_.c_str()) != 0) {
+            // Rename failed, try manual copy+delete as fallback
+            std::ifstream src(temp_path, std::ios::binary);
+            std::ofstream dst(log_file_path_, std::ios::binary | std::ios::trunc);
+            dst << src.rdbuf();
+            src.close();
+            dst.close();
+            unlink(temp_path.c_str());
         }
         
         // Reopen the file in append mode
         log_file_.open(log_file_path_, std::ios::app);
+    }
+}
+
+void Logger::flush() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    
+    // Write buffered data to file
+    if (buffer_position_ > 0 && log_file_.is_open()) {
+        log_file_.write(write_buffer_.data(), buffer_position_);
+        log_file_.flush();
+        buffer_position_ = 0;
+        write_buffer_.clear();
     }
 }
 
@@ -159,11 +209,38 @@ void Logger::log(LogLevel level, const std::string& message) {
        << "[PID:" << getpid() << "] "
        << message << std::endl;
     
+    std::string log_line = ss.str();
+    
     if (console_output_) {
-        std::cerr << ss.str();
+        std::cerr << log_line;
     } else if (log_file_.is_open()) {
-        log_file_ << ss.str();
-        log_file_.flush();
+        // Use circular buffer for batching (Fix #6)
+        // Add log line to buffer
+        const char* data = log_line.c_str();
+        size_t len = log_line.length();
+        
+        // Check if buffer will overflow
+        if (buffer_position_ + len >= BUFFER_SIZE) {
+            // Buffer is full, flush immediately
+            if (buffer_position_ > 0) {
+                log_file_.write(write_buffer_.data(), buffer_position_);
+                log_file_.flush();
+                buffer_position_ = 0;
+                write_buffer_.clear();
+            }
+        }
+        
+        // Add to buffer
+        write_buffer_.insert(write_buffer_.end(), data, data + len);
+        buffer_position_ += len;
+        
+        // Flush if buffer reaches threshold (4KB)
+        if (buffer_position_ >= FLUSH_THRESHOLD) {
+            log_file_.write(write_buffer_.data(), buffer_position_);
+            log_file_.flush();
+            buffer_position_ = 0;
+            write_buffer_.clear();
+        }
     } else {
         // If no file and no console (PAM context), use syslog as fallback
         int syslog_level = LOG_INFO;
@@ -176,7 +253,7 @@ void Logger::log(LogLevel level, const std::string& message) {
         syslog(syslog_level, "%s", message.c_str());
     }
     
-    // Check if rotation is needed (every 10 writes)
+    // Check if rotation is needed (every 50 writes)
     rotateLogIfNeeded();
 }
 

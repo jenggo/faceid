@@ -744,9 +744,8 @@ int cmd_test(const std::string& username, bool auto_adjust) {
                 ? matched_names[i] + " (" + std::to_string(static_cast<int>(matched_distances[i] * 100)) + "%)"
                 : "Unknown (" + std::to_string(static_cast<int>(matched_distances[i] * 100)) + "%)";
 
-            // Draw rectangle at ORIGINAL position (SDL will flip it correctly)
-            faceid::drawRectangle(display_frame, face.x, face.y,
-                                 face.width, face.height, color, 2);
+            // Draw rectangle with centering correction using shared helper
+            int adjusted_x = faceid::drawFaceBoundingBox(display_frame, face, color, 2);
 
             // Draw facial landmarks if available (5-point landmarks from YOLO/YuNet)
             if (face.hasLandmarks()) {
@@ -771,7 +770,8 @@ int cmd_test(const std::string& username, bool auto_adjust) {
             std::reverse(label.begin(), label.end());
             int text_width = label.length() * 8;
             // Position text: align with right edge of box before flip = left edge after flip
-            int text_x = face.x + face.width - text_width;
+            // Use same centering adjustment as the box
+            int text_x = adjusted_x + face.width - text_width;
             faceid::drawText(display_frame, label, text_x, face.y - 10, color, 1.0);
         }
 
@@ -784,59 +784,35 @@ int cmd_test(const std::string& username, bool auto_adjust) {
         if (elapsed > 0) {
             double fps = static_cast<double>(frame_count) / elapsed;
 
-            // Draw info banner at top (expanded to 110px for 5 lines)
-            faceid::drawFilledRectangle(display_frame, 0, 0, display_frame.width(), 110, faceid::Color::Black());
-
-            // Face count
-            std::string info_text = "Detected faces: " + std::to_string(faces.size());
-            std::reverse(info_text.begin(), info_text.end());
-            int info_width = info_text.length() * 8;
-            faceid::drawText(display_frame, info_text, display_frame.width() - 10 - info_width, 10, faceid::Color::White(), 1.0);
-
-            // FPS
-            std::string fps_text = "FPS: " + std::to_string(static_cast<int>(fps));
-            std::reverse(fps_text.begin(), fps_text.end());
-            int fps_width = fps_text.length() * 8;
-            faceid::drawText(display_frame, fps_text, display_frame.width() - 10 - fps_width, 25, faceid::Color::Green(), 1.0);
-
-            // Current enrolled face distance (show the distance for the first detected face)
+            // Draw compact info banner at top using shared helper
+            std::vector<std::string> info_items = {
+                "Detected faces: " + std::to_string(faces.size()),
+                "FPS: " + std::to_string(static_cast<int>(fps))
+            };
+            
+            // Add distance if face detected
             if (!faces.empty() && !matched_distances.empty()) {
                 double current_distance = matched_distances[0];
-                std::string dist_text = "Distance: " + std::to_string(static_cast<int>(current_distance * 100)) + "%";
-                std::reverse(dist_text.begin(), dist_text.end());
-                int dist_width = dist_text.length() * 8;
-                // Color: green if matched, red if not
-                faceid::Color dist_color = (current_distance < threshold) ? faceid::Color::Green() : faceid::Color::Red();
-                faceid::drawText(display_frame, dist_text, display_frame.width() - 10 - dist_width, 45, dist_color, 1.0);
+                info_items.push_back("Distance: " + std::to_string(static_cast<int>(current_distance * 100)) + "%");
             }
-
-            // Threshold info
-            std::string thresh_text = "Threshold: " + std::to_string(static_cast<int>(threshold * 100)) + "%";
-            std::reverse(thresh_text.begin(), thresh_text.end());
-            int thresh_width = thresh_text.length() * 8;
-            faceid::drawText(display_frame, thresh_text, display_frame.width() - 10 - thresh_width, 65, faceid::Color::Gray(), 1.0);
             
-            // Adjustment status (if auto-adjust enabled)
+            // Add threshold
+            info_items.push_back("Threshold: " + std::to_string(static_cast<int>(threshold * 100)) + "%");
+            
+            // Add adjustment status if active
             if (auto_adjust && !adjustment_status.empty()) {
-                std::string adj_text = adjustment_status;
-                std::reverse(adj_text.begin(), adj_text.end());
-                int adj_width = adj_text.length() * 8;
-                faceid::Color adj_color = is_adjusting ? faceid::Color::Yellow() : faceid::Color::Cyan();
-                faceid::drawText(display_frame, adj_text, display_frame.width() - 10 - adj_width, 85, adj_color, 1.0);
+                info_items.push_back(adjustment_status);
             }
+            
+            faceid::drawCompactBanner(display_frame, info_items);
         }
 
-        // Draw help text at bottom
-        faceid::drawFilledRectangle(display_frame, 0, display_frame.height() - 30,
-                                   display_frame.width(), 30, faceid::Color::Black());
+        // Draw help text at bottom using shared helper
         std::string help_text = "Press 'q' or ESC to quit";
         if (auto_adjust && can_save_config) {
             help_text += " | Press 's' to save settings";
         }
-        std::reverse(help_text.begin(), help_text.end());
-        int help_width = help_text.length() * 8;
-        faceid::drawText(display_frame, help_text, display_frame.width() - 10 - help_width, display_frame.height() - 20,
-                        faceid::Color::White(), 1.0);
+        faceid::drawHelpBanner(display_frame, help_text);
 
         // Display the frame (SDL will flip horizontally)
         display.show(display_frame);

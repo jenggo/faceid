@@ -3,10 +3,33 @@
 #include <vector>
 #include "commands.h"
 #include "config_paths.h"
+#include "../config.h"
+#include "../logger.h"
 
 using namespace faceid;
 
 int main(int argc, char* argv[]) {
+    // Load configuration to set log level
+    auto& config = faceid::Config::getInstance();
+    std::string config_path = std::string(CONFIG_DIR) + "/faceid.conf";
+    config.load(config_path);
+    
+    // Configure log level from config file
+    auto& logger = faceid::Logger::getInstance();
+    std::string log_level_str = config.getString("logging", "log_level").value_or("INFO");
+    
+    faceid::LogLevel log_level = faceid::LogLevel::INFO;
+    if (log_level_str == "DEBUG") {
+        log_level = faceid::LogLevel::DEBUG;
+    } else if (log_level_str == "INFO") {
+        log_level = faceid::LogLevel::INFO;
+    } else if (log_level_str == "WARNING") {
+        log_level = faceid::LogLevel::WARNING;
+    } else if (log_level_str == "ERROR") {
+        log_level = faceid::LogLevel::ERROR;
+    }
+    logger.setLogLevel(log_level);
+    
     if (argc < 2) {
         print_usage();
         return 1;

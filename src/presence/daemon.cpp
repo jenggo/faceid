@@ -192,6 +192,17 @@ namespace {
                         continue;
                     }
                     
+                    // Validate extracted frame size
+                    if (!faceid::validateFrameSize(frame_width, frame_height, frame_channels)) {
+                        logger.error("Invalid frame dimensions from shared memory: " + 
+                                   std::to_string(frame_width) + "x" + 
+                                   std::to_string(frame_height) + "x" + 
+                                   std::to_string(frame_channels));
+                        adaptive_mgr.failOptimization();
+                        delete[] frame_buffer;
+                        continue;
+                    }
+                    
                     logger.info("Extracted frame: " + std::to_string(frame_width) + "x" + 
                                std::to_string(frame_height) + "x" + std::to_string(frame_channels));
                     
@@ -384,6 +395,10 @@ int main(int argc, char* argv[]) {
     int shutter_timeout = config.getInt("presence_detection", "shutter_timeout_minutes").value_or(5);
     std::string camera_device = config.getString("camera", "device").value_or("/dev/video0");
     
+    // Read presence camera resolution (optional, defaults to 640x480)
+    int presence_camera_width = config.getInt("presence_detection", "presence_camera_width").value_or(640);
+    int presence_camera_height = config.getInt("presence_detection", "presence_camera_height").value_or(480);
+    
     // Read no-peek configuration
     bool no_peek_enabled = config.getBool("no_peek", "enabled").value_or(false);
     int min_face_distance = config.getInt("no_peek", "min_face_distance_pixels").value_or(80);
@@ -466,6 +481,11 @@ int main(int argc, char* argv[]) {
     detector.setShutterBrightnessThreshold(shutter_brightness);
     detector.setShutterVarianceThreshold(shutter_variance);
     detector.setShutterTimeout(shutter_timeout * 60 * 1000);  // Convert minutes to milliseconds
+    
+    // Configure presence camera resolution
+    detector.setPresenceCameraResolution(presence_camera_width, presence_camera_height);
+    logger.info("Presence camera configured: " + std::to_string(presence_camera_width) + "x" + 
+                std::to_string(presence_camera_height));
     
     // Configure no-peek detection
     detector.enableNoPeek(no_peek_enabled);

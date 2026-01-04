@@ -77,12 +77,13 @@ bool AdaptiveAuthManager::initialize() {
     
     // Initialize mutex if we're the owner
     if (is_owner_) {
+        // Initialize state FIRST (before mutex)
+        std::memset(state_, 0, sizeof(AdaptiveAuthState));
+        
+        // Then initialize mutex
         pthread_mutexattr_init(&state_->mutex_attr);
         pthread_mutexattr_setpshared(&state_->mutex_attr, PTHREAD_PROCESS_SHARED);
         pthread_mutex_init(&state_->mutex, &state_->mutex_attr);
-        
-        // Initialize state
-        std::memset(state_, 0, sizeof(AdaptiveAuthState));
     }
     
     Logger::getInstance().debug("Adaptive auth shared memory initialized (owner: " + 
@@ -142,17 +143,23 @@ void AdaptiveAuthManager::captureFrame(const uint8_t* data, int width, int heigh
     
     lock();
     
-    state_->frame_width = width;
-    state_->frame_height = height;
-    state_->frame_channels = channels;
-    
-    size_t frame_size = width * height * channels;
-    if (frame_size > MAX_FRAME_SIZE) {
-        Logger::getInstance().error("Frame too large for shared memory: " + std::to_string(frame_size));
+    // Validate frame size using helper function
+    if (!validateFrameSize(width, height, channels)) {
+        size_t frame_size = calculateFrameSize(width, height, channels);
+        Logger::getInstance().error("Frame size exceeds shared memory buffer: " + 
+                                   std::to_string(frame_size) + " bytes (max: " + 
+                                   std::to_string(MAX_FRAME_SIZE) + " bytes). " +
+                                   "Resolution: " + std::to_string(width) + "x" + 
+                                   std::to_string(height) + "x" + std::to_string(channels));
         unlock();
         return;
     }
     
+    state_->frame_width = width;
+    state_->frame_height = height;
+    state_->frame_channels = channels;
+    
+    size_t frame_size = calculateFrameSize(width, height, channels);
     std::memcpy(state_->frame_data, data, frame_size);
     state_->optimization_requested = true;
     
@@ -208,7 +215,16 @@ bool AdaptiveAuthManager::getFrameData(uint8_t* buffer, int& width, int& height,
     height = state_->frame_height;
     channels = state_->frame_channels;
     
-    size_t frame_size = width * height * channels;
+    // Validate frame size before copying
+    if (!validateFrameSize(width, height, channels)) {
+        Logger::getInstance().error("Invalid frame size in shared memory: " + 
+                                   std::to_string(width) + "x" + std::to_string(height) + 
+                                   "x" + std::to_string(channels));
+        unlock();
+        return false;
+    }
+    
+    size_t frame_size = calculateFrameSize(width, height, channels);
     std::memcpy(buffer, state_->frame_data, frame_size);
     
     unlock();

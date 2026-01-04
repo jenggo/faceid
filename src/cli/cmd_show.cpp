@@ -1,5 +1,6 @@
 #include "commands.h"
 #include "cli_common.h"
+#include "cli_helpers.h"
 #include <algorithm>  // for std::reverse
 
 namespace faceid {
@@ -81,9 +82,8 @@ int cmd_show() {
                 ? faceid::Color::Green()   // Green for primary face
                 : faceid::Color::Yellow(); // Yellow for additional faces
             
-            // Draw rectangle at ORIGINAL position (SDL will flip it correctly)
-            faceid::drawRectangle(display_frame, face.x, face.y, 
-                                 face.width, face.height, color, 2);
+            // Draw rectangle with centering correction using shared helper
+            int adjusted_x = faceid::drawFaceBoundingBox(display_frame, face, color, 2);
             
             // Draw facial landmarks if available (5-point landmarks)
             if (face.hasLandmarks()) {
@@ -108,8 +108,7 @@ int cmd_show() {
             std::string label = (i == 0) ? "Face 1 (Primary)" : "Face " + std::to_string(i + 1);
             std::reverse(label.begin(), label.end());
             int text_width = label.length() * 8;
-            // Position text: align with right edge of box before flip = left edge after flip
-            int text_x = face.x + face.width - text_width;
+            int text_x = adjusted_x + face.width - text_width;
             faceid::drawText(display_frame, label, text_x, face.y - 10, color, 1.0);
         }
         
@@ -121,36 +120,17 @@ int cmd_show() {
         if (elapsed > 0) {
             double fps = static_cast<double>(frame_count) / elapsed;
             
-            // Draw info banner at top
-            faceid::drawFilledRectangle(display_frame, 0, 0, display_frame.width(), 70, faceid::Color::Black());
-            
-            // Face count (reversed text for SDL flip)
-            std::string info_text = "Detected faces: " + std::to_string(faces.size());
-            std::reverse(info_text.begin(), info_text.end());
-            int info_width = info_text.length() * 8;
-            faceid::drawText(display_frame, info_text, display_frame.width() - 10 - info_width, 10, faceid::Color::White(), 1.0);
-            
-            // FPS (reversed text for SDL flip)
-            std::string fps_text = "FPS: " + std::to_string(static_cast<int>(fps));
-            std::reverse(fps_text.begin(), fps_text.end());
-            int fps_width = fps_text.length() * 8;
-            faceid::drawText(display_frame, fps_text, display_frame.width() - 10 - fps_width, 25, faceid::Color::Green(), 1.0);
-            
-            // Resolution (reversed text for SDL flip)
-            std::string res_text = std::to_string(display_frame.width()) + "x" + std::to_string(display_frame.height());
-            std::reverse(res_text.begin(), res_text.end());
-            int res_width = res_text.length() * 8;
-            faceid::drawText(display_frame, res_text, display_frame.width() - 10 - res_width, 45, faceid::Color::Gray(), 1.0);
+            // Draw compact banner using shared helper
+            std::vector<std::string> info_items = {
+                "Detected faces: " + std::to_string(faces.size()),
+                "FPS: " + std::to_string(static_cast<int>(fps)),
+                "Resolution: " + std::to_string(display_frame.width()) + "x" + std::to_string(display_frame.height())
+            };
+            faceid::drawCompactBanner(display_frame, info_items);
         }
         
-        // Draw help text at bottom (reversed text for SDL flip)
-        faceid::drawFilledRectangle(display_frame, 0, display_frame.height() - 30, 
-                                   display_frame.width(), 30, faceid::Color::Black());
-        std::string help_text = "Press 'q' or ESC to quit";
-        std::reverse(help_text.begin(), help_text.end());
-        int help_width = help_text.length() * 8;
-        faceid::drawText(display_frame, help_text, display_frame.width() - 10 - help_width, display_frame.height() - 20, 
-                        faceid::Color::White(), 1.0);
+        // Draw help text using shared helper
+        faceid::drawHelpBanner(display_frame, "Press 'q' or ESC to quit");
         
         // Display the frame (SDL will flip horizontally)
         display.show(display_frame);

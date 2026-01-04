@@ -556,16 +556,28 @@ Image PresenceDetector::captureFrame() {
     if (!camera_ || !camera_->isOpened()) {
         camera_ = std::make_unique<Camera>(camera_device_);
         
-        // Open with 640x480 (smaller for presence detection = faster processing)
-        if (!camera_->open(640, 480)) {
-            Logger::getInstance().error("Failed to open camera: " + camera_device_);
+        Logger& logger = Logger::getInstance();
+        
+        // Use configured resolution for presence detection
+        int width = presence_camera_width_;
+        int height = presence_camera_height_;
+        
+        logger.info("Attempting to open camera with resolution: " + 
+                   std::to_string(width) + "x" + std::to_string(height));
+        
+        if (!camera_->open(width, height)) {
+            logger.error("Failed to open camera: " + camera_device_ + 
+                        " with resolution " + std::to_string(width) + "x" + std::to_string(height));
+            logger.error("Presence detection will be disabled. Check camera capabilities with: v4l2-ctl --device=" + 
+                        camera_device_ + " --list-formats-ext");
             return Image();
         }
         
-        Logger& logger = Logger::getInstance();
+        // Log successful camera opening with actual resolution
         logger.info("Camera opened for presence detection");
         logger.info("Camera device: " + camera_device_);
-        logger.info("Camera resolution: 640x480");
+        logger.info("Requested resolution: " + std::to_string(width) + "x" + std::to_string(height));
+        logger.warning("NOTE: If camera doesn't support requested resolution, detection may fail or produce distorted images");
     }
     
     Image frame;

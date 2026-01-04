@@ -73,6 +73,12 @@ public:
     void setShutterVarianceThreshold(double threshold) { shutter_variance_threshold_ = threshold; }
     void setShutterTimeout(int ms) { shutter_timeout_ms_ = ms; }
     
+    // Presence camera resolution configuration
+    void setPresenceCameraResolution(int width, int height) { 
+        presence_camera_width_ = width; 
+        presence_camera_height_ = height; 
+    }
+    
     // No-peek configuration
     void enableNoPeek(bool enable) { no_peek_enabled_ = enable; }
     void setMinFaceDistance(int pixels) { min_face_distance_pixels_ = pixels; }
@@ -191,6 +197,10 @@ private:
     int shutter_timeout_ms_ = 300000;              // 5 minutes
     int consecutive_shutter_closed_scans_ = 0;
     ShutterState last_shutter_state_ = ShutterState::OPEN;
+    
+    // Presence camera resolution (configurable)
+    int presence_camera_width_ = 640;
+    int presence_camera_height_ = 480;
     
     // Display server detection (set once at startup)
     bool is_wayland_ = false;

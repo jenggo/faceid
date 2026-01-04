@@ -838,6 +838,63 @@ static inline bool updateConfigFile(const std::string& config_path, float confid
     return true;
 }
 
+// ========== Shared Camera View Helpers ==========
+
+/**
+ * Draw a face bounding box with centering correction for flipped camera
+ * @param frame The frame to draw on
+ * @param face The detected face rectangle
+ * @param color The color for the box
+ * @param thickness Line thickness (default 2)
+ * @return adjusted_x The adjusted X coordinate (for label positioning)
+ */
+static inline int drawFaceBoundingBox(Image& frame, const Rect& face, const Color& color, int thickness = 2) {
+    // Apply centering correction for both X and Y axes
+    // Camera is horizontally flipped: subtract X to shift RIGHT in flipped view
+    // Y is not flipped: subtract Y to shift UP
+    int adjusted_x = face.x - 8;  // Shift right (more to compensate for left offset)
+    int adjusted_y = face.y - 5;  // Shift up (to compensate for downward offset)
+    drawRectangle(frame, adjusted_x, adjusted_y, face.width, face.height, color, thickness);
+    return adjusted_x;
+}
+
+/**
+ * Draw compact single-line info banner at top of frame
+ * @param frame The frame to draw on
+ * @param info_items Vector of info strings to display (e.g., "FPS: 21", "Distance: 37%")
+ * @param height Banner height in pixels (default 30)
+ */
+static inline void drawCompactBanner(Image& frame, const std::vector<std::string>& info_items, int height = 30) {
+    // Draw black background
+    drawFilledRectangle(frame, 0, 0, frame.width(), height, Color::Black());
+    
+    // Join all items with " | " separator
+    std::string banner_text;
+    for (size_t i = 0; i < info_items.size(); i++) {
+        if (i > 0) banner_text += " | ";
+        banner_text += info_items[i];
+    }
+    
+    // Reverse for SDL horizontal flip
+    std::reverse(banner_text.begin(), banner_text.end());
+    int text_width = banner_text.length() * 8;
+    drawText(frame, banner_text, frame.width() - 10 - text_width, 10, Color::White(), 1.0);
+}
+
+/**
+ * Draw help text at bottom of frame
+ * @param frame The frame to draw on
+ * @param help_text The help text to display (will be reversed for flip)
+ * @param height Banner height in pixels (default 30)
+ */
+static inline void drawHelpBanner(Image& frame, const std::string& help_text, int height = 30) {
+    drawFilledRectangle(frame, 0, frame.height() - height, frame.width(), height, Color::Black());
+    std::string reversed_text = help_text;
+    std::reverse(reversed_text.begin(), reversed_text.end());
+    int text_width = reversed_text.length() * 8;
+    drawText(frame, reversed_text, frame.width() - 10 - text_width, frame.height() - 20, Color::White(), 1.0);
+}
+
 
 } // namespace faceid
 

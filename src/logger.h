@@ -5,6 +5,7 @@
 #include <fstream>
 #include <mutex>
 #include <cstddef>
+#include <vector>
 
 namespace faceid {
 
@@ -31,6 +32,9 @@ public:
     void auditAuthAttempt(const std::string& username, const std::string& method);
     void auditAuthSuccess(const std::string& username, const std::string& method, double duration_ms);
     void auditAuthFailure(const std::string& username, const std::string& method, const std::string& reason);
+    
+    // Flush buffer to disk (called manually or on buffer full)
+    void flush();
 
 private:
     Logger();
@@ -49,8 +53,14 @@ private:
     LogLevel min_level_ = LogLevel::INFO;
     bool console_output_ = false;
     std::string log_file_path_;
-    size_t max_log_lines_ = 50;
+    size_t max_log_lines_ = 1000;  // Rotate after 1000 lines (reduced memory usage)
     size_t log_counter_ = 0;
+    
+    // Circular buffer for batching writes (Fix #6)
+    static const size_t BUFFER_SIZE = 8 * 1024 * 1024;  // 8 MB buffer
+    std::vector<char> write_buffer_;
+    size_t buffer_position_ = 0;
+    static const size_t FLUSH_THRESHOLD = 4096;  // Flush after 4KB
 };
 
 } // namespace faceid
