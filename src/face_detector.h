@@ -195,6 +195,24 @@ public:
     static Image normalizeImageHistogram(const Image& face_image);
     
     // ========================================================================
+    // PHASE 2: Adaptive Preprocessing for Variable Lighting
+    // ========================================================================
+    // Apply gamma correction with specified gamma value
+    // gamma < 1.0: brighten, gamma > 1.0: darken
+    Image applyGammaCorrection(const Image& image, float gamma);
+    
+    // Adaptive gamma correction based on detected brightness
+    // Automatically adjusts to bring brightness toward target level
+    Image applyAdaptiveGammaCorrection(const Image& image);
+    
+    // Normalize brightness using linear scaling toward target (127.5/255)
+    Image normalizeBrightness(const Image& image);
+    
+    // Apply CLAHE with adaptive clip limit based on histogram characteristics
+    // Low contrast images get higher clip limit for stronger enhancement
+    Image applyAdaptiveCLAHE(const Image& image);
+    
+    // ========================================================================
     // QUICK WIN #2: Face Quality Assessment
     // ========================================================================
     // Evaluates face image quality based on blur, size, brightness, and detector confidence

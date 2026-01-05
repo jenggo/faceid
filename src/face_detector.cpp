@@ -833,10 +833,31 @@ std::vector<FaceEncoding> FaceDetector::encodeFaces(
             aligned = alignFace(frame, face_rect);
         }
 
-        // QUICK WIN #1: Apply histogram equalization if enabled
-        if (Config::getInstance().getBool("recognition", "enable_histogram_eq").value_or(true)) {
+        // PHASE 2: Adaptive Preprocessing Pipeline
+        // Order: Gamma → Brightness → CLAHE → Histogram EQ (legacy)
+        
+        // Step 1: Adaptive gamma correction (for extreme lighting)
+        if (Config::getInstance().getBool("recognition", "enable_gamma_correction").value_or(true)) {
+            aligned = applyAdaptiveGammaCorrection(aligned);
+            Logger::getInstance().debug("Gamma correction applied to face " + std::to_string(idx));
+        }
+        
+        // Step 2: Brightness normalization (linear scaling)
+        if (Config::getInstance().getBool("recognition", "enable_brightness_normalization").value_or(true)) {
+            aligned = normalizeBrightness(aligned);
+            Logger::getInstance().debug("Brightness normalization applied to face " + std::to_string(idx));
+        }
+        
+        // Step 3: Adaptive CLAHE (contrast enhancement)
+        if (Config::getInstance().getBool("recognition", "enable_adaptive_clahe").value_or(true)) {
+            aligned = applyAdaptiveCLAHE(aligned);
+            Logger::getInstance().debug("Adaptive CLAHE applied to face " + std::to_string(idx));
+        }
+        
+        // QUICK WIN #1: Legacy histogram equalization (optional, now redundant with CLAHE)
+        if (Config::getInstance().getBool("recognition", "enable_histogram_eq").value_or(false)) {
             aligned = normalizeImageHistogram(aligned);
-            Logger::getInstance().debug("Histogram equalization applied to face " + std::to_string(idx));
+            Logger::getInstance().debug("Legacy histogram equalization applied to face " + std::to_string(idx));
         }
         
         // QUICK WIN #2: Assess face quality and skip low-quality faces
@@ -1536,6 +1557,229 @@ std::vector<size_t> FaceDetector::deduplicateFaces(
 // ============================================================================
 // QUICK WIN #1: Histogram Equalization
 // ============================================================================
+// ============================================================================
+// PHASE 2: Adaptive Preprocessing Pipeline for Variable Lighting
+// ============================================================================
+
+/**
+ * Calculate mean brightness of an image (0-255 scale)
+ */
+static float calculateMeanBrightness(const uint8_t* data, int width, int height, int stride, int channels) {
+    double sum = 0.0;
+    int pixel_count = 0;
+    
+    for (int y = 0; y < height; y++) {
+        for (int x = 0; x < width; x++) {
+            if (channels == 3) {
+                // Use standard luminance formula for RGB
+                uint8_t b = data[y * stride + x * 3 + 0];
+                uint8_t g = data[y * stride + x * 3 + 1];
+                uint8_t r = data[y * stride + x * 3 + 2];
+                sum += 0.299 * r + 0.587 * g + 0.114 * b;
+            } else {
+                sum += data[y * stride + x];
+            }
+            pixel_count++;
+        }
+    }
+    
+    return static_cast<float>(sum / pixel_count);
+}
+
+/**
+ * Apply gamma correction to adjust brightness
+ * gamma < 1.0: brighten image (for dark conditions)
+ * gamma > 1.0: darken image (for bright conditions)
+ */
+Image FaceDetector::applyGammaCorrection(const Image& image, float gamma) {
+    // Build lookup table for gamma correction
+    uint8_t lut[256];
+    for (int i = 0; i < 256; i++) {
+        float normalized = i / 255.0f;
+        float corrected = std::pow(normalized, gamma);
+        lut[i] = static_cast<uint8_t>(std::min(255.0f, corrected * 255.0f + 0.5f));
+    }
+    
+    // Apply LUT to image
+    Image result = image.clone();
+    uint8_t* data = result.data();
+    int total_pixels = result.width() * result.height() * result.channels();
+    
+    for (int i = 0; i < total_pixels; i++) {
+        data[i] = lut[data[i]];
+    }
+    
+    return result;
+}
+
+/**
+ * Adaptive gamma correction based on image brightness
+ * Automatically brightens dark images and darkens bright images
+ */
+Image FaceDetector::applyAdaptiveGammaCorrection(const Image& image) {
+    float mean_brightness = calculateMeanBrightness(
+        image.data(), image.width(), image.height(), 
+        image.stride(), image.channels()
+    );
+    
+    const float target_brightness = 127.5f;  // Middle of 0-255 range
+    const float brightness_tolerance = 20.0f;  // Don't adjust if within ±20 of target
+    
+    // Check if adjustment is needed
+    if (std::abs(mean_brightness - target_brightness) < brightness_tolerance) {
+        Logger::getInstance().debug("Brightness OK (" + std::to_string(mean_brightness) + 
+                                   "), skipping gamma correction");
+        return image.clone();
+    }
+    
+    // Calculate gamma: lower gamma brightens, higher gamma darkens
+    // For dark images (brightness < target): gamma < 1.0
+    // For bright images (brightness > target): gamma > 1.0
+    float gamma = target_brightness / std::max(1.0f, mean_brightness);
+    
+    // Clamp gamma to reasonable range to avoid over-correction
+    gamma = std::max(0.5f, std::min(2.0f, gamma));
+    
+    Logger::getInstance().debug("Applying gamma correction: brightness=" + 
+                               std::to_string(mean_brightness) + ", gamma=" + 
+                               std::to_string(gamma));
+    
+    return applyGammaCorrection(image, gamma);
+}
+
+/**
+ * Normalize brightness toward target level (127.5 on 0-255 scale)
+ * Uses simple linear scaling
+ */
+Image FaceDetector::normalizeBrightness(const Image& image) {
+    float mean_brightness = calculateMeanBrightness(
+        image.data(), image.width(), image.height(),
+        image.stride(), image.channels()
+    );
+    
+    const float target_brightness = 127.5f;
+    const float brightness_tolerance = 15.0f;
+    
+    // Check if adjustment needed
+    if (std::abs(mean_brightness - target_brightness) < brightness_tolerance) {
+        Logger::getInstance().debug("Brightness normalized (within tolerance): " + 
+                                   std::to_string(mean_brightness));
+        return image.clone();
+    }
+    
+    // Calculate linear scaling factor
+    float scale = target_brightness / std::max(1.0f, mean_brightness);
+    
+    // Clamp scale to avoid extreme adjustments
+    scale = std::max(0.5f, std::min(2.0f, scale));
+    
+    Logger::getInstance().debug("Normalizing brightness: " + std::to_string(mean_brightness) + 
+                               " -> " + std::to_string(target_brightness) + 
+                               ", scale=" + std::to_string(scale));
+    
+    // Apply linear scaling
+    Image result = image.clone();
+    uint8_t* data = result.data();
+    int total_pixels = result.width() * result.height() * result.channels();
+    
+    for (int i = 0; i < total_pixels; i++) {
+        float val = data[i] * scale;
+        data[i] = static_cast<uint8_t>(std::min(255.0f, std::max(0.0f, val)));
+    }
+    
+    return result;
+}
+
+/**
+ * Apply adaptive CLAHE based on image histogram characteristics
+ * Adjusts clip limit based on contrast level
+ */
+Image FaceDetector::applyAdaptiveCLAHE(const Image& image) {
+    // Convert to grayscale if needed
+    Image work_img;
+    if (image.channels() == 3) {
+        work_img = toGrayscale(image.data(), image.width(), 
+                              image.height(), image.stride());
+    } else {
+        work_img = image.clone();
+    }
+    
+    // Calculate histogram statistics
+    std::vector<int> histogram(256, 0);
+    const uint8_t* data = work_img.data();
+    int total_pixels = work_img.width() * work_img.height();
+    
+    for (int i = 0; i < total_pixels; i++) {
+        histogram[data[i]]++;
+    }
+    
+    // Calculate histogram spread (standard deviation)
+    double mean = 0.0;
+    for (int i = 0; i < 256; i++) {
+        mean += i * histogram[i];
+    }
+    mean /= total_pixels;
+    
+    double variance = 0.0;
+    for (int i = 0; i < 256; i++) {
+        double diff = i - mean;
+        variance += diff * diff * histogram[i];
+    }
+    variance /= total_pixels;
+    double std_dev = std::sqrt(variance);
+    
+    // Adaptive clip limit based on contrast
+    // Low contrast (low std_dev): higher clip limit for more enhancement
+    // High contrast (high std_dev): lower clip limit to avoid over-enhancement
+    double base_clip_limit = 2.0;
+    double clip_limit;
+    
+    if (std_dev < 30.0) {
+        // Very low contrast - apply strong enhancement
+        clip_limit = base_clip_limit * 2.5;
+        Logger::getInstance().debug("Low contrast detected (std=" + std::to_string(std_dev) + 
+                                   "), using high CLAHE clip limit: " + std::to_string(clip_limit));
+    } else if (std_dev < 60.0) {
+        // Medium contrast - moderate enhancement
+        clip_limit = base_clip_limit * 1.5;
+        Logger::getInstance().debug("Medium contrast (std=" + std::to_string(std_dev) + 
+                                   "), using moderate CLAHE clip limit: " + std::to_string(clip_limit));
+    } else {
+        // High contrast - gentle enhancement
+        clip_limit = base_clip_limit;
+        Logger::getInstance().debug("High contrast (std=" + std::to_string(std_dev) + 
+                                   "), using base CLAHE clip limit: " + std::to_string(clip_limit));
+    }
+    
+    // Apply CLAHE
+    CLAHE clahe(clip_limit, 8, 8);
+    Image result(work_img.width(), work_img.height(), 1);
+    
+    clahe.apply(work_img.data(), result.data(), 
+               work_img.width(), work_img.height(),
+               work_img.width(), result.width());
+    
+    // Convert back to BGR if original was color
+    if (image.channels() == 3) {
+        Image bgr_result(result.width(), result.height(), 3);
+        uint8_t* bgr_data = bgr_result.data();
+        const uint8_t* gray_data = result.data();
+        
+        for (int i = 0; i < total_pixels; i++) {
+            bgr_data[i * 3 + 0] = gray_data[i];  // B
+            bgr_data[i * 3 + 1] = gray_data[i];  // G
+            bgr_data[i * 3 + 2] = gray_data[i];  // R
+        }
+        return bgr_result;
+    }
+    
+    return result;
+}
+
+// ============================================================================
+// QUICK WIN #1: Histogram Equalization (Legacy)
+// ============================================================================
+
 Image FaceDetector::normalizeImageHistogram(const Image& face_image) {
     // Convert to grayscale if needed
     Image work_img;
