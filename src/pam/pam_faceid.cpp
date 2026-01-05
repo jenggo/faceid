@@ -457,141 +457,221 @@ static bool authenticate_user(const char* username) {
                            std::to_string(detection_confidence) + ")");
                 syslog(LOG_DEBUG, "pam_faceid: Using cascading detection with confidence: %.3f", detection_confidence);
                 
+                // PHASE 4: Temporal smoothing configuration
+                bool enable_temporal_smoothing = config.getBool("recognition", "enable_temporal_smoothing").value_or(true);
+                int temporal_frames = config.getInt("recognition", "temporal_frames").value_or(3);
+                int required_matches = config.getInt("recognition", "required_consecutive_matches").value_or(2);
+                
+                if (enable_temporal_smoothing) {
+                    logger.debug(std::string("Temporal smoothing enabled: requiring ") + 
+                               std::to_string(required_matches) + "/" + std::to_string(temporal_frames) + " frames");
+                    syslog(LOG_DEBUG, "pam_faceid: Temporal smoothing: %d/%d frames required", 
+                           required_matches, temporal_frames);
+                }
+                
                 auto start = std::chrono::steady_clock::now();
                 while (!cancel_flag.load() && std::chrono::duration_cast<std::chrono::seconds>(
                        std::chrono::steady_clock::now() - start).count() < timeout) {
                     
-                    faceid::Image frame;
-                    if (!camera.read(frame)) {
-                        continue;
-                    }
+                    // PHASE 4: Temporal smoothing - capture multiple consecutive frames
+                    std::vector<bool> frame_matches;
+                    int frames_to_capture = enable_temporal_smoothing ? temporal_frames : 1;
                     
-                    // Store frame data for potential adaptive optimization
-                    {
-                        std::lock_guard<std::mutex> lock(frame_mutex);
-                        // Only clone if last_frame is empty or different size
-                        if (last_frame->empty() || 
-                            last_frame->width() != frame.width() || 
-                            last_frame->height() != frame.height()) {
-                            *last_frame = frame.clone();
-                        } else {
-                            // Copy data directly for efficiency
-                            std::memcpy(last_frame->data(), frame.data(), 
-                                       frame.width() * frame.height() * frame.channels());
+                    for (int frame_idx = 0; frame_idx < frames_to_capture; frame_idx++) {
+                        // Check cancellation between frames
+                        if (cancel_flag.load()) {
+                            break;
                         }
-                    }
-                    
-                    // Use cascading detection for robust face detection across all lighting conditions
-                    // This automatically tries 3 stages: standard CLAHE, aggressive CLAHE, and fallback detector
-                    auto cascade_result = detector.detectFacesCascade(frame.view(), false, detection_confidence);
-                    
-                    if (cascade_result.faces.empty()) {
-                        continue;
-                    }
-                    
-                    // Log which cascade stage was used for detection
-                    if (cascade_result.stage_used > 1) {
-                        logger.debug(std::string("Face detected using cascade stage ") + 
-                                   std::to_string(cascade_result.stage_used) + 
-                                   " (brightness: " + std::to_string(cascade_result.avg_brightness) + ")");
-                        syslog(LOG_DEBUG, "pam_faceid: Cascade stage %d used (brightness: %.2f)", 
-                               cascade_result.stage_used, cascade_result.avg_brightness);
-                    }
-                    
-                    // Encode faces using the preprocessed frame from cascade
-                    auto encodings = detector.encodeFaces(cascade_result.processed_frame.view(), 
-                                                         cascade_result.faces);
-                    if (encodings.empty()) {
-                        continue;
-                    }
-                    
-                    // Deduplicate faces - filter out multiple detections of the same person
-                    // This prevents false positives from the same face detected at different angles/positions
-                    auto unique_indices = FaceDetector::deduplicateFaces(cascade_result.faces, encodings, 0.15);
-                    
-                    // Filter to only unique faces
-                    std::vector<FaceEncoding> unique_encodings;
-                    for (size_t idx : unique_indices) {
-                        if (idx < encodings.size()) {
-                            unique_encodings.push_back(encodings[idx]);
+                        
+                        faceid::Image frame;
+                        if (!camera.read(frame)) {
+                            continue;
                         }
-                    }
-                    
-                    // Compare detected faces against ALL users to find best match
-                    for (const auto& detected_encoding : unique_encodings) {
-                        double best_distance = 999.0;
-                        std::string best_match_user = "";
                         
-                        // PHASE 3: Get quality-based filtering and early-exit thresholds
-                        double min_quality_threshold = config.getDouble("recognition", "min_encoding_quality").value_or(0.5);
-                        double early_exit_threshold = threshold * 0.5;  // Strong match = 50% of threshold
+                        // Store frame data for potential adaptive optimization
+                        {
+                            std::lock_guard<std::mutex> lock(frame_mutex);
+                            // Only clone if last_frame is empty or different size
+                            if (last_frame->empty() || 
+                                last_frame->width() != frame.width() || 
+                                last_frame->height() != frame.height()) {
+                                *last_frame = frame.clone();
+                            } else {
+                                // Copy data directly for efficiency
+                                std::memcpy(last_frame->data(), frame.data(), 
+                                           frame.width() * frame.height() * frame.channels());
+                            }
+                        }
                         
-                        // Compare against all enrolled users
-                        for (const auto& user_model : all_users) {
-                            // Support both V1 (legacy) and V2 (multi-sample) formats
-                            if (user_model.isMultiSampleFormat()) {
-                                // V2 format: compare against all encodings with quality weighting
-                                for (size_t pose_idx = 0; pose_idx < user_model.sample_encodings.size(); ++pose_idx) {
-                                    const auto& pose_encodings = user_model.sample_encodings[pose_idx];
-                                    const auto& pose_qualities = user_model.quality_scores[pose_idx];
-                                    
-                                    for (size_t var_idx = 0; var_idx < pose_encodings.size(); ++var_idx) {
-                                        // Skip low-quality encodings
-                                        if (pose_qualities[var_idx] < min_quality_threshold) {
-                                            continue;
+                        // Use cascading detection for robust face detection across all lighting conditions
+                        // This automatically tries 3 stages: standard CLAHE, aggressive CLAHE, and fallback detector
+                        auto cascade_result = detector.detectFacesCascade(frame.view(), false, detection_confidence);
+                        
+                        if (cascade_result.faces.empty()) {
+                            if (enable_temporal_smoothing) {
+                                frame_matches.push_back(false);
+                                continue;
+                            } else {
+                                continue;  // Legacy mode: skip to next frame in outer loop
+                            }
+                        }
+                        
+                        // Log which cascade stage was used for detection
+                        if (cascade_result.stage_used > 1) {
+                            logger.debug(std::string("Face detected using cascade stage ") + 
+                                       std::to_string(cascade_result.stage_used) + 
+                                       " (brightness: " + std::to_string(cascade_result.avg_brightness) + ")");
+                            syslog(LOG_DEBUG, "pam_faceid: Cascade stage %d used (brightness: %.2f)", 
+                                   cascade_result.stage_used, cascade_result.avg_brightness);
+                        }
+                        
+                        // Encode faces using the preprocessed frame from cascade
+                        auto encodings = detector.encodeFaces(cascade_result.processed_frame.view(), 
+                                                             cascade_result.faces);
+                        if (encodings.empty()) {
+                            if (enable_temporal_smoothing) {
+                                frame_matches.push_back(false);
+                                continue;
+                            } else {
+                                continue;
+                            }
+                        }
+                        
+                        // Deduplicate faces - filter out multiple detections of the same person
+                        // This prevents false positives from the same face detected at different angles/positions
+                        auto unique_indices = FaceDetector::deduplicateFaces(cascade_result.faces, encodings, 0.15);
+                        
+                        // Filter to only unique faces
+                        std::vector<FaceEncoding> unique_encodings;
+                        for (size_t idx : unique_indices) {
+                            if (idx < encodings.size()) {
+                                unique_encodings.push_back(encodings[idx]);
+                            }
+                        }
+                        
+                        // Track if this frame matched
+                        bool frame_matched = false;
+                        
+                        // Compare detected faces against ALL users to find best match
+                        for (const auto& detected_encoding : unique_encodings) {
+                            double best_distance = 999.0;
+                            std::string best_match_user = "";
+                            
+                            // PHASE 3: Get quality-based filtering and early-exit thresholds
+                            double min_quality_threshold = config.getDouble("recognition", "min_encoding_quality").value_or(0.5);
+                            double early_exit_threshold = threshold * 0.5;  // Strong match = 50% of threshold
+                            
+                            // Compare against all enrolled users
+                            for (const auto& user_model : all_users) {
+                                // Support both V1 (legacy) and V2 (multi-sample) formats
+                                if (user_model.isMultiSampleFormat()) {
+                                    // V2 format: compare against all encodings with quality weighting
+                                    for (size_t pose_idx = 0; pose_idx < user_model.sample_encodings.size(); ++pose_idx) {
+                                        const auto& pose_encodings = user_model.sample_encodings[pose_idx];
+                                        const auto& pose_qualities = user_model.quality_scores[pose_idx];
+                                        
+                                        for (size_t var_idx = 0; var_idx < pose_encodings.size(); ++var_idx) {
+                                            // Skip low-quality encodings
+                                            if (pose_qualities[var_idx] < min_quality_threshold) {
+                                                continue;
+                                            }
+                                            
+                                            // Use quality-weighted comparison
+                                            double distance = detector.compareFacesWeighted(
+                                                detected_encoding,
+                                                pose_encodings[var_idx],
+                                                pose_qualities[var_idx]
+                                            );
+                                            
+                                            if (distance < best_distance) {
+                                                best_distance = distance;
+                                                best_match_user = user_model.username;
+                                            }
+                                            
+                                            // Early exit on strong match (significant optimization)
+                                            // Only in legacy mode (temporal smoothing disabled)
+                                            if (!enable_temporal_smoothing && distance < early_exit_threshold && user_model.username == username) {
+                                                logger.info(std::string("Strong face match (early exit) for user ") + username + 
+                                                          " (distance: " + std::to_string(distance) + 
+                                                          ", quality: " + std::to_string(pose_qualities[var_idx]) + 
+                                                          ", cascade stage: " + std::to_string(cascade_result.stage_used) + ")");
+                                                syslog(LOG_INFO, "pam_faceid: Face match success - early exit (distance: %.3f, quality: %.2f, cascade stage: %d)", 
+                                                       distance, pose_qualities[var_idx], cascade_result.stage_used);
+                                                return true;
+                                            }
                                         }
-                                        
-                                        // Use quality-weighted comparison
-                                        double distance = detector.compareFacesWeighted(
-                                            detected_encoding,
-                                            pose_encodings[var_idx],
-                                            pose_qualities[var_idx]
-                                        );
-                                        
+                                    }
+                                } else {
+                                    // V1 format (legacy): compare against encodings vector (no quality scores)
+                                    for (const auto& stored_encoding : user_model.encodings) {
+                                        double distance = detector.compareFaces(detected_encoding, stored_encoding);
                                         if (distance < best_distance) {
                                             best_distance = distance;
                                             best_match_user = user_model.username;
                                         }
-                                        
-                                        // Early exit on strong match (significant optimization)
-                                        if (distance < early_exit_threshold && user_model.username == username) {
-                                            logger.info(std::string("Strong face match (early exit) for user ") + username + 
-                                                      " (distance: " + std::to_string(distance) + 
-                                                      ", quality: " + std::to_string(pose_qualities[var_idx]) + 
-                                                      ", cascade stage: " + std::to_string(cascade_result.stage_used) + ")");
-                                            syslog(LOG_INFO, "pam_faceid: Face match success - early exit (distance: %.3f, quality: %.2f, cascade stage: %d)", 
-                                                   distance, pose_qualities[var_idx], cascade_result.stage_used);
-                                            return true;
-                                        }
-                                    }
-                                }
-                            } else {
-                                // V1 format (legacy): compare against encodings vector (no quality scores)
-                                for (const auto& stored_encoding : user_model.encodings) {
-                                    double distance = detector.compareFaces(detected_encoding, stored_encoding);
-                                    if (distance < best_distance) {
-                                        best_distance = distance;
-                                        best_match_user = user_model.username;
                                     }
                                 }
                             }
+                            
+                            // Only accept if:
+                            // 1. Distance is below threshold
+                            // 2. Best match is the current user (not another user)
+                            if (best_distance < threshold && best_match_user == username) {
+                                frame_matched = true;
+                                
+                                // Legacy mode: immediate success
+                                if (!enable_temporal_smoothing) {
+                                    logger.info(std::string("Face matched for user ") + username + 
+                                              " (distance: " + std::to_string(best_distance) + 
+                                              ", cascade stage: " + std::to_string(cascade_result.stage_used) + ")");
+                                    syslog(LOG_INFO, "pam_faceid: Face match success (distance: %.3f, cascade stage: %d)", 
+                                           best_distance, cascade_result.stage_used);
+                                    return true;
+                                }
+                                
+                                // Temporal smoothing mode: log and continue
+                                logger.debug(std::string("Frame ") + std::to_string(frame_idx + 1) + "/" + 
+                                           std::to_string(frames_to_capture) + " matched (distance: " + 
+                                           std::to_string(best_distance) + ")");
+                                break;  // Stop checking other encodings for this frame
+                            } else if (best_distance < threshold && best_match_user != username) {
+                                // Face matched a different user - log security event
+                                logger.warning(std::string("Face matched different user '") + best_match_user + 
+                                             "' instead of '" + username + "' (distance: " + 
+                                             std::to_string(best_distance) + "), rejecting authentication");
+                            }
                         }
                         
-                        // Only accept if:
-                        // 1. Distance is below threshold
-                        // 2. Best match is the current user (not another user)
-                        if (best_distance < threshold && best_match_user == username) {
-                            logger.info(std::string("Face matched for user ") + username + 
-                                      " (distance: " + std::to_string(best_distance) + 
-                                      ", cascade stage: " + std::to_string(cascade_result.stage_used) + ")");
-                            syslog(LOG_INFO, "pam_faceid: Face match success (distance: %.3f, cascade stage: %d)", 
-                                   best_distance, cascade_result.stage_used);
+                        // Record frame match result (temporal smoothing mode only)
+                        if (enable_temporal_smoothing) {
+                            frame_matches.push_back(frame_matched);
+                            
+                            // Early exit: if we have enough matches already, stop capturing frames
+                            int matches_so_far = std::count(frame_matches.begin(), frame_matches.end(), true);
+                            if (matches_so_far >= required_matches) {
+                                logger.info(std::string("Temporal smoothing: ") + std::to_string(matches_so_far) + "/" + 
+                                          std::to_string(frame_idx + 1) + " frames matched, authenticating user " + username);
+                                syslog(LOG_INFO, "pam_faceid: Temporal smoothing success (%d/%d frames matched)", 
+                                       matches_so_far, frame_idx + 1);
+                                return true;
+                            }
+                        }
+                    }
+                    
+                    // PHASE 4: Temporal smoothing final decision (after capturing all frames)
+                    if (enable_temporal_smoothing && !frame_matches.empty()) {
+                        int total_matches = std::count(frame_matches.begin(), frame_matches.end(), true);
+                        
+                        if (total_matches >= required_matches) {
+                            logger.info(std::string("Temporal smoothing: ") + std::to_string(total_matches) + "/" + 
+                                      std::to_string(frame_matches.size()) + " frames matched, authenticating user " + username);
+                            syslog(LOG_INFO, "pam_faceid: Temporal smoothing success (%d/%d frames matched)", 
+                                   total_matches, static_cast<int>(frame_matches.size()));
                             return true;
-                        } else if (best_distance < threshold && best_match_user != username) {
-                            // Face matched a different user - log security event
-                            logger.warning(std::string("Face matched different user '") + best_match_user + 
-                                         "' instead of '" + username + "' (distance: " + 
-                                         std::to_string(best_distance) + "), rejecting authentication");
+                        } else {
+                            logger.debug(std::string("Temporal smoothing: insufficient matches (") + 
+                                       std::to_string(total_matches) + "/" + 
+                                       std::to_string(frame_matches.size()) + "), continuing...");
                         }
                     }
                 }
