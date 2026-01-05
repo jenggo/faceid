@@ -997,6 +997,37 @@ double FaceDetector::compareFaces(const FaceEncoding& encoding1, const FaceEncod
     return distance;
 }
 
+// ============================================================================
+// PHASE 3: Quality-Weighted Matching
+// ============================================================================
+
+double FaceDetector::compareFacesWeighted(const FaceEncoding& test_encoding,
+                                          const FaceEncoding& stored_encoding,
+                                          float quality_score) {
+    // Calculate raw cosine distance
+    double raw_distance = compareFaces(test_encoding, stored_encoding);
+    
+    // If comparison failed (invalid encodings), return as-is
+    if (raw_distance >= 999.0) {
+        return raw_distance;
+    }
+    
+    // Apply quality weighting:
+    // Higher quality → lower effective distance (more weight)
+    // Lower quality → higher effective distance (less weight)
+    //
+    // Quality factor formula: 1.0 + quality_score
+    // - quality_score = 1.0 (perfect): factor = 2.0, distance halved (2x weight)
+    // - quality_score = 0.5 (medium): factor = 1.5, distance reduced by 33%
+    // - quality_score = 0.0 (poor): factor = 1.0, distance unchanged
+    //
+    // This gives high-quality encodings up to 2x advantage without extreme weighting
+    float quality_factor = 1.0f + quality_score;
+    double weighted_distance = raw_distance / quality_factor;
+    
+    return weighted_distance;
+}
+
 Image FaceDetector::preprocessFrame(const ImageView& frame) {
     // Handle RGBA (4 channels) - extract RGB first
     Image processed;

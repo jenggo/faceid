@@ -522,22 +522,51 @@ static bool authenticate_user(const char* username) {
                         double best_distance = 999.0;
                         std::string best_match_user = "";
                         
+                        // PHASE 3: Get quality-based filtering and early-exit thresholds
+                        double min_quality_threshold = config.getDouble("recognition", "min_encoding_quality").value_or(0.5);
+                        double early_exit_threshold = threshold * 0.5;  // Strong match = 50% of threshold
+                        
                         // Compare against all enrolled users
                         for (const auto& user_model : all_users) {
                             // Support both V1 (legacy) and V2 (multi-sample) formats
                             if (user_model.isMultiSampleFormat()) {
-                                // V2 format: compare against all encodings in sample_encodings
-                                for (const auto& pose_encodings : user_model.sample_encodings) {
-                                    for (const auto& stored_encoding : pose_encodings) {
-                                        double distance = detector.compareFaces(detected_encoding, stored_encoding);
+                                // V2 format: compare against all encodings with quality weighting
+                                for (size_t pose_idx = 0; pose_idx < user_model.sample_encodings.size(); ++pose_idx) {
+                                    const auto& pose_encodings = user_model.sample_encodings[pose_idx];
+                                    const auto& pose_qualities = user_model.quality_scores[pose_idx];
+                                    
+                                    for (size_t var_idx = 0; var_idx < pose_encodings.size(); ++var_idx) {
+                                        // Skip low-quality encodings
+                                        if (pose_qualities[var_idx] < min_quality_threshold) {
+                                            continue;
+                                        }
+                                        
+                                        // Use quality-weighted comparison
+                                        double distance = detector.compareFacesWeighted(
+                                            detected_encoding,
+                                            pose_encodings[var_idx],
+                                            pose_qualities[var_idx]
+                                        );
+                                        
                                         if (distance < best_distance) {
                                             best_distance = distance;
                                             best_match_user = user_model.username;
                                         }
+                                        
+                                        // Early exit on strong match (significant optimization)
+                                        if (distance < early_exit_threshold && user_model.username == username) {
+                                            logger.info(std::string("Strong face match (early exit) for user ") + username + 
+                                                      " (distance: " + std::to_string(distance) + 
+                                                      ", quality: " + std::to_string(pose_qualities[var_idx]) + 
+                                                      ", cascade stage: " + std::to_string(cascade_result.stage_used) + ")");
+                                            syslog(LOG_INFO, "pam_faceid: Face match success - early exit (distance: %.3f, quality: %.2f, cascade stage: %d)", 
+                                                   distance, pose_qualities[var_idx], cascade_result.stage_used);
+                                            return true;
+                                        }
                                     }
                                 }
                             } else {
-                                // V1 format (legacy): compare against encodings vector
+                                // V1 format (legacy): compare against encodings vector (no quality scores)
                                 for (const auto& stored_encoding : user_model.encodings) {
                                     double distance = detector.compareFaces(detected_encoding, stored_encoding);
                                     if (distance < best_distance) {

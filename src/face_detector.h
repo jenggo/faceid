@@ -62,6 +62,13 @@ public:
     // Compare two face encodings (cosine similarity)
     double compareFaces(const FaceEncoding& encoding1, const FaceEncoding& encoding2);
     
+    // PHASE 3: Compare face encodings with quality weighting
+    // Higher quality encodings are weighted more heavily (lower effective distance)
+    // quality_score: 0.0-1.0, where 1.0 is highest quality
+    double compareFacesWeighted(const FaceEncoding& test_encoding, 
+                                const FaceEncoding& stored_encoding,
+                                float quality_score);
+    
     // Performance: Pre-process frame for faster detection (CLAHE enhancement)
     Image preprocessFrame(const ImageView& frame);
     
