@@ -1808,6 +1808,65 @@ Image FaceDetector::applyAdaptiveCLAHE(const Image& image) {
 }
 
 // ============================================================================
+// PHASE 5: Synthetic Lighting Augmentation for Enrollment
+// ============================================================================
+
+Image FaceDetector::simulateBrightLighting(const Image& image) {
+    // Simulate bright lighting: increase brightness by 1.7x with gamma adjustment
+    // This mimics well-lit office environments or outdoor sunny conditions
+    
+    Image result = image.clone();
+    uint8_t* data = result.data();
+    int total_pixels = result.width() * result.height() * result.channels();
+    
+    // Apply brightness multiplier with saturation
+    const float brightness_factor = 1.7f;
+    
+    for (int i = 0; i < total_pixels; i++) {
+        float pixel = data[i] * brightness_factor;
+        // Clamp to 0-255 range
+        data[i] = static_cast<uint8_t>(std::min(255.0f, std::max(0.0f, pixel)));
+    }
+    
+    // Apply gamma correction to balance the brightness boost
+    // Gamma < 1.0 brightens dark areas more than bright areas
+    result = applyGammaCorrection(result, 0.8f);
+    
+    Logger::getInstance().debug("Applied bright lighting simulation (1.7x brightness, gamma=0.8)");
+    
+    return result;
+}
+
+Image FaceDetector::simulateDimLighting(const Image& image) {
+    // Simulate dim/shadow lighting: reduce brightness to 0.5x with contrast reduction
+    // This mimics low-light indoor environments or shadowed conditions
+    
+    Image result = image.clone();
+    uint8_t* data = result.data();
+    int total_pixels = result.width() * result.height() * result.channels();
+    
+    // Apply brightness reduction
+    const float brightness_factor = 0.5f;
+    
+    for (int i = 0; i < total_pixels; i++) {
+        float pixel = data[i] * brightness_factor;
+        data[i] = static_cast<uint8_t>(pixel);
+    }
+    
+    // Apply gamma correction to simulate shadow characteristics
+    // Gamma > 1.0 darkens the image with more emphasis on mid-tones
+    result = applyGammaCorrection(result, 1.3f);
+    
+    // Reduce contrast slightly to simulate diffuse lighting in shadows
+    // Apply subtle CLAHE to maintain some detail
+    result = applyAdaptiveCLAHE(result);
+    
+    Logger::getInstance().debug("Applied dim lighting simulation (0.5x brightness, gamma=1.3, contrast reduction)");
+    
+    return result;
+}
+
+// ============================================================================
 // QUICK WIN #1: Histogram Equalization (Legacy)
 // ============================================================================
 

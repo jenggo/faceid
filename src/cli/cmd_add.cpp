@@ -80,10 +80,10 @@ int cmd_add(const std::string& username, const std::string& face_id) {
         return 1;
     }
     
-    std::cout << "Models loaded successfully!" << std::endl;
-    std::cout << std::endl;
-    std::cout << "Please look at the camera and press Enter when ready..." << std::endl;
-    std::cin.get();
+     std::cout << "Models loaded successfully!" << std::endl;
+     std::cout << std::endl;
+     std::cout << "Please look at the camera and press Enter when ready..." << std::endl;
+     std::cin.get();
     
      // Create preview window with actual camera dimensions
     faceid::Display display("FaceID - Face Enrollment Preview", width, height);
@@ -108,15 +108,25 @@ int cmd_add(const std::string& username, const std::string& face_id) {
      
      // Storage for all consistency results
      struct SampleData {
-         std::vector<std::vector<float>> all_encodings;  // All 5 frames
+         std::vector<std::vector<float>> all_encodings;  // All 5 frames encodings
          std::vector<faceid::Rect> face_rects;
+         std::vector<std::shared_ptr<faceid::Image>> frames;  // PHASE 5: Frames for augmentation
          int best_frame_index;
          float quality_score;
      };
      std::vector<SampleData> all_samples;
      
+     // PHASE 5: Determine number of samples based on extended enrollment setting
+     bool enable_extended_enrollment = config.getBool("recognition", "enable_extended_enrollment").value_or(false);
+     const int num_samples = 5;  // Always capture 5 poses
+     
+     if (enable_extended_enrollment) {
+         std::cout << "Extended enrollment enabled - will generate synthetic lighting variations" << std::endl;
+         std::cout << "This improves recognition accuracy without requiring special lighting setup" << std::endl;
+         std::cout << std::endl;
+     }
+     
      // Capture and process multiple frames
-     const int num_samples = 5;
      std::vector<faceid::FaceEncoding> encodings;
      
      std::cout << "Capturing " << num_samples << " face samples..." << std::endl;
@@ -129,7 +139,11 @@ int cmd_add(const std::string& username, const std::string& face_id) {
          "(Turn head slightly left)",
          "(Turn head slightly right)",
          "(Tilt head slightly up)",
-         "(Neutral expression)"
+         "(Neutral expression)",
+         // PHASE 5: Extended enrollment lighting-specific poses
+         "(Face bright light source - e.g. desk lamp)",
+         "(Turn away from light - create shadow)",
+         "(Face window - backlit condition)"
      };
     
     for (int i = 0; i < num_samples; i++) {
@@ -328,13 +342,14 @@ int cmd_add(const std::string& username, const std::string& face_id) {
              continue;
          }
          
-         // Store all 5 encodings from this sample
-         SampleData sample_data;
-         sample_data.all_encodings = consistency_result.encodings;
-         sample_data.face_rects = consistency_result.face_rects;
-         sample_data.best_frame_index = consistency_result.best_frame_index;
-         sample_data.quality_score = consistency_result.best_quality_score;
-         all_samples.push_back(sample_data);
+          // Store all 5 encodings from this sample
+          SampleData sample_data;
+          sample_data.all_encodings = consistency_result.encodings;
+          sample_data.face_rects = consistency_result.face_rects;
+          sample_data.frames = consistency_result.frames;  // PHASE 5: Store frames
+          sample_data.best_frame_index = consistency_result.best_frame_index;
+          sample_data.quality_score = consistency_result.best_quality_score;
+          all_samples.push_back(sample_data);
          
          std::cout << "✓ OK (quality: " << std::fixed << std::setprecision(2) 
                    << (consistency_result.best_quality_score * 100) << "%, "
@@ -353,9 +368,74 @@ int cmd_add(const std::string& username, const std::string& face_id) {
      std::cout << "Successfully captured " << num_samples << " samples with " 
                << (num_samples * 5) << " total frames!" << std::endl;
      
+     // PHASE 5: Apply synthetic lighting augmentation if enabled
+     if (enable_extended_enrollment) {
+         std::cout << std::endl;
+         std::cout << "Applying synthetic lighting augmentation..." << std::endl;
+         
+         // For each pose, generate bright and dim variants from the best frame
+         std::vector<SampleData> augmented_samples;
+         
+         for (size_t pose_idx = 0; pose_idx < all_samples.size(); ++pose_idx) {
+             const auto& original_sample = all_samples[pose_idx];
+             
+             if (original_sample.frames.empty() || original_sample.best_frame_index < 0) {
+                 std::cerr << "Warning: No frames available for pose " << pose_idx << ", skipping augmentation" << std::endl;
+                 continue;
+             }
+             
+             // Get best frame for this pose
+             const auto& best_frame = original_sample.frames[original_sample.best_frame_index];
+             const auto& best_face_rect = original_sample.face_rects[original_sample.best_frame_index];
+             
+             // Generate bright variant
+             faceid::Image bright_frame = detector.simulateBrightLighting(*best_frame);
+             faceid::Image processed_bright = detector.preprocessFrame(bright_frame.view());
+             auto bright_encodings = detector.encodeFaces(processed_bright.view(), {best_face_rect});
+             
+             // Generate dim variant  
+             faceid::Image dim_frame = detector.simulateDimLighting(*best_frame);
+             faceid::Image processed_dim = detector.preprocessFrame(dim_frame.view());
+             auto dim_encodings = detector.encodeFaces(processed_dim.view(), {best_face_rect});
+             
+             if (!bright_encodings.empty() && !dim_encodings.empty()) {
+                 // Create augmented samples for this pose
+                 // Sample 1: Original
+                 augmented_samples.push_back(original_sample);
+                 
+                 // Sample 2: Bright variant (create new SampleData with 1 encoding)
+                 SampleData bright_sample;
+                 bright_sample.all_encodings = {bright_encodings[0]};
+                 bright_sample.face_rects = {best_face_rect};
+                 bright_sample.best_frame_index = 0;
+                 bright_sample.quality_score = original_sample.quality_score * 0.95f;  // Slightly lower quality
+                 augmented_samples.push_back(bright_sample);
+                 
+                 // Sample 3: Dim variant
+                 SampleData dim_sample;
+                 dim_sample.all_encodings = {dim_encodings[0]};
+                 dim_sample.face_rects = {best_face_rect};
+                 dim_sample.best_frame_index = 0;
+                 dim_sample.quality_score = original_sample.quality_score * 0.95f;
+                 augmented_samples.push_back(dim_sample);
+             } else {
+                 std::cerr << "Warning: Failed to generate synthetic variants for pose " << pose_idx << std::endl;
+                 augmented_samples.push_back(original_sample);
+             }
+         }
+         
+         // Replace original samples with augmented ones
+         all_samples = augmented_samples;
+         
+         std::cout << "✓ Generated " << all_samples.size() << " total samples (original + synthetic lighting variations)" << std::endl;
+     }
+     
+     std::cout << std::endl;
+     
      // Organize encodings in V2 format: [pose][encoding_variant]
      // Each of the 5 samples represents a different pose/head position
      // Each sample has 5 encoding variants (the 5 consecutive frames captured)
+     // With extended enrollment: 15 samples (5 poses × 3 lighting conditions)
      std::vector<std::vector<FaceEncoding>> sample_encodings;
      std::vector<std::vector<float>> quality_scores;
      

@@ -220,6 +220,20 @@ public:
     Image applyAdaptiveCLAHE(const Image& image);
     
     // ========================================================================
+    // PHASE 5: Synthetic Lighting Augmentation for Enrollment
+    // ========================================================================
+    // Generate synthetic lighting variations for robust enrollment
+    // These simulate different lighting conditions without requiring physical setup
+    
+    // Simulate bright lighting (1.5-2x brightness with gamma adjustment)
+    // Simulates enrollment in well-lit office or outdoor conditions
+    Image simulateBrightLighting(const Image& image);
+    
+    // Simulate dim/shadow lighting (0.4-0.6x brightness with contrast reduction)
+    // Simulates enrollment in low-light or shadowed conditions
+    Image simulateDimLighting(const Image& image);
+    
+    // ========================================================================
     // QUICK WIN #2: Face Quality Assessment
     // ========================================================================
     // Evaluates face image quality based on blur, size, brightness, and detector confidence

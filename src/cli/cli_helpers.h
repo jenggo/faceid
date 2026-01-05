@@ -87,6 +87,7 @@ struct ConsistencyResult {
     bool is_consistent;                        // Overall success
     std::vector<std::vector<float>> encodings; // All 5 consecutive encodings
     std::vector<Rect> face_rects;             // All 5 face rectangles
+    std::vector<std::shared_ptr<Image>> frames; // PHASE 5: Captured frames for augmentation
     std::vector<float> distances;             // Distances between consecutive pairs (size=4)
     int best_frame_index;                     // Index of best quality frame (0-4)
     float best_quality_score;                 // Quality score of best frame
@@ -435,6 +436,12 @@ static inline ConsistencyResult validateFrameConsistency(
                             result.best_quality_score = quality_score;
                             result.best_frame_index = i;
                         }
+                    }
+                    
+                    // PHASE 5: Transfer captured frames to result for synthetic augmentation
+                    result.frames.reserve(captured_frames.size());
+                    for (auto& frame : captured_frames) {
+                        result.frames.push_back(std::make_shared<Image>(std::move(frame)));
                     }
                     
                     break;  // Success!
