@@ -233,7 +233,15 @@ int main(int argc, char* argv[]) {
                         continue;  // Skip if testing specific user
                     }
                     
-                    for (const auto& stored_encoding : model.encodings) {
+                    // Flatten sample_encodings for matching (V2 format)
+                    std::vector<FaceEncoding> model_flat_encodings;
+                    for (const auto& pose_encodings : model.sample_encodings) {
+                        model_flat_encodings.insert(model_flat_encodings.end(),
+                                                   pose_encodings.begin(),
+                                                   pose_encodings.end());
+                    }
+                    
+                    for (const auto& stored_encoding : model_flat_encodings) {
                         double distance = detector.compareFaces(stored_encoding, encodings[i]);
                         if (distance < best_distance) {
                             best_distance = distance;

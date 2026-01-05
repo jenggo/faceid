@@ -90,11 +90,17 @@ bool ModelCache::loadUserModel(const std::string& username, BinaryFaceModel& mod
     for (const auto& filepath : files) {
         BinaryFaceModel file_model;
         if (BinaryModelLoader::loadUserModel(filepath, file_model) && file_model.valid) {
-            // Merge encodings
-            merged_model.encodings.insert(
-                merged_model.encodings.end(),
-                file_model.encodings.begin(),
-                file_model.encodings.end()
+            // Merge V2 format (sample_encodings and quality_scores)
+            merged_model.sample_encodings.insert(
+                merged_model.sample_encodings.end(),
+                file_model.sample_encodings.begin(),
+                file_model.sample_encodings.end()
+            );
+            
+            merged_model.quality_scores.insert(
+                merged_model.quality_scores.end(),
+                file_model.quality_scores.begin(),
+                file_model.quality_scores.end()
             );
             
             // Merge face_ids
@@ -113,7 +119,7 @@ bool ModelCache::loadUserModel(const std::string& username, BinaryFaceModel& mod
         }
     }
     
-    if (merged_model.valid && !merged_model.encodings.empty()) {
+    if (merged_model.valid && !merged_model.sample_encodings.empty()) {
         model = merged_model;
         cache_[username] = merged_model;
         return true;

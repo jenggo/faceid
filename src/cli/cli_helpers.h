@@ -17,6 +17,12 @@
 
 namespace faceid {
 
+// Struct to hold optimization results from camera analysis
+struct OptimizationResult {
+    float detection_confidence;  // Optimal detection confidence threshold
+    float min_face_quality;      // Minimum achievable face quality from camera
+};
+
 // Helper: Calculate cosine distance between two face encodings
 static inline float cosineDistance(const std::vector<float>& vec1, const std::vector<float>& vec2) {
     float dot = 0.0f;
@@ -106,21 +112,25 @@ static inline float getConsistencyThreshold(const FaceDetector& detector) {
     std::transform(model_lower.begin(), model_lower.end(), model_lower.begin(), ::tolower);
     
     // Model-specific thresholds based on typical intra-person distances
+    // NOTE: These are more relaxed than before to account for:
+    // - Cascade detection using different preprocessing stages
+    // - Natural variance in face position/expression between frames
+    // - V2 format with multiple encodings per pose
     if (model_lower.find("sface") != std::string::npos) {
-        return 0.12f;  // SFace (128D) - very tight clustering
+        return 0.18f;  // SFace (128D) - increased from 0.12 for better capture success
     } else if (model_lower.find("mobilefacenet") != std::string::npos || 
                model_lower.find("mobilenet") != std::string::npos) {
-        return 0.15f;  // MobileFaceNet (192D)
+        return 0.20f;  // MobileFaceNet (192D) - increased from 0.15
     } else if (model_lower.find("arcface") != std::string::npos && 
                model_lower.find("r34") != std::string::npos) {
-        return 0.18f;  // ArcFace ResNet-34 (256D)
+        return 0.22f;  // ArcFace ResNet-34 (256D) - increased from 0.18
     } else if (model_lower.find("glint360k") != std::string::npos || 
                model_lower.find("webface") != std::string::npos) {
-        return 0.20f;  // Glint360K/WebFace (512D) - larger models have more variance
+        return 0.25f;  // Glint360K/WebFace (512D) - increased from 0.20
     }
     
     // Default: conservative threshold for unknown models
-    return 0.15f;
+    return 0.20f;  // Increased from 0.15
 }
 
 // Calculate sharpness using Laplacian variance
@@ -309,7 +319,8 @@ static inline ConsistencyResult validateFrameConsistency(
     const std::string& prompt,
     int num_samples,
     float optimal_confidence,
-    int tracking_interval
+    int tracking_interval,
+    float min_quality_override = 0.70f  // Camera-adaptive quality threshold
 ) {
     ConsistencyResult result = {};
     result.is_consistent = false;
@@ -318,14 +329,14 @@ static inline ConsistencyResult validateFrameConsistency(
     result.best_frame_index = -1;
     result.best_quality_score = 0.0f;
     
-    const int MAX_ATTEMPTS = 150;  // 150 frames * 50ms = 7.5 seconds timeout
+    const int MAX_ATTEMPTS = 300;  // 300 frames * 50ms = 15 seconds timeout (increased for better UX)
     const int REQUIRED_FRAMES = 5;
     
     float current_threshold = base_threshold;
     int relax_count = 0;
     const int MAX_RELAX = 3;
-    const float RELAX_FACTOR = 1.25f;
-    const float MAX_RELAX_FACTOR = 1.5f;
+    const float RELAX_FACTOR = 1.30f;  // Increased from 1.25 for faster relaxation
+    const float MAX_RELAX_FACTOR = 2.0f;  // Increased from 1.5 to allow more relaxation
     
     std::vector<faceid::Image> captured_frames;
     
@@ -339,9 +350,25 @@ static inline ConsistencyResult validateFrameConsistency(
             continue;
         }
         
-        // Preprocess and detect
+        // Temporarily use basic detection instead of cascade for debugging
+        // TODO: Fix cascade detection + encoding coordinate mismatch
         faceid::Image processed_frame = detector.preprocessFrame(frame.view());
-        auto faces = detector.detectOrTrackFaces(processed_frame.view(), tracking_interval, optimal_confidence);
+        auto faces = detector.detectFaces(processed_frame.view(), false, optimal_confidence);
+        
+        // DEBUG: Log detection failures
+        static int no_face_count = 0;
+        static int multi_face_count = 0;
+        if (faces.empty()) {
+            no_face_count++;
+            if (no_face_count % 10 == 0) {
+                std::cout << "\r  [DEBUG] No face detected (count: " << no_face_count << ")   " << std::flush;
+            }
+        } else if (faces.size() > 1) {
+            multi_face_count++;
+            if (multi_face_count % 10 == 0) {
+                std::cout << "\r  [DEBUG] Multiple faces (" << faces.size() << ", count: " << multi_face_count << ")   " << std::flush;
+            }
+        }
         
         // Only proceed if exactly 1 face detected
         if (faces.size() != 1) {
@@ -379,9 +406,27 @@ static inline ConsistencyResult validateFrameConsistency(
             continue;
         }
         
-        // Encode face
-        auto encodings = detector.encodeFaces(processed_frame.view(), faces);
+        // Encode face using the PROCESSED frame (same as detection)
+        // The face rectangles are in processed_frame coordinates, so we must use
+        // processed_frame for encoding to match the coordinate space
+        // Use camera-adaptive quality threshold instead of config default
+        auto encodings = detector.encodeFaces(processed_frame.view(), faces, min_quality_override);
         if (encodings.empty()) {
+            static int encoding_fail_count = 0;
+            encoding_fail_count++;
+            if (encoding_fail_count % 10 == 0) {
+                std::cout << "\r  [DEBUG] Encoding failed (count: " << encoding_fail_count 
+                          << ") - Check /var/log/faceid.log for details   " << std::flush;
+            }
+            
+            // Add extra debug: print face rect to understand the issue
+            if (encoding_fail_count == 1 || encoding_fail_count % 100 == 0) {
+                std::cout << std::endl << "  [DEBUG] Face rect: x=" << faces[0].x 
+                          << " y=" << faces[0].y 
+                          << " w=" << faces[0].width 
+                          << " h=" << faces[0].height 
+                          << " (frame: " << frame.width() << "x" << frame.height() << ")" << std::endl;
+            }
             continue;
         }
         
@@ -397,6 +442,11 @@ static inline ConsistencyResult validateFrameConsistency(
         } else {
             // Check consistency with previous frame
             float distance = cosineDistance(result.encodings.back(), encoding);
+            
+            // DEBUG: Log the distance to understand why it's failing
+            std::cout << "\r  Distance: " << std::fixed << std::setprecision(3) 
+                      << distance << " (threshold: " << current_threshold 
+                      << ", frames: " << result.frames_captured << "/5)   " << std::flush;
             
             if (distance < current_threshold) {
                 // Consistent! Add to collection
@@ -455,7 +505,8 @@ static inline ConsistencyResult validateFrameConsistency(
                 captured_frames.clear();
                 
                 // Check for timeout and auto-relax (silent)
-                if (result.total_attempts > 50 * (relax_count + 1)) {
+                // Relax sooner (every 30 attempts instead of 50) for better UX
+                if (result.total_attempts > 30 * (relax_count + 1)) {
                     relax_count++;
                     float new_threshold = base_threshold * std::pow(RELAX_FACTOR, relax_count);
                     if (new_threshold <= base_threshold * MAX_RELAX_FACTOR) {
@@ -523,9 +574,10 @@ static inline ConsistencyResult validateFrameConsistency(
 
 // Helper: Find optimal detection confidence from camera feed
 // Analyzes 10-15 frames and also validates camera quality
+// Returns struct with detection confidence AND minimum achievable face quality
 // NOTE: This is used during enrollment (faceid add) where the two-phase capture
 // already handles waiting for face detection. Don't call this directly from test command.
-static inline float findOptimalDetectionConfidence(Camera& camera, FaceDetector& detector, Display& display) {
+static inline OptimizationResult findOptimalDetectionConfidence(Camera& camera, FaceDetector& detector, Display& display) {
     std::cout << std::endl;
     std::cout << "=== Auto-Detecting Optimal Settings ===" << std::endl;
     std::cout << "Analyzing camera conditions and finding best detection settings..." << std::endl;
@@ -563,7 +615,7 @@ static inline float findOptimalDetectionConfidence(Camera& camera, FaceDetector&
     
     if (frames.empty()) {
         std::cerr << "Failed to capture frames for confidence analysis" << std::endl;
-        return -1.0f;
+        return {-1.0f, 0.70f};  // Return default quality threshold
     }
     
     std::cout << "Captured " << frames.size() << " frames, analyzing..." << std::endl;
@@ -577,6 +629,7 @@ static inline float findOptimalDetectionConfidence(Camera& camera, FaceDetector&
     std::vector<float> contrast_values;
     std::vector<float> encoding_norms;
     std::vector<float> sharpness_values;
+    std::vector<float> face_quality_scores;  // NEW: Collect actual face quality scores
     
     // Helper lambda to count valid faces at a given confidence across all frames
     auto countValidFacesMultiFrame = [&](float conf) -> std::pair<int, int> {
@@ -585,7 +638,10 @@ static inline float findOptimalDetectionConfidence(Camera& camera, FaceDetector&
         
         for (size_t f = 0; f < processed_frames.size(); f++) {
             auto faces = detector.detectFaces(processed_frames[f].view(), false, conf);
-            auto encodings = detector.encodeFaces(processed_frames[f].view(), faces);
+            // Disable quality filtering (0.0) to collect ALL faces regardless of quality
+            // Collect actual quality scores via out_quality_scores parameter
+            std::vector<float> frame_quality_scores;
+            auto encodings = detector.encodeFaces(processed_frames[f].view(), faces, 0.0, &frame_quality_scores);
             
             int valid_count = 0;
             for (size_t i = 0; i < faces.size(); i++) {
@@ -602,6 +658,11 @@ static inline float findOptimalDetectionConfidence(Camera& camera, FaceDetector&
                         contrast_values.push_back(metrics.contrast);
                         encoding_norms.push_back(metrics.encoding_norm);
                         sharpness_values.push_back(metrics.sharpness);
+                        
+                        // Collect actual face quality score if available
+                        if (i < frame_quality_scores.size()) {
+                            face_quality_scores.push_back(frame_quality_scores[i]);
+                        }
                     }
                 }
             }
@@ -719,19 +780,52 @@ static inline float findOptimalDetectionConfidence(Camera& camera, FaceDetector&
             if (avg_sharpness < 50.0f) {
                 std::cout << "⚠ Low sharpness - check camera focus or clean lens" << std::endl;
             }
+            
+            // Calculate minimum achievable face quality from ACTUAL observed values
+            float estimated_min_quality = 0.50f;  // Default fallback
+            
+            if (!face_quality_scores.empty()) {
+                // Use the minimum observed quality score as baseline
+                float min_observed_quality = *std::min_element(face_quality_scores.begin(), 
+                                                                face_quality_scores.end());
+                // Subtract 5% safety margin to handle slight variations
+                estimated_min_quality = std::max(0.20f, min_observed_quality - 0.05f);
+                
+                std::cout << std::endl;
+                std::cout << "Face quality analysis: min=" << std::fixed << std::setprecision(3) 
+                          << min_observed_quality << " samples=" << face_quality_scores.size() << std::endl;
+                std::cout << "Adapting quality threshold: " << std::fixed << std::setprecision(2) 
+                          << estimated_min_quality << " (config default: 0.70)" << std::endl;
+            } else {
+                // Fallback: Use heuristic based on brightness/contrast
+                estimated_min_quality = 0.40f + (avg_brightness * 0.30f) + (avg_contrast * 0.20f);
+                estimated_min_quality = std::max(0.20f, estimated_min_quality - 0.10f);
+                
+                std::cout << std::endl;
+                std::cout << "Adapting quality threshold (heuristic): " << std::fixed << std::setprecision(2) 
+                          << estimated_min_quality << " (default: 0.70)" << std::endl;
+            }
+            
+            std::cout << std::endl;
+            std::cout << "Proceeding with enrollment..." << std::endl;
+            return {found_confidence, estimated_min_quality};
         }
         
+        // No quality metrics collected or calculation failed, use sensible enrollment default
+        // Based on testing, real cameras produce quality ~0.50-0.55, while config default is 0.70
+        // Use 0.50 which is more realistic for enrollment
         std::cout << std::endl;
         std::cout << "Proceeding with enrollment..." << std::endl;
+        std::cout << "Using adaptive quality threshold: 0.50 (config default: 0.70)" << std::endl;
+        return {found_confidence, 0.50f};  // Lower threshold for enrollment
     } else {
         std::cerr << "⚠ Could not auto-detect optimal confidence" << std::endl;
         std::cerr << "  Using default value (0.8 for " << detector.getDetectionModelType() << ")" << std::endl;
         
         // Set reasonable default based on model type
         found_confidence = 0.8f;  // RetinaFace, YuNet, YOLOv5/v7/v8-Face
+        return {found_confidence, 0.50f};  // Use realistic enrollment threshold
     }
-    
-    return found_confidence;
 }
 
 // Helper: Update config file with new confidence and threshold values

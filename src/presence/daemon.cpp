@@ -289,12 +289,22 @@ namespace {
                     }
                     
                     // Calculate max intra-user distance (distance between user's own faces)
+                    // V2 format: iterate through sample_encodings (poses) and quality_scores
                     float max_intra_distance = 0.0f;
                     for (const auto& user_model : all_users) {
-                        for (size_t i = 0; i < user_model.encodings.size(); i++) {
-                            for (size_t j = i + 1; j < user_model.encodings.size(); j++) {
-                                double dist = detector.compareFaces(user_model.encodings[i], 
-                                                                    user_model.encodings[j]);
+                        // Flatten all encodings from all poses for comparison
+                        std::vector<faceid::FaceEncoding> all_encodings;
+                        for (const auto& pose_encodings : user_model.sample_encodings) {
+                            all_encodings.insert(all_encodings.end(), 
+                                               pose_encodings.begin(), 
+                                               pose_encodings.end());
+                        }
+                        
+                        // Compare all pairs
+                        for (size_t i = 0; i < all_encodings.size(); i++) {
+                            for (size_t j = i + 1; j < all_encodings.size(); j++) {
+                                double dist = detector.compareFaces(all_encodings[i], 
+                                                                    all_encodings[j]);
                                 if (dist > max_intra_distance) {
                                     max_intra_distance = dist;
                                 }

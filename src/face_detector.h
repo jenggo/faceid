@@ -57,7 +57,9 @@ public:
     
     // Encode faces using SFace
     std::vector<FaceEncoding> encodeFaces(const ImageView& frame,
-                                          const std::vector<Rect>& face_locations);
+                                          const std::vector<Rect>& face_locations,
+                                          double min_quality_override = -1.0,
+                                          std::vector<float>* out_quality_scores = nullptr);
     
     // Compare two face encodings (cosine similarity)
     double compareFaces(const FaceEncoding& encoding1, const FaceEncoding& encoding2);
@@ -193,14 +195,6 @@ public:
         double similarity_threshold = 0.15  // Faces with distance < 0.15 are considered same person
     );
 
-
-    // ========================================================================
-    // QUICK WIN #1: Histogram Equalization
-    // ========================================================================
-    // Normalizes lighting variations on aligned face crops before encoding
-    // Expected improvement: 1-2% accuracy gain, ~1ms overhead
-    static Image normalizeImageHistogram(const Image& face_image);
-    
     // ========================================================================
     // PHASE 2: Adaptive Preprocessing for Variable Lighting
     // ========================================================================

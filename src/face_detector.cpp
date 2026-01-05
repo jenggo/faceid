@@ -14,6 +14,7 @@
 #include <cmath>
 #include <fstream>
 #include <sstream>
+#include <iostream>
 #include <regex>
 #include <dirent.h>
 #include <memory>
@@ -781,7 +782,9 @@ bbox_fallback:
 
 std::vector<FaceEncoding> FaceDetector::encodeFaces(
     const ImageView& frame,
-    const std::vector<Rect>& face_locations) {
+    const std::vector<Rect>& face_locations,
+    double min_quality_override,
+    std::vector<float>* out_quality_scores) {
     
     if (!models_loaded_ || face_locations.empty()) {
         if (!models_loaded_) {
@@ -854,19 +857,21 @@ std::vector<FaceEncoding> FaceDetector::encodeFaces(
             Logger::getInstance().debug("Adaptive CLAHE applied to face " + std::to_string(idx));
         }
         
-        // QUICK WIN #1: Legacy histogram equalization (optional, now redundant with CLAHE)
-        if (Config::getInstance().getBool("recognition", "enable_histogram_eq").value_or(false)) {
-            aligned = normalizeImageHistogram(aligned);
-            Logger::getInstance().debug("Legacy histogram equalization applied to face " + std::to_string(idx));
-        }
-        
         // QUICK WIN #2: Assess face quality and skip low-quality faces
-        double min_quality = Config::getInstance().getDouble("recognition", "min_face_quality")
+        // Use override if provided (for enrollment auto-detection), otherwise use config
+        // Note: -1.0 means "use config", 0.0 means "accept all", >0 means specific threshold
+        double min_quality = (min_quality_override >= 0.0) ? min_quality_override :
+                             Config::getInstance().getDouble("recognition", "min_face_quality")
                              .value_or(0.70);
         bool debug_quality = Config::getInstance().getBool("recognition", "debug_face_quality")
                              .value_or(false);
         
         FaceQuality quality = assessFaceQuality(aligned, face_rect, frame.width(), 1.0f);
+        
+        // Store quality score if requested (even if face will be rejected)
+        if (out_quality_scores) {
+            out_quality_scores->push_back(quality.overall_score);
+        }
         
         if (debug_quality) {
             char buf[256];
@@ -878,9 +883,12 @@ std::vector<FaceEncoding> FaceDetector::encodeFaces(
         }
         
         if (quality.overall_score < min_quality) {
-            Logger::getInstance().debug("Face " + std::to_string(idx) + " skipped - low quality: " + 
-                                       std::to_string(quality.overall_score) + " < " +
-                                       std::to_string(min_quality));
+            std::string msg = "Face " + std::to_string(idx) + " skipped - low quality: " + 
+                             std::to_string(quality.overall_score) + " < " +
+                             std::to_string(min_quality);
+            Logger::getInstance().debug(msg);
+            // Debug output disabled - check /var/log/faceid.log if needed
+            // std::cerr << "[ENROLLMENT DEBUG] " << msg << std::endl;
             continue;
         }
         Logger::getInstance().debug("Aligned face to " + std::to_string(aligned.width()) + "x" + std::to_string(aligned.height()));
@@ -909,7 +917,9 @@ std::vector<FaceEncoding> FaceDetector::encodeFaces(
         if (ret != 0) {
             // Inference failed - skip this face
             // This can happen with corrupted models or invalid input
-            Logger::getInstance().debug("NCNN inference FAILED with ret=" + std::to_string(ret));
+            std::string msg = "NCNN inference FAILED with ret=" + std::to_string(ret);
+            Logger::getInstance().debug(msg);
+            // std::cerr << "[ENROLLMENT DEBUG] " << msg << std::endl;
             continue;
         }
         
@@ -919,8 +929,10 @@ std::vector<FaceEncoding> FaceDetector::encodeFaces(
         // Validate output dimensions (check against detected model dimension)
         if (out.w != static_cast<int>(current_encoding_dim_) || out.h != 1 || out.c != 1) {
             // Unexpected output dimensions - skip this face
-            Logger::getInstance().debug("Output dimensions INVALID: expected w=" + std::to_string(current_encoding_dim_) + 
-                " h=1 c=1, got w=" + std::to_string(out.w) + " h=" + std::to_string(out.h) + " c=" + std::to_string(out.c));
+            std::string msg = "Output dimensions INVALID: expected w=" + std::to_string(current_encoding_dim_) + 
+                " h=1 c=1, got w=" + std::to_string(out.w) + " h=" + std::to_string(out.h) + " c=" + std::to_string(out.c);
+            Logger::getInstance().debug(msg);
+            // std::cerr << "[ENROLLMENT DEBUG] " << msg << std::endl;
             continue;
         }
         
@@ -1864,62 +1876,6 @@ Image FaceDetector::simulateDimLighting(const Image& image) {
     Logger::getInstance().debug("Applied dim lighting simulation (0.5x brightness, gamma=1.3, contrast reduction)");
     
     return result;
-}
-
-// ============================================================================
-// QUICK WIN #1: Histogram Equalization (Legacy)
-// ============================================================================
-
-Image FaceDetector::normalizeImageHistogram(const Image& face_image) {
-    // Convert to grayscale if needed
-    Image work_img;
-    if (face_image.channels() == 3) {
-        work_img = toGrayscale(face_image.data(), face_image.width(), 
-                               face_image.height(), face_image.stride());
-    } else if (face_image.channels() == 1) {
-        work_img = face_image.clone();
-    } else {
-        return face_image.clone();  // Unsupported format
-    }
-
-    int width = work_img.width();
-    int height = work_img.height();
-    uint8_t* data = work_img.data();
-    int total_pixels = width * height;
-    
-    // Compute histogram
-    std::vector<int> histogram(256, 0);
-    for (int i = 0; i < total_pixels; i++) {
-        histogram[data[i]]++;
-    }
-    
-    // Compute cumulative distribution function (CDF)
-    std::vector<uint8_t> lut(256);
-    int sum = 0;
-    for (int i = 0; i < 256; i++) {
-        sum += histogram[i];
-        lut[i] = static_cast<uint8_t>((sum * 255) / total_pixels);
-    }
-    
-    // Apply histogram equalization
-    for (int i = 0; i < total_pixels; i++) {
-        data[i] = lut[data[i]];
-    }
-    
-    // Convert back to BGR if original was color
-    if (face_image.channels() == 3) {
-        Image result(width, height, 3);
-        uint8_t* result_data = result.data();
-        
-        for (int i = 0; i < total_pixels; i++) {
-            result_data[i * 3 + 0] = data[i];  // B
-            result_data[i * 3 + 1] = data[i];  // G
-            result_data[i * 3 + 2] = data[i];  // R
-        }
-        return result;
-    }
-    
-    return work_img;
 }
 
 // ============================================================================

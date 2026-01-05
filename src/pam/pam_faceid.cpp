@@ -526,8 +526,9 @@ static bool authenticate_user(const char* username) {
                         }
                         
                         // Encode faces using the preprocessed frame from cascade
+                        // Use adaptive quality threshold (0.50) matching enrollment behavior
                         auto encodings = detector.encodeFaces(cascade_result.processed_frame.view(), 
-                                                             cascade_result.faces);
+                                                             cascade_result.faces, 0.50);
                         if (encodings.empty()) {
                             if (enable_temporal_smoothing) {
                                 frame_matches.push_back(false);
@@ -561,53 +562,41 @@ static bool authenticate_user(const char* username) {
                             double min_quality_threshold = config.getDouble("recognition", "min_encoding_quality").value_or(0.5);
                             double early_exit_threshold = threshold * 0.5;  // Strong match = 50% of threshold
                             
-                            // Compare against all enrolled users
+                            // Compare against all enrolled users (V2 format only)
                             for (const auto& user_model : all_users) {
-                                // Support both V1 (legacy) and V2 (multi-sample) formats
-                                if (user_model.isMultiSampleFormat()) {
-                                    // V2 format: compare against all encodings with quality weighting
-                                    for (size_t pose_idx = 0; pose_idx < user_model.sample_encodings.size(); ++pose_idx) {
-                                        const auto& pose_encodings = user_model.sample_encodings[pose_idx];
-                                        const auto& pose_qualities = user_model.quality_scores[pose_idx];
-                                        
-                                        for (size_t var_idx = 0; var_idx < pose_encodings.size(); ++var_idx) {
-                                            // Skip low-quality encodings
-                                            if (pose_qualities[var_idx] < min_quality_threshold) {
-                                                continue;
-                                            }
-                                            
-                                            // Use quality-weighted comparison
-                                            double distance = detector.compareFacesWeighted(
-                                                detected_encoding,
-                                                pose_encodings[var_idx],
-                                                pose_qualities[var_idx]
-                                            );
-                                            
-                                            if (distance < best_distance) {
-                                                best_distance = distance;
-                                                best_match_user = user_model.username;
-                                            }
-                                            
-                                            // Early exit on strong match (significant optimization)
-                                            // Only in legacy mode (temporal smoothing disabled)
-                                            if (!enable_temporal_smoothing && distance < early_exit_threshold && user_model.username == username) {
-                                                logger.info(std::string("Strong face match (early exit) for user ") + username + 
-                                                          " (distance: " + std::to_string(distance) + 
-                                                          ", quality: " + std::to_string(pose_qualities[var_idx]) + 
-                                                          ", cascade stage: " + std::to_string(cascade_result.stage_used) + ")");
-                                                syslog(LOG_INFO, "pam_faceid: Face match success - early exit (distance: %.3f, quality: %.2f, cascade stage: %d)", 
-                                                       distance, pose_qualities[var_idx], cascade_result.stage_used);
-                                                return true;
-                                            }
+                                // V2 format: compare against all encodings with quality weighting
+                                for (size_t pose_idx = 0; pose_idx < user_model.sample_encodings.size(); ++pose_idx) {
+                                    const auto& pose_encodings = user_model.sample_encodings[pose_idx];
+                                    const auto& pose_qualities = user_model.quality_scores[pose_idx];
+                                    
+                                    for (size_t var_idx = 0; var_idx < pose_encodings.size(); ++var_idx) {
+                                        // Skip low-quality encodings
+                                        if (pose_qualities[var_idx] < min_quality_threshold) {
+                                            continue;
                                         }
-                                    }
-                                } else {
-                                    // V1 format (legacy): compare against encodings vector (no quality scores)
-                                    for (const auto& stored_encoding : user_model.encodings) {
-                                        double distance = detector.compareFaces(detected_encoding, stored_encoding);
+                                        
+                                        // Use quality-weighted comparison
+                                        double distance = detector.compareFacesWeighted(
+                                            detected_encoding,
+                                            pose_encodings[var_idx],
+                                            pose_qualities[var_idx]
+                                        );
+                                        
                                         if (distance < best_distance) {
                                             best_distance = distance;
                                             best_match_user = user_model.username;
+                                        }
+                                        
+                                        // Early exit on strong match (significant optimization)
+                                        // Only in legacy mode (temporal smoothing disabled)
+                                        if (!enable_temporal_smoothing && distance < early_exit_threshold && user_model.username == username) {
+                                            logger.info(std::string("Strong face match (early exit) for user ") + username + 
+                                                      " (distance: " + std::to_string(distance) + 
+                                                      ", quality: " + std::to_string(pose_qualities[var_idx]) + 
+                                                      ", cascade stage: " + std::to_string(cascade_result.stage_used) + ")");
+                                            syslog(LOG_INFO, "pam_faceid: Face match success - early exit (distance: %.3f, quality: %.2f, cascade stage: %d)", 
+                                                   distance, pose_qualities[var_idx], cascade_result.stage_used);
+                                            return true;
                                         }
                                     }
                                 }

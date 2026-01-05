@@ -93,8 +93,10 @@ int cmd_add(const std::string& username, const std::string& face_id) {
     std::cout << "   Press 'q' in the preview window to cancel" << std::endl;
     std::cout << std::endl;
     
-    // Step 1: Auto-detect optimal detection confidence
-    float optimal_confidence = findOptimalDetectionConfidence(camera, detector, display);
+    // Step 1: Auto-detect optimal detection confidence and quality threshold
+    faceid::OptimizationResult optimization = findOptimalDetectionConfidence(camera, detector, display);
+    float optimal_confidence = optimization.detection_confidence;
+    float min_quality_threshold = optimization.min_face_quality;
     if (optimal_confidence < 0.0f) {
         std::cerr << "Failed to determine optimal confidence" << std::endl;
         return 1;
@@ -332,7 +334,8 @@ int cmd_add(const std::string& username, const std::string& face_id) {
              prompts[i],
              num_samples,
              optimal_confidence,
-             tracking_interval
+             tracking_interval,
+             min_quality_threshold  // Pass camera-adaptive quality
          );
          
          if (!consistency_result.is_consistent) {

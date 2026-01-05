@@ -44,7 +44,11 @@ int cmd_list(const std::string& username) {
                     }
                 }
                 
-                int samples = model.encodings.size();
+                // V2 format: count total encodings across all poses
+                int samples = 0;
+                for (const auto& pose_encodings : model.sample_encodings) {
+                    samples += pose_encodings.size();
+                }
                 
                 std::cout << "  " << face_id;
                 std::cout << " (" << samples << " samples";

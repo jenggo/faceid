@@ -40,15 +40,28 @@ static bool hasInvalidValues(const std::vector<float>& vec) {
 static bool checkEncodingIntegrity(const BinaryFaceModel& model, const FaceDetector& detector, bool verbose = true) {
     if (verbose) {
         std::cout << "\n=== Encoding Integrity Check ===" << std::endl;
-        std::cout << "Total encodings: " << model.encodings.size() << std::endl;
+        // V2 format: count total encodings across all poses
+        int total_encodings = 0;
+        for (const auto& pose_encodings : model.sample_encodings) {
+            total_encodings += pose_encodings.size();
+        }
+        std::cout << "Total encodings: " << total_encodings << std::endl;
     }
     
     bool has_issues = false;
     size_t current_model_dim = detector.getEncodingDimension();
     
+    // Flatten all encodings for checking
+    std::vector<FaceEncoding> all_encodings;
+    for (const auto& pose_encodings : model.sample_encodings) {
+        all_encodings.insert(all_encodings.end(), 
+                           pose_encodings.begin(), 
+                           pose_encodings.end());
+    }
+    
     // Check 1: Normalization
     bool all_normalized = true;
-    for (const auto& enc : model.encodings) {
+    for (const auto& enc : all_encodings) {
         float norm = calculateNorm(enc);
         if (std::abs(norm - 1.0f) > 0.01f) {
             all_normalized = false;
@@ -67,7 +80,7 @@ static bool checkEncodingIntegrity(const BinaryFaceModel& model, const FaceDetec
     
     // Check 2: Invalid values (NaN/Inf)
     bool has_invalid = false;
-    for (const auto& enc : model.encodings) {
+    for (const auto& enc : all_encodings) {
         if (hasInvalidValues(enc)) {
             has_invalid = true;
             break;
@@ -85,7 +98,7 @@ static bool checkEncodingIntegrity(const BinaryFaceModel& model, const FaceDetec
     // Check 3: Size validation - check against current model dimension
     bool all_valid_size = true;
     size_t expected_dim = current_model_dim;
-    for (const auto& enc : model.encodings) {
+    for (const auto& enc : all_encodings) {
         if (enc.size() != expected_dim) {
             all_valid_size = false;
             break;
@@ -96,7 +109,7 @@ static bool checkEncodingIntegrity(const BinaryFaceModel& model, const FaceDetec
         std::cout << "✗ CRITICAL: Some encodings have incorrect dimensions" << std::endl;
         std::cout << "  Expected: " << expected_dim << "D vectors (current model: " 
                   << detector.getModelName() << ")" << std::endl;
-        std::cout << "  Found: " << (model.encodings.empty() ? 0 : model.encodings[0].size()) << "D vectors" << std::endl;
+        std::cout << "  Found: " << (all_encodings.empty() ? 0 : all_encodings[0].size()) << "D vectors" << std::endl;
         std::cout << "  Solution: Re-enroll with 'sudo faceid add " << model.username << "'" << std::endl;
         has_issues = true;
     } else if (verbose) {
@@ -104,8 +117,8 @@ static bool checkEncodingIntegrity(const BinaryFaceModel& model, const FaceDetec
     }
     
     // Check 4: Self-similarity (optional, detailed check)
-    if (verbose && model.encodings.size() > 0) {
-        float self_dist = cosineDistance(model.encodings[0], model.encodings[0]);
+    if (verbose && all_encodings.size() > 0) {
+        float self_dist = cosineDistance(all_encodings[0], all_encodings[0]);
         if (self_dist > 0.01f) {
             std::cout << "⚠ WARNING: Self-distance is " << self_dist << " (should be ~0.0)" << std::endl;
             has_issues = true;
@@ -225,16 +238,24 @@ int cmd_test(const std::string& username, bool auto_adjust) {
         if (!faces.empty()) {
             // Encode and match faces
             auto recog_start = std::chrono::high_resolution_clock::now();
-            auto encodings = detector.encodeFaces(processed_frame.view(), faces);
+            // Use adaptive quality threshold (0.50) for testing, matching enrollment behavior
+            auto encodings = detector.encodeFaces(processed_frame.view(), faces, 0.50);
             
             // Match against enrolled users
             bool matched = false;
             for (size_t i = 0; i < encodings.size() && i < faces.size(); i++) {
                 double best_distance = 999.0;
                 std::string best_match = "";
-                
+
                 for (const auto& model : all_models) {
-                    for (const auto& stored_encoding : model.encodings) {
+                    // Flatten sample_encodings for matching
+                    std::vector<FaceEncoding> model_flat_encodings;
+                    for (const auto& pose_encodings : model.sample_encodings) {
+                        model_flat_encodings.insert(model_flat_encodings.end(),
+                                                   pose_encodings.begin(),
+                                                   pose_encodings.end());
+                    }
+                    for (const auto& stored_encoding : model_flat_encodings) {
                         double distance = detector.compareFaces(stored_encoding, encodings[i]);
                         if (distance < best_distance) {
                             best_distance = distance;
@@ -433,7 +454,7 @@ int cmd_test(const std::string& username, bool auto_adjust) {
                         auto cascade_result = detector.detectFacesCascade(frame.view(), false, optimal_confidence);
                         
                         if (cascade_result.faces.size() == 1) {
-                            auto encodings = detector.encodeFaces(cascade_result.processed_frame.view(), cascade_result.faces);
+                            auto encodings = detector.encodeFaces(cascade_result.processed_frame.view(), cascade_result.faces, 0.50);
                             if (!encodings.empty()) {
                                 captured_encoding = encodings[0];
                                 captured = true;
@@ -494,7 +515,14 @@ int cmd_test(const std::string& username, bool auto_adjust) {
         for (const auto& test_enc : test_encodings) {
             // Compare against ALL enrolled faces to find the best match
             for (const auto& model : all_models) {
-                for (const auto& enrolled_enc : model.encodings) {
+                // Flatten sample_encodings for comparison
+                std::vector<FaceEncoding> model_flat_encodings;
+                for (const auto& pose_encodings : model.sample_encodings) {
+                    model_flat_encodings.insert(model_flat_encodings.end(),
+                                               pose_encodings.begin(),
+                                               pose_encodings.end());
+                }
+                for (const auto& enrolled_enc : model_flat_encodings) {
                     float dist = cosineDistance(enrolled_enc, test_enc);
                     test_distances.push_back(dist);
                 }
@@ -600,7 +628,7 @@ int cmd_test(const std::string& username, bool auto_adjust) {
                     auto cascade_result = detector.detectFacesCascade(adj_frame.view(), false, 0.5f);
                     
                     if (cascade_result.faces.size() == 1) {
-                        auto adj_encodings = detector.encodeFaces(cascade_result.processed_frame.view(), cascade_result.faces);
+                        auto adj_encodings = detector.encodeFaces(cascade_result.processed_frame.view(), cascade_result.faces, 0.50);
                         if (!adj_encodings.empty() && isValidFace(cascade_result.faces[0], adj_frame.width(), adj_frame.height(), adj_encodings[0])) {
                             adjustment_encodings.push_back(adj_encodings[0]);
                         }
@@ -616,7 +644,14 @@ int cmd_test(const std::string& username, bool auto_adjust) {
                 for (const auto& adj_enc : adjustment_encodings) {
                     // Compare against ALL enrolled faces to find the best match
                     for (const auto& model : all_models) {
-                        for (const auto& enrolled_enc : model.encodings) {
+                        // Flatten sample_encodings for comparison
+                        std::vector<FaceEncoding> model_flat_encodings;
+                        for (const auto& pose_encodings : model.sample_encodings) {
+                            model_flat_encodings.insert(model_flat_encodings.end(),
+                                                       pose_encodings.begin(),
+                                                       pose_encodings.end());
+                        }
+                        for (const auto& enrolled_enc : model_flat_encodings) {
                             double dist = cosineDistance(enrolled_enc, adj_enc);
                             max_distance = std::max(max_distance, dist);
                         }
@@ -652,7 +687,7 @@ int cmd_test(const std::string& username, bool auto_adjust) {
         std::vector<double> matched_distances(faces.size(), 999.0);
 
         if (!faces.empty()) {
-            auto encodings = detector.encodeFaces(processed_frame.view(), faces);
+            auto encodings = detector.encodeFaces(processed_frame.view(), faces, 0.50);
             
             // Deduplicate faces - filter out multiple detections of the same person
             // This prevents false positives from the same face detected at different angles/positions
@@ -685,7 +720,14 @@ int cmd_test(const std::string& username, bool auto_adjust) {
 
                 // Compare with all users
                 for (const auto& model : all_models) {
-                    for (const auto& stored_encoding : model.encodings) {
+                    // Flatten sample_encodings for matching
+                    std::vector<FaceEncoding> model_flat_encodings;
+                    for (const auto& pose_encodings : model.sample_encodings) {
+                        model_flat_encodings.insert(model_flat_encodings.end(),
+                                                   pose_encodings.begin(),
+                                                   pose_encodings.end());
+                    }
+                    for (const auto& stored_encoding : model_flat_encodings) {
                         double distance = detector.compareFaces(stored_encoding, encodings[i]);
                         if (distance < best_distance) {
                             // Shift best to second best
