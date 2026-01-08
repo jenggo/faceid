@@ -26,6 +26,21 @@ static float calculateNorm(const std::vector<float>& vec) {
     return std::sqrt(sum);
 }
 
+// Helper: Format distance percentage with decimal precision for small values
+static std::string formatDistancePercent(double distance) {
+    double percent = distance * 100.0;
+    
+    if (percent < 1.0) {
+        // Show one decimal place for very small distances (< 1%)
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%.1f%%", percent);
+        return std::string(buf);
+    } else {
+        // Show as integer for larger distances
+        return std::to_string(static_cast<int>(percent)) + "%";
+    }
+}
+
 // Helper: Check for NaN or Inf values
 static bool hasInvalidValues(const std::vector<float>& vec) {
     for (float val : vec) {
@@ -404,7 +419,6 @@ int cmd_test(const std::string& username, bool auto_adjust) {
         
         // Test cascade detection on reference frame
         auto cascade_result = detector.detectFacesCascade(reference_frame.view(), false, 0.5f);
-        faceid::Image processed_frame = std::move(cascade_result.processed_frame);
         
         if (cascade_result.faces.empty()) {
             std::cerr << "✗ No faces detected in reference frame" << std::endl;
@@ -676,7 +690,6 @@ int cmd_test(const std::string& username, bool auto_adjust) {
 
         // Use cascading detection for robust face detection in all lighting conditions
         auto cascade_result = detector.detectFacesCascade(frame.view(), false, 0.5f);
-        faceid::Image processed_frame = std::move(cascade_result.processed_frame);
         auto faces = cascade_result.faces;
 
         // Clone frame for drawing
@@ -687,7 +700,7 @@ int cmd_test(const std::string& username, bool auto_adjust) {
         std::vector<double> matched_distances(faces.size(), 999.0);
 
         if (!faces.empty()) {
-            auto encodings = detector.encodeFaces(processed_frame.view(), faces, 0.50);
+            auto encodings = detector.encodeFaces(cascade_result.processed_frame.view(), faces, 0.50);
             
             // Deduplicate faces - filter out multiple detections of the same person
             // This prevents false positives from the same face detected at different angles/positions
@@ -727,8 +740,10 @@ int cmd_test(const std::string& username, bool auto_adjust) {
                                                    pose_encodings.begin(),
                                                    pose_encodings.end());
                     }
+                    
                     for (const auto& stored_encoding : model_flat_encodings) {
                         double distance = detector.compareFaces(stored_encoding, encodings[i]);
+                        
                         if (distance < best_distance) {
                             // Shift best to second best
                             second_best_distance = best_distance;
@@ -783,8 +798,8 @@ int cmd_test(const std::string& username, bool auto_adjust) {
                 : faceid::Color::Red();   // No match - red
 
             std::string label = !matched_names[i].empty()
-                ? matched_names[i] + " (" + std::to_string(static_cast<int>(matched_distances[i] * 100)) + "%)"
-                : "Unknown (" + std::to_string(static_cast<int>(matched_distances[i] * 100)) + "%)";
+                ? matched_names[i] + " (" + formatDistancePercent(matched_distances[i]) + ")"
+                : "Unknown (" + formatDistancePercent(matched_distances[i]) + ")";
 
             // Draw rectangle with centering correction using shared helper
             int adjusted_x = faceid::drawFaceBoundingBox(display_frame, face, color, 2);
@@ -835,7 +850,7 @@ int cmd_test(const std::string& username, bool auto_adjust) {
             // Add distance if face detected
             if (!faces.empty() && !matched_distances.empty()) {
                 double current_distance = matched_distances[0];
-                info_items.push_back("Distance: " + std::to_string(static_cast<int>(current_distance * 100)) + "%");
+                info_items.push_back("Distance: " + formatDistancePercent(current_distance));
             }
             
             // Add threshold

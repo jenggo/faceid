@@ -953,13 +953,45 @@ std::vector<FaceEncoding> FaceDetector::encodeFaces(
         
         Logger::getInstance().debug("L2 norm before normalization: " + std::to_string(norm));
         
+        // Validate norm is reasonable (not zero, not too small)
+        if (norm < 0.01f) {
+            Logger::getInstance().debug("WARNING: L2 norm too small (" + std::to_string(norm) + "), skipping this encoding");
+            continue;
+        }
+        
         if (norm > 0) {
             for (float& val : encoding) {
                 val /= norm;
             }
             Logger::getInstance().debug("L2 normalization applied successfully");
-        } else {
-            Logger::getInstance().debug("WARNING: L2 norm is zero, skipping normalization");
+        }
+        
+        // Additional validation: check for NaN/Inf values after normalization
+        bool has_invalid = false;
+        for (float val : encoding) {
+            if (std::isnan(val) || std::isinf(val)) {
+                has_invalid = true;
+                break;
+            }
+        }
+        if (has_invalid) {
+            Logger::getInstance().debug("WARNING: Encoding contains NaN/Inf values, skipping");
+            continue;
+        }
+        
+        // Check for suspicious encodings (all same value, which indicates corruption)
+        // This can happen if encoding from invalid/empty image data
+        bool all_same = true;
+        float first_val = encoding[0];
+        for (size_t j = 1; j < encoding.size() && all_same; j++) {
+            if (std::abs(encoding[j] - first_val) > 0.0001f) {
+                all_same = false;
+            }
+        }
+        if (all_same) {
+            Logger::getInstance().debug("WARNING: Encoding has all identical values (" + 
+                std::to_string(first_val) + "), likely corrupted, skipping");
+            continue;
         }
         
         encodings.push_back(encoding);

@@ -168,8 +168,24 @@ namespace {
         auto& logger = faceid::Logger::getInstance();
         logger.info("Adaptive authentication optimization worker started");
         
+        // Load config to get camera resolution
+        auto& config = faceid::Config::getInstance();
+        if (!config.load(config_path)) {
+            logger.error("Failed to load config in optimization worker");
+            return;
+        }
+        
+        // Get camera resolution from config (use camera.width/height as fallback if presence settings not available)
+        int camera_width = config.getInt("presence_detection", "presence_camera_width")
+                               .value_or(config.getInt("camera", "width").value_or(640));
+        int camera_height = config.getInt("presence_detection", "presence_camera_height")
+                                .value_or(config.getInt("camera", "height").value_or(360));
+        
+        logger.info("Initializing adaptive auth with camera resolution: " + 
+                   std::to_string(camera_width) + "x" + std::to_string(camera_height));
+        
         faceid::AdaptiveAuthManager adaptive_mgr;
-        if (!adaptive_mgr.initialize()) {
+        if (!adaptive_mgr.initialize(camera_width, camera_height, 3)) {
             logger.error("Failed to initialize adaptive auth manager in worker thread");
             return;
         }
@@ -266,6 +282,7 @@ namespace {
                     if (all_users.empty()) {
                         logger.error("No enrolled users found for threshold calculation");
                         adaptive_mgr.failOptimization();
+                        cache.clearCache();  // Free model cache memory
                         delete[] frame_buffer;
                         continue;
                     }
@@ -275,6 +292,7 @@ namespace {
                     if (cascade_result.faces.empty()) {
                         logger.error("Face disappeared after optimization");
                         adaptive_mgr.failOptimization();
+                        cache.clearCache();  // Free model cache memory
                         delete[] frame_buffer;
                         continue;
                     }
@@ -284,6 +302,7 @@ namespace {
                     if (encodings.empty()) {
                         logger.error("Failed to encode face");
                         adaptive_mgr.failOptimization();
+                        cache.clearCache();  // Free model cache memory
                         delete[] frame_buffer;
                         continue;
                     }
@@ -330,12 +349,20 @@ namespace {
                                ", threshold: " + std::to_string(optimal_threshold));
                     
                     adaptive_mgr.completeOptimization(optimal_confidence, optimal_threshold);
+                    cache.clearCache();  // Free model cache memory (~5 MB)
                     
                     delete[] frame_buffer;
                     
                 } catch (const std::exception& e) {
                     logger.error(std::string("Optimization failed with exception: ") + e.what());
                     adaptive_mgr.failOptimization();
+                    // Clear cache if it was loaded before exception
+                    try {
+                        auto& cache = faceid::ModelCache::getInstance();
+                        cache.clearCache();
+                    } catch (...) {
+                        // Ignore any secondary exceptions during cleanup
+                    }
                 }
             }
             

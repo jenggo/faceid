@@ -255,12 +255,6 @@ static bool authenticate_user(const char* username) {
     Logger& logger = Logger::getInstance();
     openlog("pam_faceid", LOG_PID, LOG_AUTH);
     
-    // Initialize adaptive authentication manager
-    AdaptiveAuthManager adaptive_mgr;
-    if (!adaptive_mgr.initialize()) {
-        syslog(LOG_WARNING, "pam_faceid: Failed to initialize adaptive auth manager, continuing without adaptive optimization");
-    }
-    
     // Load configuration
     Config& config = Config::getInstance();
     const std::string config_path = std::string(CONFIG_DIR) + "/faceid.conf";
@@ -269,6 +263,16 @@ static bool authenticate_user(const char* username) {
         logger.auditAuthFailure(username, "biometric", "config_load_failed");
         closelog();
         return false;
+    }
+    
+    // Get camera resolution for adaptive auth shared memory sizing
+    int camera_width = config.getInt("camera", "width").value_or(640);
+    int camera_height = config.getInt("camera", "height").value_or(360);
+    
+    // Initialize adaptive authentication manager with camera resolution
+    AdaptiveAuthManager adaptive_mgr;
+    if (!adaptive_mgr.initialize(camera_width, camera_height, 3)) {
+        syslog(LOG_WARNING, "pam_faceid: Failed to initialize adaptive auth manager, continuing without adaptive optimization");
     }
     
     // Check lid state

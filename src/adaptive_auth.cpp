@@ -5,6 +5,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <cstring>
+#include <cstddef>
 #include <errno.h>
 
 namespace faceid {
@@ -12,7 +13,7 @@ namespace faceid {
 static const char* SHM_NAME = "/faceid_adaptive_auth";
 
 AdaptiveAuthManager::AdaptiveAuthManager() 
-    : shm_fd_(-1), state_(nullptr), is_owner_(false) {
+    : shm_fd_(-1), state_(nullptr), is_owner_(false), shm_size_(0) {
 }
 
 AdaptiveAuthManager::~AdaptiveAuthManager() {
@@ -21,7 +22,7 @@ AdaptiveAuthManager::~AdaptiveAuthManager() {
         if (is_owner_) {
             pthread_mutex_destroy(&state_->mutex);
         }
-        munmap(state_, sizeof(AdaptiveAuthState));
+        munmap(state_, shm_size_);
         state_ = nullptr;
     }
     
@@ -31,7 +32,21 @@ AdaptiveAuthManager::~AdaptiveAuthManager() {
     }
 }
 
-bool AdaptiveAuthManager::initialize() {
+bool AdaptiveAuthManager::initialize(uint32_t width, uint32_t height, uint32_t channels) {
+    // Calculate actual shared memory size needed for this resolution
+    shm_size_ = calculateSharedMemorySize(width, height, channels);
+    
+    Logger::getInstance().debug("Adaptive auth initializing with resolution " + 
+                               std::to_string(width) + "x" + std::to_string(height) + "x" + std::to_string(channels) +
+                               " (shm_size: " + std::to_string(shm_size_) + " bytes)");
+    
+    // Validate resolution fits in upper limit
+    if (!validateFrameSize(width, height, channels)) {
+        Logger::getInstance().error("Frame size " + std::to_string(width) + "x" + std::to_string(height) + "x" + std::to_string(channels) +
+                                   " exceeds MAX_FRAME_SIZE limit");
+        return false;
+    }
+    
     // Try to open existing shared memory first
     shm_fd_ = shm_open(SHM_NAME, O_RDWR, 0666);
     
@@ -49,8 +64,8 @@ bool AdaptiveAuthManager::initialize() {
         } else {
             is_owner_ = true;
             
-            // Set size
-            if (ftruncate(shm_fd_, sizeof(AdaptiveAuthState)) == -1) {
+            // Set size based on actual resolution needs
+            if (ftruncate(shm_fd_, shm_size_) == -1) {
                 Logger::getInstance().error("Failed to set shared memory size: " + std::string(strerror(errno)));
                 close(shm_fd_);
                 shm_fd_ = -1;
@@ -62,7 +77,7 @@ bool AdaptiveAuthManager::initialize() {
     
     // Map shared memory
     state_ = static_cast<AdaptiveAuthState*>(
-        mmap(nullptr, sizeof(AdaptiveAuthState), PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd_, 0)
+        mmap(nullptr, shm_size_, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd_, 0)
     );
     
     if (state_ == MAP_FAILED) {
@@ -78,7 +93,10 @@ bool AdaptiveAuthManager::initialize() {
     // Initialize mutex if we're the owner
     if (is_owner_) {
         // Initialize state FIRST (before mutex)
-        std::memset(state_, 0, sizeof(AdaptiveAuthState));
+        std::memset(state_, 0, shm_size_);
+        
+        // Store the allocated frame size for validation
+        state_->allocated_frame_size = static_cast<uint32_t>(shm_size_ - offsetof(AdaptiveAuthState, frame_data));
         
         // Then initialize mutex
         pthread_mutexattr_init(&state_->mutex_attr);
@@ -87,7 +105,8 @@ bool AdaptiveAuthManager::initialize() {
     }
     
     Logger::getInstance().debug("Adaptive auth shared memory initialized (owner: " + 
-                               std::string(is_owner_ ? "yes" : "no") + ")");
+                               std::string(is_owner_ ? "yes" : "no") + 
+                               ", allocated_frame_size: " + std::to_string(state_->allocated_frame_size) + " bytes)");
     return true;
 }
 
@@ -143,12 +162,12 @@ void AdaptiveAuthManager::captureFrame(const uint8_t* data, int width, int heigh
     
     lock();
     
-    // Validate frame size using helper function
-    if (!validateFrameSize(width, height, channels)) {
-        size_t frame_size = calculateFrameSize(width, height, channels);
-        Logger::getInstance().error("Frame size exceeds shared memory buffer: " + 
-                                   std::to_string(frame_size) + " bytes (max: " + 
-                                   std::to_string(MAX_FRAME_SIZE) + " bytes). " +
+    // Validate frame size against allocated buffer
+    size_t frame_size = calculateFrameSize(width, height, channels);
+    if (frame_size > state_->allocated_frame_size) {
+        Logger::getInstance().error("Frame size exceeds allocated buffer: " + 
+                                   std::to_string(frame_size) + " bytes (allocated: " + 
+                                   std::to_string(state_->allocated_frame_size) + " bytes). " +
                                    "Resolution: " + std::to_string(width) + "x" + 
                                    std::to_string(height) + "x" + std::to_string(channels));
         unlock();
@@ -159,7 +178,6 @@ void AdaptiveAuthManager::captureFrame(const uint8_t* data, int width, int heigh
     state_->frame_height = height;
     state_->frame_channels = channels;
     
-    size_t frame_size = calculateFrameSize(width, height, channels);
     std::memcpy(state_->frame_data, data, frame_size);
     state_->optimization_requested = true;
     

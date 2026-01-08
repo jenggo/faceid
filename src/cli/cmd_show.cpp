@@ -22,7 +22,6 @@ int cmd_show() {
     auto device = config.getString("camera", "device").value_or("/dev/video0");
     auto width = config.getInt("camera", "width").value_or(640);
     auto height = config.getInt("camera", "height").value_or(480);
-    int tracking_interval = config.getInt("face_detection", "tracking_interval").value_or(10);
     
     std::cout << "Using camera: " << device << " (" << width << "x" << height << ")" << std::endl;
     
@@ -66,9 +65,9 @@ int cmd_show() {
             continue;
         }
         
-        // Preprocess and detect faces
-        faceid::Image processed_frame = detector.preprocessFrame(frame.view());
-        auto faces = detector.detectOrTrackFaces(processed_frame.view(), tracking_interval);
+        // Use cascading detection for robust face detection in all lighting conditions
+        auto cascade_result = detector.detectFacesCascade(frame.view(), false, 0.5f);
+        auto faces = cascade_result.faces;
         
         // Clone frame for drawing
         faceid::Image display_frame = frame.clone();
