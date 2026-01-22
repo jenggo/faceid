@@ -436,20 +436,11 @@ int main(int argc, char* argv[]) {
     int presence_camera_width = config.getInt("presence_detection", "presence_camera_width").value_or(640);
     int presence_camera_height = config.getInt("presence_detection", "presence_camera_height").value_or(480);
     
-    // NEW: Read face recognition configuration
-    bool recognition_required = config.getBool("presence_detection", "require_recognition").value_or(true);
-    
     // Read no-peek configuration
     bool no_peek_enabled = config.getBool("no_peek", "enabled").value_or(false);
-    bool gaze_detection_enabled = config.getBool("no_peek", "gaze_detection_enabled").value_or(true);
-    float gaze_yaw_threshold = config.getDouble("no_peek", "gaze_yaw_threshold").value_or(30.0);
-    float gaze_pitch_threshold = config.getDouble("no_peek", "gaze_pitch_threshold").value_or(30.0);
     int min_face_distance = config.getInt("no_peek", "min_face_distance_pixels").value_or(80);
     double min_face_size = config.getDouble("no_peek", "min_face_size_percent").value_or(0.08);
     int peek_delay = config.getInt("no_peek", "peek_detection_delay_seconds").value_or(2);
-    bool peek_show_notification = config.getBool("no_peek", "peek_show_notification").value_or(true);
-    bool peek_blur_screen = config.getBool("no_peek", "peek_blur_screen").value_or(false);
-    bool peek_blank_screen = config.getBool("no_peek", "peek_blank_screen").value_or(false);
     int unblank_delay = config.getInt("no_peek", "unblank_delay_seconds").value_or(3);
     
     // Read schedule configuration
@@ -488,20 +479,11 @@ int main(int argc, char* argv[]) {
     logger.info("  Shutter timeout: " + std::to_string(shutter_timeout) + " min");
     logger.info("  Camera device: " + camera_device);
     
-    logger.info("Face recognition configuration:");
-    logger.info("  Recognition required: " + std::string(recognition_required ? "YES" : "NO"));
-    
     logger.info("No-peek detection configuration:");
     logger.info("  Enabled: " + std::string(no_peek_enabled ? "YES" : "NO"));
-    logger.info("  Gaze detection enabled: " + std::string(gaze_detection_enabled ? "YES" : "NO"));
-    logger.info("  Gaze yaw threshold: " + std::to_string(gaze_yaw_threshold) + " degrees");
-    logger.info("  Gaze pitch threshold: " + std::to_string(gaze_pitch_threshold) + " degrees");
     logger.info("  Min face distance: " + std::to_string(min_face_distance) + " pixels");
     logger.info("  Min face size: " + std::to_string(min_face_size * 100) + "%");
     logger.info("  Peek detection delay: " + std::to_string(peek_delay) + "s");
-    logger.info("  Show notification: " + std::string(peek_show_notification ? "YES" : "NO"));
-    logger.info("  Blur screen: " + std::string(peek_blur_screen ? "YES" : "NO"));
-    logger.info("  Blank screen: " + std::string(peek_blank_screen ? "YES" : "NO"));
     logger.info("  Unblank delay: " + std::to_string(unblank_delay) + "s");
     
     logger.info("Schedule configuration:");
@@ -532,6 +514,7 @@ int main(int argc, char* argv[]) {
     );
     
     // Configure additional options
+    detector.setMouseJitterThreshold(mouse_jitter_threshold);
     detector.setShutterBrightnessThreshold(shutter_brightness);
     detector.setShutterVarianceThreshold(shutter_variance);
     detector.setShutterTimeout(shutter_timeout * 60 * 1000);  // Convert minutes to milliseconds
@@ -541,19 +524,11 @@ int main(int argc, char* argv[]) {
     logger.info("Presence camera configured: " + std::to_string(presence_camera_width) + "x" + 
                 std::to_string(presence_camera_height));
     
-    // Configure face recognition (SECURITY CRITICAL!)
-    detector.setRecognitionRequired(recognition_required);
-    
-    // Configure no-peek detection (NEW: Enhanced with gaze)
+    // Configure no-peek detection
     detector.enableNoPeek(no_peek_enabled);
-    detector.setGazeDetectionEnabled(gaze_detection_enabled);
-    detector.setGazeThresholds(gaze_yaw_threshold, gaze_pitch_threshold);
     detector.setMinFaceDistance(min_face_distance);
     detector.setMinFaceSizePercent(min_face_size);
     detector.setPeekDetectionDelay(peek_delay * 1000);  // Convert seconds to milliseconds
-    detector.setPeekShowNotification(peek_show_notification);
-    detector.setPeekBlurScreen(peek_blur_screen);
-    detector.setPeekBlankScreen(peek_blank_screen);
     detector.setUnblankDelay(unblank_delay * 1000);  // Convert seconds to milliseconds
     
     // Configure schedule

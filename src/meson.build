@@ -7,6 +7,7 @@ cpp_args = [
 gio_dep = dependency('gio-2.0', required: true)
 glib_dep = dependency('glib-2.0', required: true)
 sdl2_dep = dependency('sdl2', required: true)
+libevdev_dep = dependency('libevdev', required: true)  # NEW: For input monitoring
 
 # Core library
 core_sources = files(
@@ -22,6 +23,9 @@ core_sources = files(
     'adaptive_auth.cpp',
     'presence/guard.cpp',
     'presence/detector.cpp',
+    'presence/input_monitor.cpp',      # NEW: Event-driven input monitoring
+    'presence/peek_detector.cpp',       # NEW: Gaze-aware peek detection
+    'presence/notification.cpp',        # NEW: Desktop notifications
     'models/binary_model.cpp',
     'models/model_cache.cpp',
     'detectors/retinaface.cpp',
@@ -34,7 +38,7 @@ core_lib = static_library(
     'faceid-core',
     sources: core_sources,
     include_directories: inc,
-    dependencies: [ncnn_dep, turbojpeg_dep, libyuv_dep, gio_dep, glib_dep, libsystemd_dep],
+    dependencies: [ncnn_dep, turbojpeg_dep, libyuv_dep, gio_dep, glib_dep, libsystemd_dep, libevdev_dep],  # Added libevdev_dep
     cpp_args: cpp_args,
     link_args: ['-lpthread', '-lrt'],  # pthread for mutex, rt for shm_open
 )
@@ -46,7 +50,7 @@ pam_module = shared_module(
     'pam_faceid',
     sources: pam_sources,
     include_directories: inc,
-    dependencies: [pam_dep, ncnn_dep, turbojpeg_dep, libyuv_dep, gio_dep, glib_dep],
+    dependencies: [pam_dep, ncnn_dep, turbojpeg_dep, libyuv_dep, gio_dep, glib_dep, libevdev_dep],  # Added libevdev_dep
     link_with: core_lib,
     cpp_args: cpp_args,
     link_args: ['-ldl', '-lpthread'],  # For threading support
@@ -88,7 +92,7 @@ presence_daemon_exe = executable(
     'faceid-presence',
     sources: presence_daemon_sources,
     include_directories: inc,
-    dependencies: [ncnn_dep, turbojpeg_dep, libyuv_dep],
+    dependencies: [ncnn_dep, turbojpeg_dep, libyuv_dep, libevdev_dep],  # Added libevdev_dep
     link_with: core_lib,
     cpp_args: cpp_args,
     link_args: ['-lpthread'],

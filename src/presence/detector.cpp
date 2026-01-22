@@ -1,43 +1,25 @@
 #include "detector.h"
 #include "../logger.h"
-#include "../face_detector.h"
-#include "../image.h"
+#include "../config.h"
+#include "../models/model_cache.h"
 #include <libyuv.h>
 #include <fstream>
+#include <thread>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/file.h>
 #include <unistd.h>
 #include <fcntl.h>
-#include <dirent.h>
 #include <glob.h>
 #include <cmath>
-#include <atomic>
 
 // Lock file pattern for detecting PAM authentication
 // Must match the path used in pam/pam_faceid.cpp SystemWideLock class
-// Now using per-user lock files: /run/faceid/faceid-<username>.lock
 static const char* PAM_LOCK_PATTERN = "/run/faceid/faceid-*.lock";
 
 namespace faceid {
 
-// Helper function: Fast BGR to GRAY conversion using libyuv with Image classes
-// Currently unused, but kept for future reference
-/*
-static Image convertBGRToGrayLibyuv(const ImageView& src_bgr) {
-    Image dst_gray(src_bgr.width(), src_bgr.height(), 1);
-    
-    // Use libyuv's RGB24ToJ400 (grayscale) conversion
-    // Note: OpenCV's BGR = RGB24, J400 is grayscale (full range 0-255)
-    libyuv::RGB24ToJ400(src_bgr.data(), src_bgr.stride(), 
-                        dst_gray.data(), dst_gray.stride(), 
-                        src_bgr.width(), src_bgr.height());
-    
-    return dst_gray;
-}
-*/
-
-// Helper function: Fast GRAY to BGR conversion using libyuv with Image classes
+// Helper function: Fast GRAY to BGR conversion using libyuv
 static Image convertGrayToBGRLibyuv(const ImageView& src_gray) {
     Image dst_bgr(src_gray.width(), src_gray.height(), 3);
     
@@ -64,7 +46,7 @@ PresenceDetector::PresenceDetector(
     int max_scan_failures,
     std::chrono::minutes max_idle_time)
     : camera_device_(camera_device)
-    
+    , last_enrollment_load_(std::chrono::steady_clock::now() - std::chrono::hours(24))
     , current_state_(State::ACTIVELY_PRESENT)
     , last_activity_(std::chrono::steady_clock::now())
     , state_entry_time_(std::chrono::steady_clock::now())
@@ -74,8 +56,7 @@ PresenceDetector::PresenceDetector(
     , inactive_threshold_ms_(std::chrono::duration_cast<std::chrono::milliseconds>(inactive_threshold).count())
     , scan_interval_ms_(std::chrono::duration_cast<std::chrono::milliseconds>(scan_interval).count())
     , max_scan_failures_(max_scan_failures)
-    , max_idle_time_ms_(std::chrono::duration_cast<std::chrono::milliseconds>(max_idle_time).count())
-    , last_interrupt_check_(std::chrono::steady_clock::now() - std::chrono::seconds(1)) {
+    , max_idle_time_ms_(std::chrono::duration_cast<std::chrono::milliseconds>(max_idle_time).count()) {
 }
 
 PresenceDetector::~PresenceDetector() {
@@ -90,7 +71,24 @@ bool PresenceDetector::initialize() {
         is_wayland_ = detectDisplayServer();
         logger.info(std::string("Display server: ") + (is_wayland_ ? "Wayland" : "X11"));
         
-        logger.info("Presence detector initialized successfully (lazy loading enabled)");
+        // Initialize InputMonitor for event-driven activity detection
+        input_monitor_ = std::make_unique<InputMonitor>();
+        if (!input_monitor_->initialize()) {
+            logger.error("Failed to initialize InputMonitor");
+            return false;
+        }
+        
+        // Set activity callback
+        input_monitor_->setActivityCallback([this]() {
+            notifyActivity();
+        });
+        
+        // Initialize PeekDetector (lazy-loaded with FaceDetector)
+        peek_detector_ = std::make_unique<PeekDetector>(face_detector_.get());
+        peek_detector_->setGazeThresholds(gaze_yaw_threshold_, gaze_pitch_threshold_);
+        peek_detector_->setFaceFilters(min_face_size_percent_, min_face_distance_pixels_);
+        
+        logger.info("Presence detector initialized successfully");
         return true;
     } catch (const std::exception& e) {
         logger.error(std::string("Failed to initialize presence detector: ") + e.what());
@@ -105,6 +103,11 @@ bool PresenceDetector::start() {
     
     Logger& logger = Logger::getInstance();
     logger.info("Starting presence detection service");
+    
+    // Start InputMonitor
+    if (input_monitor_) {
+        input_monitor_->start();
+    }
     
     running_.store(true);
     detection_thread_ = std::thread(&PresenceDetector::detectionLoop, this);
@@ -122,15 +125,13 @@ void PresenceDetector::stop() {
     
     running_.store(false);
     
-    if (detection_thread_.joinable()) {
-        detection_thread_.join();
+    // Stop InputMonitor
+    if (input_monitor_) {
+        input_monitor_->stop();
     }
     
-    // Release camera
-    std::lock_guard<std::mutex> lock(camera_mutex_);
-    if (camera_ && camera_->isOpened()) {
-        camera_->close();
-        camera_.reset();
+    if (detection_thread_.joinable()) {
+        detection_thread_.join();
     }
 }
 
@@ -149,6 +150,7 @@ std::string PresenceDetector::getStateString() const {
 
 void PresenceDetector::notifyActivity() {
     last_activity_ = std::chrono::steady_clock::now();
+    has_recent_activity_.store(true);
     
     // If we were away or scanning, transition back to active
     if (current_state_ != State::ACTIVELY_PRESENT) {
@@ -163,16 +165,6 @@ void PresenceDetector::pauseForAuthentication() {
     if (pause_count_ == 1) {
         paused_for_auth_.store(true);
         Logger::getInstance().debug("Presence detection paused for authentication");
-        
-        // Release camera for PAM auth
-        std::lock_guard<std::mutex> cam_lock(camera_mutex_);
-        if (camera_ && camera_->isOpened()) {
-            camera_->close();
-            camera_.reset();  // Free camera object memory
-        }
-        
-        // Also clear cached frame to free memory
-        last_captured_frame_ = Image();
     }
 }
 
@@ -188,15 +180,12 @@ void PresenceDetector::resumeAfterAuthentication() {
 
 // Check if PAM authentication is in progress by testing if any lock file is locked
 bool PresenceDetector::checkPAMLockFile() {
-    // Check for any lock files matching /tmp/faceid-*.lock
-    // Use glob to find all matching files
     glob_t glob_result;
     memset(&glob_result, 0, sizeof(glob_result));
     
     int ret = glob(PAM_LOCK_PATTERN, GLOB_TILDE, NULL, &glob_result);
     if (ret != 0) {
-        // No matching files found
-        return false;
+        return false; // No matching files found
     }
     
     bool any_locked = false;
@@ -211,16 +200,15 @@ bool PresenceDetector::checkPAMLockFile() {
         }
         
         // Try to acquire shared lock (non-blocking)
-        // If PAM has exclusive lock, this will fail with EWOULDBLOCK
         int result = flock(fd, LOCK_SH | LOCK_NB);
         
         if (result == -1 && errno == EWOULDBLOCK) {
-            // PAM holds exclusive lock, authentication in progress
+            // PAM holds exclusive lock
             any_locked = true;
             close(fd);
             break;
         } else if (result == 0) {
-            // We got the shared lock, release it immediately
+            // We got the shared lock, release it
             flock(fd, LOCK_UN);
         }
         
@@ -235,13 +223,12 @@ void PresenceDetector::detectionLoop() {
     guard_.updateState();
     
     while (running_.load()) {
-        // Check if PAM authentication is in progress by checking lock file
+        // Check if PAM authentication is in progress
         bool pam_lock_exists = checkPAMLockFile();
         if (pam_lock_exists && !paused_for_auth_.load()) {
             Logger::getInstance().debug("PAM authentication lock detected, pausing presence detection");
             pauseForAuthentication();
         } else if (!pam_lock_exists && paused_for_auth_.load() && pause_count_ == 1) {
-            // Only auto-resume if we were auto-paused (pause_count == 1)
             Logger::getInstance().debug("PAM authentication lock released, resuming presence detection");
             resumeAfterAuthentication();
         }
@@ -254,14 +241,12 @@ void PresenceDetector::detectionLoop() {
         
         // Check schedule first
         if (!isWithinSchedule()) {
-            // Outside scheduled hours/days, pause detection
-            // If we were scanning, transition to ACTIVELY_PRESENT (assume user present)
             if (current_state_ == State::IDLE_WITH_SCANNING || 
                 current_state_ == State::AWAY_CONFIRMED) {
                 Logger::getInstance().info("Outside schedule - pausing presence detection");
                 transitionTo(State::ACTIVELY_PRESENT);
             }
-            // Sleep in short intervals to allow quick shutdown
+            // Sleep in short intervals
             for (int i = 0; i < 60 && running_.load(); i++) {
                 std::this_thread::sleep_for(std::chrono::seconds(1));
             }
@@ -272,7 +257,6 @@ void PresenceDetector::detectionLoop() {
         guard_.updateState();
         
         if (!guard_.shouldRunPresenceDetection()) {
-            // Guard conditions not met, pause detection
             std::this_thread::sleep_for(std::chrono::milliseconds(1000));
             continue;
         }
@@ -284,8 +268,6 @@ void PresenceDetector::detectionLoop() {
         if (current_state_ == State::IDLE_WITH_SCANNING) {
             std::this_thread::sleep_for(std::chrono::milliseconds(scan_interval_ms_));
         } else {
-            // Not scanning, just monitoring activity
-            // Use 1 second interval for better responsiveness
             std::this_thread::sleep_for(std::chrono::seconds(1));
         }
     }
@@ -298,19 +280,13 @@ void PresenceDetector::updateStateMachine() {
     
     Logger& logger = Logger::getInstance();
     
-    // Debug: Log state and activity every 5 seconds
+    // Debug: Log state every 5 seconds
     static auto last_debug_log = std::chrono::steady_clock::now();
     if (std::chrono::duration_cast<std::chrono::seconds>(now - last_debug_log).count() >= 5) {
         bool has_activity = hasRecentActivity();
-        // Use static buffer to avoid string allocation overhead
-        static char log_buf[256];
-        snprintf(log_buf, sizeof(log_buf), 
-                "State: %s, Inactive time: %lds, Has recent activity: %s, Threshold: %ds",
-                getStateString().c_str(), 
-                (long)(inactive_time / 1000),
-                has_activity ? "YES" : "NO",
-                inactive_threshold_ms_ / 1000);
-        logger.info(log_buf);
+        logger.debug("State: " + getStateString() + 
+                     ", Inactive time: " + std::to_string(inactive_time / 1000) + "s" +
+                     ", Has activity: " + (has_activity ? "YES" : "NO"));
         last_debug_log = now;
     }
     
@@ -318,10 +294,8 @@ void PresenceDetector::updateStateMachine() {
         case State::ACTIVELY_PRESENT:
             // Check if user has been inactive
             if (hasRecentActivity()) {
-                // User still active, update timestamp
                 last_activity_ = now;
             } else if (inactive_time > inactive_threshold_ms_) {
-                // User has been inactive, start scanning
                 logger.info("Inactivity detected! Transitioning to scanning mode");
                 transitionTo(State::IDLE_WITH_SCANNING);
                 scan_failures_ = 0;
@@ -329,42 +303,33 @@ void PresenceDetector::updateStateMachine() {
             break;
             
         case State::IDLE_WITH_SCANNING: {
-            // FIRST: Check if user became active (keyboard/mouse input)
-            // This takes priority over face scanning
+            // Check if user became active
             if (hasRecentActivity()) {
                 logger.info("User activity detected during scanning, returning to active state");
                 transitionTo(State::ACTIVELY_PRESENT);
                 last_activity_ = now;
-                scan_failures_ = 0;  // Reset failure counter
-                consecutive_shutter_closed_scans_ = 0;  // Reset shutter counter
+                scan_failures_ = 0;
+                consecutive_shutter_closed_scans_ = 0;
                 break;
             }
             
-            // Scan for face
-            static char scan_buf[128];
-            snprintf(scan_buf, sizeof(scan_buf), "Scanning for face... (failures so far: %d)", scan_failures_);
-            logger.info(scan_buf);
-            bool face_detected = detectFace();
+            // Scan for face with recognition
+            logger.info("Scanning for authorized user... (failures so far: " + 
+                       std::to_string(scan_failures_) + ")");
+            bool authorized = detectAndRecognizeFace();
             
             // Check if failure was due to closed shutter
-            if (!face_detected && last_shutter_state_ == ShutterState::CLOSED) {
+            if (!authorized && last_shutter_state_ == ShutterState::CLOSED) {
                 consecutive_shutter_closed_scans_++;
-                static char shutter_buf[128];
-                snprintf(shutter_buf, sizeof(shutter_buf), 
-                        "Camera shutter is CLOSED (scan #%d) - pausing presence detection",
-                        consecutive_shutter_closed_scans_);
-                logger.warning(shutter_buf);
-                
-                // Don't count as "away" - user may have closed shutter for privacy
-                // Just pause scanning and stay in IDLE_WITH_SCANNING state
+                logger.warning("Camera shutter is CLOSED (scan #" + 
+                              std::to_string(consecutive_shutter_closed_scans_) + 
+                              ") - pausing presence detection");
                 
                 // If shutter has been closed for configured timeout, lock anyway
                 if (consecutive_shutter_closed_scans_ * scan_interval_ms_ > shutter_timeout_ms_) {
-                    static char timeout_buf[128];
-                    snprintf(timeout_buf, sizeof(timeout_buf), 
-                            "Camera shutter closed for %d+ minutes - locking anyway",
-                            shutter_timeout_ms_ / 60000);
-                    logger.info(timeout_buf);
+                    logger.info("Camera shutter closed for " + 
+                               std::to_string(shutter_timeout_ms_ / 60000) + 
+                               "+ minutes - locking anyway");
                     transitionTo(State::AWAY_CONFIRMED);
                     lockScreen();
                 }
@@ -374,39 +339,25 @@ void PresenceDetector::updateStateMachine() {
             // Shutter is open, reset counter
             consecutive_shutter_closed_scans_ = 0;
             
-            if (face_detected) {
-                // Face detected! User is still here
+            if (authorized) {
+                // Authorized user detected!
                 successful_detections_++;
-                logger.info("Face detected! Returning to active state");
+                logger.info("Authorized user detected! Returning to active state");
                 transitionTo(State::ACTIVELY_PRESENT);
                 last_activity_ = now;
-                scan_failures_ = 0;  // Reset failure counter
-                
-                // Check for peek (shoulder surfing) using cached frame
-                // This avoids reopening the camera after it was just released
-                if (no_peek_enabled_ && !last_captured_frame_.empty()) {
-                    bool peek = detectPeek(last_captured_frame_.view());
-                    updatePeekState(peek);
-                    // Clear cached frame after use
-                    last_captured_frame_ = Image();
-                }
+                scan_failures_ = 0;
             } else {
-                // No face detected (and shutter is open)
+                // No authorized user detected
                 failed_detections_++;
                 scan_failures_++;
-                static char failure_buf[128];
-                snprintf(failure_buf, sizeof(failure_buf), 
-                        "No face detected (failure %d of %d)",
-                        scan_failures_, max_scan_failures_);
-                logger.info(failure_buf);
+                logger.info("No authorized user detected (failure " + 
+                           std::to_string(scan_failures_) + " of " + 
+                           std::to_string(max_scan_failures_) + ")");
                 
                 if (scan_failures_ >= max_scan_failures_) {
-                    // Too many failures, user is away
-                    static char away_buf[128];
-                    snprintf(away_buf, sizeof(away_buf), 
-                            "User confirmed away after %d failed scans - locking screen",
-                            scan_failures_);
-                    logger.info(away_buf);
+                    logger.info("User confirmed away after " + 
+                               std::to_string(scan_failures_) + 
+                               " failed scans - locking screen");
                     transitionTo(State::AWAY_CONFIRMED);
                     lockScreen();
                 }
@@ -414,11 +365,9 @@ void PresenceDetector::updateStateMachine() {
             
             // Also check timeout
             if (inactive_time > max_idle_time_ms_) {
-                static char idle_buf[128];
-                snprintf(idle_buf, sizeof(idle_buf), 
-                        "User confirmed away after %ld seconds idle - locking screen",
-                        (long)(inactive_time / 1000));
-                logger.info(idle_buf);
+                logger.info("User confirmed away after " + 
+                           std::to_string(inactive_time / 1000) + 
+                           " seconds idle - locking screen");
                 transitionTo(State::AWAY_CONFIRMED);
                 lockScreen();
             }
@@ -443,67 +392,52 @@ void PresenceDetector::transitionTo(State new_state) {
     state_transitions_++;
     
     Logger& logger = Logger::getInstance();
-    logger.info("State transition: " + getStateString() + " -> " + 
-                [new_state]() {
-                    switch (new_state) {
-                        case State::ACTIVELY_PRESENT: return std::string("ACTIVELY_PRESENT");
-                        case State::IDLE_WITH_SCANNING: return std::string("IDLE_WITH_SCANNING");
-                        case State::AWAY_CONFIRMED: return std::string("AWAY_CONFIRMED");
-                    }
-                    return std::string("UNKNOWN");
-                }());
-    
-    // Close camera when leaving IDLE_WITH_SCANNING state (save power/privacy)
-    if (current_state_ == State::IDLE_WITH_SCANNING && 
-        (new_state == State::ACTIVELY_PRESENT || new_state == State::AWAY_CONFIRMED)) {
-        std::lock_guard<std::mutex> lock(camera_mutex_);
-        if (camera_ && camera_->isOpened()) {
-            camera_->close();
-            camera_.reset();
-            logger.info("Camera released (no longer scanning)");
-        }
+    std::string new_state_str;
+    switch (new_state) {
+        case State::ACTIVELY_PRESENT: new_state_str = "ACTIVELY_PRESENT"; break;
+        case State::IDLE_WITH_SCANNING: new_state_str = "IDLE_WITH_SCANNING"; break;
+        case State::AWAY_CONFIRMED: new_state_str = "AWAY_CONFIRMED"; break;
     }
+    
+    logger.info("State transition: " + getStateString() + " -> " + new_state_str);
     
     current_state_ = new_state;
     state_entry_time_ = std::chrono::steady_clock::now();
 }
 
 bool PresenceDetector::ensureDetectorInitialized() {
-    // Lazy-load FaceDetector to save memory when outside schedule
     if (!face_detector_) {
-        face_detector_ = std::make_unique<faceid::FaceDetector>();
+        face_detector_ = std::make_unique<FaceDetector>();
+        if (!face_detector_->loadModels()) {
+            Logger::getInstance().error("Failed to load face detection models");
+            return false;
+        }
         Logger::getInstance().info("Face detector initialized (lazy load)");
     }
-    // LibFaceDetection has embedded models - no explicit model loading needed
     return true;
 }
 
-bool PresenceDetector::detectFace() {
+// CRITICAL SECURITY FUNCTION: Detect AND Recognize face
+bool PresenceDetector::detectAndRecognizeFace() {
     try {
         total_scans_++;
         
-        // Ensure detector is initialized before use
+        // Ensure detector is initialized
         if (!ensureDetectorInitialized()) {
-            failed_detections_++;
             return false;
         }
         
-        Image frame = captureFrame();
+        // Step 1: Capture frame and close camera IMMEDIATELY
+        Image frame = captureFrameAndClose();
         if (frame.empty()) {
-            failed_detections_++;
             return false;
         }
         
-        // Check if camera shutter is closed
+        // Step 2: Check if camera shutter is closed
         ShutterState shutter = detectShutterState(frame.view());
         if (shutter == ShutterState::CLOSED) {
-            char log_buf[256];
-            snprintf(log_buf, sizeof(log_buf), 
-                    "Camera shutter closed, skipping face detection (closed count: %d)",
-                    consecutive_shutter_closed_scans_);
-            Logger::getInstance().info(log_buf);
+            Logger::getInstance().info("Camera shutter closed, skipping face detection");
             last_shutter_state_ = ShutterState::CLOSED;
-            failed_detections_++;
             return false;
         }
         
@@ -512,345 +446,336 @@ bool PresenceDetector::detectFace() {
         }
         last_shutter_state_ = shutter;
         
-         // Use FaceDetector with tracking for better performance
-         // Convert frame to BGR if needed (Camera might return grayscale)
-         Image bgr_frame = std::move(frame);
-         if (bgr_frame.channels() != 3) {
-          bgr_frame = convertGrayToBGRLibyuv(bgr_frame.view());
-          }
-          
-          // Use cascading detection for robust presence detection in all lighting conditions
-          auto cascade_result = face_detector_->detectFacesCascade(bgr_frame.view(), false);
-         
-         bool detected = !cascade_result.faces.empty();
-         
-         if (detected) {
-             Logger::getInstance().debug("Face detected in presence check (stage " + 
-                                       std::to_string(cascade_result.stage_used) + ")");
-             // Cache frame for peek detection (only if peek enabled)
-             if (no_peek_enabled_) {
-                 // Use the preprocessed frame from cascade for consistency
-                 last_captured_frame_ = cascade_result.processed_frame.clone();
-             }
-         }
-        
-        if (detected) {
-            successful_detections_++;
-        } else {
-            failed_detections_++;
+        // Step 3: Detect faces using cascade
+        Image bgr_frame = std::move(frame);
+        if (bgr_frame.channels() != 3) {
+            bgr_frame = convertGrayToBGRLibyuv(bgr_frame.view());
         }
         
-        return detected;
+        auto cascade_result = face_detector_->detectFacesCascade(bgr_frame.view(), false);
+        
+        if (cascade_result.faces.empty()) {
+            Logger::getInstance().debug("No faces detected");
+            return false; // No face detected
+        }
+        
+        Logger::getInstance().debug("Face(s) detected (stage " + 
+                                   std::to_string(cascade_result.stage_used) + 
+                                   "), checking authorization...");
+        
+        // Step 4: Recognize faces (SECURITY: required!)
+        if (!recognition_required_) {
+            Logger::getInstance().warning("Recognition disabled - accepting any face (INSECURE!)");
+            // Check for peek if enabled
+            if (no_peek_enabled_) {
+                checkForPeek(cascade_result);
+            }
+            return true;
+        }
+        
+        // Encode faces
+        auto encodings = face_detector_->encodeFaces(
+            cascade_result.processed_frame.view(),
+            cascade_result.faces
+        );
+        
+        if (encodings.empty()) {
+            Logger::getInstance().error("Failed to encode detected faces");
+            return false;
+        }
+        
+        // Step 5: Match against enrolled users
+        bool authorized = false;
+        for (const auto& encoding : encodings) {
+            if (matchAgainstEnrolledUsers(encoding)) {
+                authorized = true;
+                break;
+            }
+        }
+        
+        if (!authorized) {
+            // SECURITY: Unknown person detected!
+            Logger::getInstance().warning("SECURITY ALERT: Unauthorized person detected!");
+            lockScreen(); // IMMEDIATE LOCK!
+            return false;
+        }
+        
+        // Step 6: Authorized user - check for peek if enabled
+        if (no_peek_enabled_) {
+            checkForPeek(cascade_result);
+        }
+        
+        return true; // Authorized user present
         
     } catch (const std::exception& e) {
-        Logger::getInstance().error(std::string("Face detection error: ") + e.what());
-        last_captured_frame_ = Image();
+        Logger::getInstance().error(std::string("Face detection/recognition error: ") + e.what());
         return false;
     }
 }
 
-Image PresenceDetector::captureFrame() {
-    std::lock_guard<std::mutex> lock(camera_mutex_);
+// NEW: Capture frame and close camera immediately (privacy fix!)
+Image PresenceDetector::captureFrameAndClose() {
+    Logger& logger = Logger::getInstance();
     
-    // Initialize camera if not already open
-    if (!camera_ || !camera_->isOpened()) {
-        camera_ = std::make_unique<Camera>(camera_device_);
-        
-        Logger& logger = Logger::getInstance();
-        
-        // Use configured resolution for presence detection
-        int width = presence_camera_width_;
-        int height = presence_camera_height_;
-        
-        logger.info("Attempting to open camera with resolution: " + 
-                   std::to_string(width) + "x" + std::to_string(height));
-        
-        if (!camera_->open(width, height)) {
-            logger.error("Failed to open camera: " + camera_device_ + 
-                        " with resolution " + std::to_string(width) + "x" + std::to_string(height));
-            logger.error("Presence detection will be disabled. Check camera capabilities with: v4l2-ctl --device=" + 
-                        camera_device_ + " --list-formats-ext");
-            return Image();
-        }
-        
-        // Log successful camera opening with actual resolution
-        logger.info("Camera opened for presence detection");
-        logger.info("Camera device: " + camera_device_);
-        logger.info("Requested resolution: " + std::to_string(width) + "x" + std::to_string(height));
-        logger.warning("NOTE: If camera doesn't support requested resolution, detection may fail or produce distorted images");
-    }
+    Camera camera(camera_device_);
     
-    Image frame;
-    if (!camera_->read(frame)) {
-        Logger::getInstance().error("Failed to capture frame");
+    if (!camera.open(presence_camera_width_, presence_camera_height_)) {
+        logger.error("Failed to open camera: " + camera_device_);
         return Image();
     }
     
-    return frame;
-}
-
-bool PresenceDetector::hasRecentActivity() const {
-    // NEW IMPLEMENTATION: Use /dev/input/event* modification time
-    // This is much faster and more reliable than /proc/interrupts
-    
-    time_t last_activity = getLastInputDeviceActivity();
-    
-    if (last_activity == 0) {
-        return false;  // Could not determine
+    // Warm-up for IR cameras (5 frames to stabilize illuminator)
+    Image warmup;
+    for (int i = 0; i < 5; i++) {
+        if (!camera.read(warmup)) {
+            logger.warning("Warm-up frame " + std::to_string(i + 1) + " failed");
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
     
-    time_t now = time(nullptr);
-    time_t idle_seconds = now - last_activity;
+    // Capture actual frame
+    Image frame;
+    if (!camera.read(frame)) {
+        logger.error("Failed to capture frame");
+        camera.close();
+        return Image();
+    }
     
-    // Apply mouse jitter threshold
-    if (idle_seconds == 0 && last_device_was_mouse_) {
-        // Check if mouse moved very recently (within jitter threshold)
-        auto now_steady = std::chrono::steady_clock::now();
-        auto since_last_mouse = std::chrono::duration_cast<std::chrono::milliseconds>(
-            now_steady - last_mouse_activity_time_).count();
+    // CRITICAL: Close camera immediately! (Privacy + fixes "camera on too long")
+    camera.close();
+    
+    return frame; // Return by move
+}
+
+// Face recognition: Match against enrolled users
+bool PresenceDetector::matchAgainstEnrolledUsers(const FaceEncoding& encoding) {
+    Logger& logger = Logger::getInstance();
+    
+    // Load enrolled users only once at first use (not periodically)
+    // MEMORY FIX: Avoid reloading large datasets repeatedly
+    if (enrolled_encodings_.empty()) {
+        auto now = std::chrono::steady_clock::now();
         
-        if (since_last_mouse < mouse_jitter_threshold_ms_) {
-            // Too soon after last mouse activity, might be jitter - ignore
-            return false;
+        // Load all enrolled users
+        auto& cache = ModelCache::getInstance();
+        auto all_users = cache.loadAllUsersParallel(4);
+        
+        enrolled_encodings_.clear();
+        enrolled_encodings_.reserve(all_users.size() * 5); // Pre-allocate to avoid reallocation
+        
+        for (const auto& user : all_users) {
+            // Flatten all encodings from all poses
+            for (const auto& pose_encodings : user.sample_encodings) {
+                enrolled_encodings_.insert(
+                    enrolled_encodings_.end(),
+                    pose_encodings.begin(),
+                    pose_encodings.end()
+                );
+            }
+        }
+        
+        last_enrollment_load_ = now;
+        logger.info("Loaded " + std::to_string(enrolled_encodings_.size()) + 
+                   " encodings from " + std::to_string(all_users.size()) + " users (cached for session)");
+    }
+    
+    if (enrolled_encodings_.empty()) {
+        logger.warning("No enrolled users found - cannot verify authorization!");
+        return false;
+    }
+    
+    // Match against enrolled encodings
+    // TODO: Load threshold from config
+    auto& config = Config::getInstance();
+    double threshold = config.getDouble("authentication", "threshold").value_or(0.4);
+    
+    for (const auto& enrolled : enrolled_encodings_) {
+        double distance = face_detector_->compareFaces(encoding, enrolled);
+        if (distance < threshold) {
+            logger.debug("Match found! Distance: " + std::to_string(distance));
+            return true; // Match found!
         }
     }
     
-    // Activity detected if idle < 2 seconds
-    bool activity = (idle_seconds < 2);
-    
-    if (activity) {
-        Logger& logger = Logger::getInstance();
-        logger.debug("ACTIVITY DETECTED: Input activity within last " + 
-                    std::to_string(idle_seconds) + " seconds");
+    logger.debug("No match found (best distance above threshold)");
+    return false; // No match
+}
+
+// Enhanced peek detection with notifications
+void PresenceDetector::checkForPeek(const FaceDetector::CascadeResult& cascade_result) {
+    if (!peek_detector_) {
+        return;
     }
     
-    return activity;
+    PeekAnalysis peek = peek_detector_->analyze(
+        cascade_result.processed_frame.view(),
+        cascade_result.faces
+    );
+    
+    Logger& logger = Logger::getInstance();
+    
+    if (peek.watchers > 0) {
+        // Someone is looking at screen!
+        logger.warning("PEEK DETECTED: " + std::to_string(peek.watchers) + 
+                      " person(s) watching screen (passing by: " + 
+                      std::to_string(peek.passing_by) + ")");
+        
+        // Send notification
+        if (peek_show_notification_) {
+            std::string msg = std::to_string(peek.watchers) + 
+                             " person(s) watching your screen!";
+            NotificationHelper::sendSecurityAlert(msg);
+        }
+        
+        // Optional actions (configurable)
+        if (peek_blur_screen_ || peek_blank_screen_) {
+            blankScreen();
+        }
+        
+        updatePeekState(true);
+    } else {
+        updatePeekState(false);
+    }
+}
+
+void PresenceDetector::updatePeekState(bool peek_detected) {
+    if (!no_peek_enabled_) {
+        return;
+    }
+    
+    Logger& logger = Logger::getInstance();
+    auto now = std::chrono::steady_clock::now();
+    
+    if (peek_detected) {
+        if (peek_state_ == PeekState::NO_PEEK) {
+            peek_state_ = PeekState::PEEK_DETECTED;
+            peek_first_detected_ = now;
+            consecutive_peek_detections_ = 1;
+            logger.info("Peek DETECTED (first time)");
+        } else {
+            consecutive_peek_detections_++;
+            
+            auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - peek_first_detected_).count();
+            
+            if (duration_ms >= peek_detection_delay_ms_ && 
+                peek_state_ != PeekState::PEEK_CONFIRMED) {
+                peek_state_ = PeekState::PEEK_CONFIRMED;
+                logger.warning("Peek CONFIRMED - screen actions triggered");
+            }
+        }
+        
+        peek_last_seen_ = now;
+    } else {
+        if (peek_state_ != PeekState::NO_PEEK) {
+            auto time_since_last_peek_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - peek_last_seen_).count();
+            
+            if (time_since_last_peek_ms >= unblank_delay_ms_) {
+                logger.info("Peek cleared - unblanking screen");
+                peek_state_ = PeekState::NO_PEEK;
+                consecutive_peek_detections_ = 0;
+                unblankScreen();
+            }
+        }
+    }
+}
+
+void PresenceDetector::blankScreen() {
+    if (screen_blanked_) {
+        return;
+    }
+    
+    Logger& logger = Logger::getInstance();
+    logger.warning("BLANKING screen due to peek detection");
+    
+    // Method 1: loginctl (works on Wayland/X11)
+    int ret = system("loginctl lock-sessions 2>/dev/null");
+    if (ret == 0) {
+        screen_blanked_ = true;
+        logger.info("Screen blanked via loginctl");
+        return;
+    }
+    
+    // Method 2: KDE D-Bus (Wayland-specific)
+    if (is_wayland_) {
+        ret = system("qdbus org.freedesktop.ScreenSaver /ScreenSaver Lock 2>/dev/null");
+        if (ret == 0) {
+            screen_blanked_ = true;
+            logger.info("Screen blanked via KDE D-Bus");
+            return;
+        }
+    }
+    
+    logger.error("Failed to blank screen");
+}
+
+void PresenceDetector::unblankScreen() {
+    if (!screen_blanked_) {
+        return;
+    }
+    
+    Logger& logger = Logger::getInstance();
+    logger.info("Unblanking screen");
+    
+    // Note: Screen unlocking typically requires user interaction
+    // We can only trigger wake, not unlock
+    screen_blanked_ = false;
+}
+
+// NEW: Simplified with InputMonitor (event-driven, not polling!)
+bool PresenceDetector::hasRecentActivity() const {
+    if (!input_monitor_ || !input_monitor_->isRunning()) {
+        return false;
+    }
+    
+    auto last_activity = input_monitor_->getLastActivity();
+    auto now = std::chrono::steady_clock::now();
+    auto idle_time = std::chrono::duration_cast<std::chrono::seconds>(
+        now - last_activity).count();
+    
+    return (idle_time < 5); // Activity within last 5 seconds
 }
 
 bool PresenceDetector::detectDisplayServer() {
-    // Method 1: Check environment variables (works if service has them)
+    // Method 1: Check environment variables
     const char* wayland_display = getenv("WAYLAND_DISPLAY");
     if (wayland_display && strlen(wayland_display) > 0) {
-        return true;  // Wayland
+        return true; // Wayland
     }
     
     const char* session_type = getenv("XDG_SESSION_TYPE");
     if (session_type && strcmp(session_type, "wayland") == 0) {
-        return true;  // Wayland
+        return true; // Wayland
     }
     
-    // Method 2: Check via loginctl (more reliable for systemd services)
+    // Method 2: Check via loginctl
     FILE* pipe = popen("loginctl show-session $(loginctl list-sessions --no-legend | awk '{print $1}' | head -1) -p Type --value 2>/dev/null | head -1", "r");
     if (pipe) {
         char buffer[32];
         bool wayland = false;
         if (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
             std::string type(buffer);
-            // Remove whitespace
             type.erase(type.find_last_not_of(" \n\r\t") + 1);
             if (type == "wayland") {
                 wayland = true;
             }
         }
-        pclose(pipe);  // Only close once
+        pclose(pipe);
         if (wayland) {
-            return true;  // Wayland
+            return true;
         }
     }
     
-    return false;  // X11 or unknown (assume X11)
+    return false; // X11 or unknown
 }
 
-std::chrono::steady_clock::time_point PresenceDetector::getLastInputActivity() const {
-    auto now = std::chrono::steady_clock::now();
-    Logger& logger = Logger::getInstance();
-    
-    // Use /proc/interrupts for both X11 and Wayland (most reliable method)
-    // Check for input device interrupt changes
-    FILE* pipe = popen("grep -E 'i8042|keyboard|mouse' /proc/interrupts 2>/dev/null | awk '{sum+=$2} END {print sum}'", "r");
-    if (pipe) {
-        char buffer[128];
-        if (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
-            pclose(pipe);
-            try {
-                unsigned long interrupt_count = std::stoul(buffer);
-                unsigned long prev_count = last_interrupt_count_;
-                
-                logger.info("Interrupt check: current=" + std::to_string(interrupt_count) + 
-                           ", previous=" + std::to_string(prev_count) + 
-                           ", delta=" + std::to_string(interrupt_count - prev_count));
-                
-                if (interrupt_count > last_interrupt_count_) {
-                    // Input activity detected - interrupts increased
-                    last_interrupt_count_ = interrupt_count;
-                    logger.info("ACTIVITY DETECTED: Interrupts increased from " + 
-                               std::to_string(prev_count) + " to " + std::to_string(interrupt_count));
-                    return now;
-                }
-                // No new interrupts - calculate time since last activity
-                // We don't know exact time, but we know it's been at least a few seconds
-                // Return a time in the past to indicate idle
-                logger.info("NO ACTIVITY: Interrupts unchanged at " + std::to_string(interrupt_count));
-                return now - std::chrono::seconds(60);
-            } catch (...) {
-                // Parsing failed
-                logger.error("Failed to parse interrupt count");
-            }
-        } else {
-            pclose(pipe);
-        }
-    }
-    
-    // Fallback: Try X11 xprintidle if available
-    if (!is_wayland_) {
-        FILE* pipe2 = popen("xprintidle 2>/dev/null", "r");
-        if (pipe2) {
-            char buffer[128];
-            if (fgets(buffer, sizeof(buffer), pipe2) != nullptr) {
-                pclose(pipe2);
-                try {
-                    long idle_ms = std::stol(buffer);
-                    return now - std::chrono::milliseconds(idle_ms);
-                } catch (...) {
-                    // Parsing failed
-                }
-            } else {
-                pclose(pipe2);
-            }
-        }
-    }
-    
-    // Final fallback: Return time in past to indicate idle
-    return now - std::chrono::hours(1);
-}
-
-PresenceDetector::Statistics PresenceDetector::getStatistics() const {
-    auto now = std::chrono::steady_clock::now();
-    auto uptime = std::chrono::duration_cast<std::chrono::seconds>(now - start_time_).count();
-    
-    return Statistics{
-        .totalScans = total_scans_.load(),
-        .facesDetected = successful_detections_.load(),
-        .failedScans = failed_detections_.load(),
-        .stateTransitions = state_transitions_.load(),
-        .uptimeSeconds = static_cast<int>(uptime)
-    };
-}
-
-// NEW: Input device detection using /dev/input mtime and interrupts
-time_t PresenceDetector::getLastInputDeviceActivity() const {
-    // Cache activity checks to reduce /proc/interrupts reads and memory churn
-    auto now = std::chrono::steady_clock::now();
-    auto time_since_last_check = std::chrono::duration_cast<std::chrono::seconds>(
-        now - last_activity_check_).count();
-    
-    // Return cached value if checked recently (within activity_cache_duration_)
-    if (time_since_last_check < activity_cache_duration_.count()) {
-        return cached_last_activity_;
-    }
-    
-    // Time to perform actual check
-    last_activity_check_ = now;
-    
-    Logger& logger = Logger::getInstance();
-    
-    // Method 1: Use /proc/interrupts (most reliable for built-in keyboard/touchpad)
-    // This works for PS/2 devices (i8042) and GPIO-based devices (touchpads/touchscreens)
-    time_t latest_input_time = 0;
-    {
-        std::ifstream interrupts("/proc/interrupts");
-        if (!interrupts.is_open()) {
-            logger.debug("Failed to open /proc/interrupts");
-            return cached_last_activity_;  // Return cached value on error
-        }
-        
-        unsigned long long total_count = 0;
-        std::string line;
-        line.reserve(256);  // Pre-allocate to reduce reallocations
-        
-        while (std::getline(interrupts, line)) {
-            // Look for input-related interrupts:
-            // - i8042: PS/2 keyboard/mouse controller (laptop built-in keyboard/touchpad)
-            // - amd_gpio: GPIO-based i2c devices (modern touchscreens/touchpads)
-            if (line.find("i8042") != std::string::npos ||
-                line.find("amd_gpio") != std::string::npos) {
-                
-                // Parse interrupt counts from all CPUs and sum them
-                // Use C-style parsing to avoid istringstream allocation overhead
-                const char* ptr = line.c_str();
-                
-                // Skip IRQ number (everything before first colon)
-                while (*ptr && *ptr != ':') ptr++;
-                if (*ptr == ':') ptr++;
-                
-                // Sum all CPU interrupt counts
-                unsigned long long count;
-                while (*ptr) {
-                    while (*ptr == ' ' || *ptr == '\t') ptr++;  // Skip whitespace
-                    if (*ptr >= '0' && *ptr <= '9') {
-                        char* end;
-                        count = strtoull(ptr, &end, 10);
-                        total_count += count;
-                        ptr = end;
-                    } else {
-                        break;  // Reached device name part
-                    }
-                }
-            }
-        }
-        
-        interrupts.close();  // Explicit close to free resources immediately
-        
-        // Store the interrupt count (static for persistence across calls)
-        // Use atomics for thread safety
-        static std::atomic<unsigned long long> last_interrupt_count{0};
-        static std::atomic<time_t> last_interrupt_time{time(nullptr)};
-        
-        // Debug logging
-        unsigned long long prev_count = last_interrupt_count.load();
-        char log_buf[256];
-        snprintf(log_buf, sizeof(log_buf), 
-                "Interrupt check: total_count=%llu, last_count=%llu, delta=%lld",
-                total_count, prev_count, 
-                (long long)(total_count - prev_count));
-        logger.debug(log_buf);
-        
-        // If interrupt count increased, update timestamp  
-        if (total_count > prev_count && total_count > 0) {
-            last_interrupt_count.store(total_count);
-            last_interrupt_time.store(time(nullptr));
-            logger.debug("ACTIVITY DETECTED: Interrupt count increased!");
-        }
-        
-        // Use interrupt time if available
-        time_t stored_time = last_interrupt_time.load();
-        if (stored_time > 0) {
-            latest_input_time = stored_time;
-        }
-    }
-    
-    // If no activity detected anywhere, return cached value
-    if (latest_input_time == 0) {
-        logger.debug("No input activity detected");
-        return cached_last_activity_;
-    }
-    
-    // Update cache
-    cached_last_activity_ = latest_input_time;
-    
-    return latest_input_time;
-}
-
-// NEW: Schedule checking
 bool PresenceDetector::isWithinSchedule() const {
-    // If schedule is disabled, always return true (active all the time)
     if (!schedule_enabled_) {
         return true;
     }
     
-    Logger& logger = Logger::getInstance();
-    
-    // Get current day of week and time
     time_t now = time(nullptr);
     struct tm* local_time = localtime(&now);
     
@@ -871,66 +796,50 @@ bool PresenceDetector::isWithinSchedule() const {
     }
     
     if (!day_active) {
-        logger.debug("Outside schedule: Current day " + std::to_string(current_day) + 
-                    " not in active days");
         return false;
     }
     
     // Check if current time is within active range
-    bool time_active = (current_time >= schedule_time_start_ && 
-                       current_time <= schedule_time_end_);
-    
-    if (!time_active) {
-        logger.debug("Outside schedule: Current time " + std::to_string(current_time) + 
-                    " not in range " + std::to_string(schedule_time_start_) + 
-                    "-" + std::to_string(schedule_time_end_));
-        return false;
-    }
-    
-    logger.debug("Within schedule: Day " + std::to_string(current_day) + 
-                ", Time " + std::to_string(current_time));
-    return true;
+    return (current_time >= schedule_time_start_ && 
+            current_time <= schedule_time_end_);
 }
 
-
-// NEW: Lock screen trigger
 void PresenceDetector::lockScreen() {
     Logger& logger = Logger::getInstance();
     logger.info("Attempting to lock screen...");
     
-    // Method 1: loginctl lock-sessions (works from systemd service, locks ALL sessions)
-    // This is the most reliable method for systemd services running as root
+    // Method 1: loginctl (most reliable)
     int ret = system("loginctl lock-sessions 2>/dev/null");
     if (ret == 0) {
-        logger.info("Screen locked successfully via loginctl lock-sessions");
+        logger.info("Screen locked via loginctl lock-sessions");
         return;
     }
     
-    // Method 2: Lock specific session (try to get active session)
+    // Method 2: Lock specific session
     ret = system("loginctl lock-session $(loginctl list-sessions --no-legend | awk '{print $1}' | head -1) 2>/dev/null");
     if (ret == 0) {
-        logger.info("Screen locked successfully via loginctl lock-session");
+        logger.info("Screen locked via loginctl lock-session");
         return;
     }
     
-    // Method 3: KDE-specific via user's D-Bus session (requires env variables)
-    // This will fail from systemd service but worth trying
-    ret = system("su - $(loginctl list-sessions --no-legend | awk '{print $3}' | head -1) -c 'qdbus org.freedesktop.ScreenSaver /ScreenSaver Lock' 2>/dev/null");
-    if (ret == 0) {
-        logger.info("Screen locked successfully via user D-Bus session");
-        return;
+    // Method 3: KDE-specific
+    if (is_wayland_) {
+        ret = system("qdbus org.freedesktop.ScreenSaver /ScreenSaver Lock 2>/dev/null");
+        if (ret == 0) {
+            logger.info("Screen locked via KDE D-Bus");
+            return;
+        }
     }
     
     logger.error("Failed to lock screen - all methods failed");
 }
 
-// NEW: Camera shutter detection
 PresenceDetector::ShutterState PresenceDetector::detectShutterState(const ImageView& frame) {
     if (frame.empty()) {
         return ShutterState::UNCERTAIN;
     }
     
-    // Calculate mean brightness (average across all pixels and channels)
+    // Calculate mean brightness
     double sum = 0.0;
     int pixel_count = 0;
     const uint8_t* data = frame.data();
@@ -949,8 +858,7 @@ PresenceDetector::ShutterState PresenceDetector::detectShutterState(const ImageV
     
     double brightness = (pixel_count > 0) ? (sum / pixel_count) : 0.0;
     
-    // Calculate standard deviation (variance indicator)
-    // First pass: calculate mean (already have it as brightness)
+    // Calculate standard deviation
     double variance_sum = 0.0;
     for (int y = 0; y < frame.height(); y++) {
         const uint8_t* row = data + y * stride;
@@ -965,24 +873,13 @@ PresenceDetector::ShutterState PresenceDetector::detectShutterState(const ImageV
     
     double stddev = (pixel_count > 0) ? std::sqrt(variance_sum / pixel_count) : 0.0;
     
-    Logger& logger = Logger::getInstance();
-    
-    // Debug logging (throttled to every 5 seconds)
-    static auto last_log = std::chrono::steady_clock::now();
-    auto now = std::chrono::steady_clock::now();
-    if (std::chrono::duration_cast<std::chrono::seconds>(now - last_log).count() >= 5) {
-        logger.debug("Shutter check: brightness=" + std::to_string(brightness) + 
-                    ", stddev=" + std::to_string(stddev));
-        last_log = now;
-    }
-    
     // Check if image is pure black (shutter closed)
     if (brightness < shutter_brightness_threshold_ && 
         stddev < shutter_variance_threshold_) {
         return ShutterState::CLOSED;
     }
     
-    // Check if very dark but with some variance (might be dark room)
+    // Check if very dark
     if (brightness < 15.0) {
         return ShutterState::UNCERTAIN;
     }
@@ -990,235 +887,25 @@ PresenceDetector::ShutterState PresenceDetector::detectShutterState(const ImageV
     return ShutterState::OPEN;
 }
 
-// No-peek detection (detects shoulder surfing - additional faces behind user)
-bool PresenceDetector::detectPeek(const ImageView& frame) {
-     if (!no_peek_enabled_ || frame.empty()) {
-         return false;
-     }
-     
-     Logger& logger = Logger::getInstance();
-     
-     try {
-        // Use FaceDetector with tracking for peek detection
-        std::vector<Rect> face_rects;
-        Image processed_frame;
-        
-        if (frame.channels() != 3) {
-            // Convert grayscale to BGR if needed
-            Image bgr_frame = convertGrayToBGRLibyuv(frame);
-            // Use cascading detection for robust peek detection
-            auto cascade_result = face_detector_->detectFacesCascade(bgr_frame.view(), false);
-            processed_frame = std::move(cascade_result.processed_frame);
-            face_rects = cascade_result.faces;
-        } else {
-            // Already BGR, use cascading detection
-            auto cascade_result = face_detector_->detectFacesCascade(frame, false);
-            processed_frame = std::move(cascade_result.processed_frame);
-            face_rects = cascade_result.faces;
-        }
-         
-         if (face_rects.empty()) {
-             return false;  // No faces at all
-         }
-         
-         // Filter out faces that are too small (too far away to see screen)
-         std::vector<Rect> filtered_faces;
-         for (const auto& face : face_rects) {
-             double face_size_percent = static_cast<double>(face.width) / frame.width();
-             if (face_size_percent >= min_face_size_percent_) {
-                 filtered_faces.push_back(face);
-             }
-         }
-         
-         // Check if we have multiple distinct faces
-         if (filtered_faces.size() < 2) {
-             return false;  // Only one person (or none after filtering)
-         }
-         
-         // Use FaceDetector helper to count distinct faces
-         // (This filters out same person detected multiple times due to movement)
-         int distinct_count = FaceDetector::countDistinctFaces(filtered_faces, min_face_distance_pixels_);
-         
-         bool peek = (distinct_count >= 2);
-         
-         if (peek) {
-             logger.warning("NO PEEK: Detected " + std::to_string(distinct_count) + 
-                           " distinct faces (potential shoulder surfing)");
-         }
-         
-         return peek;
-         
-     } catch (const std::exception& e) {
-         logger.error(std::string("Peek detection error: ") + e.what());
-         return false;
-     }
+void PresenceDetector::setGazeThresholds(float yaw, float pitch) {
+    gaze_yaw_threshold_ = yaw;
+    gaze_pitch_threshold_ = pitch;
+    if (peek_detector_) {
+        peek_detector_->setGazeThresholds(yaw, pitch);
+    }
 }
 
-void PresenceDetector::updatePeekState(bool peek_detected) {
-    if (!no_peek_enabled_) {
-        return;
-    }
-    
-    Logger& logger = Logger::getInstance();
+PresenceDetector::Statistics PresenceDetector::getStatistics() const {
     auto now = std::chrono::steady_clock::now();
+    auto uptime = std::chrono::duration_cast<std::chrono::seconds>(now - start_time_).count();
     
-    if (peek_detected) {
-        // Peek detected in current frame
-        if (peek_state_ == PeekState::NO_PEEK) {
-            // First detection
-            peek_state_ = PeekState::PEEK_DETECTED;
-            peek_first_detected_ = now;
-            consecutive_peek_detections_ = 1;
-            logger.info("Peek DETECTED (first time)");
-        } else {
-            // Already detected, check if we should confirm
-            consecutive_peek_detections_++;
-            
-            auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                now - peek_first_detected_).count();
-            
-            if (duration_ms >= peek_detection_delay_ms_ && 
-                peek_state_ != PeekState::PEEK_CONFIRMED) {
-                // Confirmed: peek has persisted long enough
-                peek_state_ = PeekState::PEEK_CONFIRMED;
-                logger.warning("Peek CONFIRMED - blanking screen");
-                blankScreen();
-            }
-        }
-        
-        peek_last_seen_ = now;
-        
-    } else {
-        // No peek in current frame
-        if (peek_state_ != PeekState::NO_PEEK) {
-            // Check if peek disappeared long enough to unblank
-            auto time_since_last_peek_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                now - peek_last_seen_).count();
-            
-            if (time_since_last_peek_ms >= unblank_delay_ms_) {
-                // Peek has been gone for grace period
-                logger.info("Peek cleared - unblanking screen");
-                peek_state_ = PeekState::NO_PEEK;
-                consecutive_peek_detections_ = 0;
-                unblankScreen();
-            }
-        }
-    }
-}
-
-void PresenceDetector::blankScreen() {
-    if (screen_blanked_) {
-        return;  // Already blanked
-    }
-    
-    Logger& logger = Logger::getInstance();
-    logger.warning("BLANKING screen due to peek detection");
-    
-    // Try multiple methods to blank screen
-    bool success = false;
-    
-    // Method 1: DPMS off via xset (works on X11)
-    int ret = system("DISPLAY=:0 xset dpms force off 2>/dev/null");
-    if (ret == 0) {
-        success = true;
-        logger.info("Screen blanked via xset (X11)");
-    }
-    
-    // Method 2: KDE Plasma screen blanking (Wayland)
-    if (!success) {
-        ret = system("qdbus org.kde.KWin.ScreenSaver2 /ScreenSaver setActive true 2>/dev/null");
-        if (ret == 0) {
-            success = true;
-            logger.info("Screen blanked via KDE ScreenSaver (Wayland)");
-        }
-    }
-    
-    // Method 3: GNOME (Wayland/X11)
-    if (!success) {
-        ret = system("dbus-send --session --type=method_call --dest=org.gnome.ScreenSaver "
-                    "/org/gnome/ScreenSaver org.gnome.ScreenSaver.SetActive boolean:true 2>/dev/null");
-        if (ret == 0) {
-            success = true;
-            logger.info("Screen blanked via GNOME ScreenSaver");
-        }
-    }
-    
-    // Method 4: Generic wlr-randr for wlroots compositors (Sway, etc.)
-    if (!success) {
-        ret = system("wlr-randr --output '*' --off 2>/dev/null");
-        if (ret == 0) {
-            success = true;
-            logger.info("Screen blanked via wlr-randr");
-        }
-    }
-    
-    if (success) {
-        screen_blanked_ = true;
-    } else {
-        logger.error("Failed to blank screen - all methods failed");
-    }
-}
-
-void PresenceDetector::unblankScreen() {
-    if (!screen_blanked_) {
-        return;  // Not blanked
-    }
-    
-    Logger& logger = Logger::getInstance();
-    logger.info("UNBLANKING screen - peek cleared");
-    
-    // Try multiple methods to unblank screen
-    bool success = false;
-    
-    // Method 1: DPMS on via xset (works on X11)
-    int ret = system("DISPLAY=:0 xset dpms force on 2>/dev/null");
-    if (ret == 0) {
-        success = true;
-        logger.info("Screen unblanked via xset (X11)");
-    }
-    
-    // Method 2: KDE Plasma screen unblanking (Wayland)
-    if (!success) {
-        ret = system("qdbus org.kde.KWin.ScreenSaver2 /ScreenSaver setActive false 2>/dev/null");
-        if (ret == 0) {
-            success = true;
-            logger.info("Screen unblanked via KDE ScreenSaver (Wayland)");
-        }
-    }
-    
-    // Method 3: GNOME (Wayland/X11)
-    if (!success) {
-        ret = system("dbus-send --session --type=method_call --dest=org.gnome.ScreenSaver "
-                    "/org/gnome/ScreenSaver org.gnome.ScreenSaver.SetActive boolean:false 2>/dev/null");
-        if (ret == 0) {
-            success = true;
-            logger.info("Screen unblanked via GNOME ScreenSaver");
-        }
-    }
-    
-    // Method 4: Generic wlr-randr for wlroots compositors
-    if (!success) {
-        ret = system("wlr-randr --output '*' --on 2>/dev/null");
-        if (ret == 0) {
-            success = true;
-            logger.info("Screen unblanked via wlr-randr");
-        }
-    }
-    
-    // Method 5: Simple mouse wiggle to wake screen (fallback)
-    if (!success) {
-        ret = system("xdotool mousemove_relative -- 1 0 2>/dev/null");
-        if (ret == 0) {
-            success = true;
-            logger.info("Screen unblanked via mouse wiggle");
-        }
-    }
-    
-    if (success) {
-        screen_blanked_ = false;
-    } else {
-        logger.error("Failed to unblank screen - may need manual intervention");
-    }
+    return Statistics{
+        .totalScans = total_scans_.load(),
+        .facesDetected = successful_detections_.load(),
+        .failedScans = failed_detections_.load(),
+        .stateTransitions = state_transitions_.load(),
+        .uptimeSeconds = static_cast<int>(uptime)
+    };
 }
 
 } // namespace faceid

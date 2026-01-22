@@ -21,7 +21,9 @@ ProtectHome=true
 ReadWritePaths=/var/log/faceid.log
 
 # Resource limits
-MemoryMax=100M
+# Recognition model is 84MB + detection models ~1MB + runtime overhead
+# 256MB provides comfortable headroom for face recognition operations
+MemoryMax=256M
 CPUQuota=10%
 
 # User and group (run as root to access devices)
