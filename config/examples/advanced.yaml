@@ -1,0 +1,37 @@
+# FaceID Advanced Configuration (Optional)
+# ~/.config/faceid/advanced.yaml
+#
+# Use this file if you want to tune performance or accuracy.
+# This file is optional - if it doesn't exist, defaults are used.
+#
+# Values here override config.yaml
+
+# Camera fine-tuning
+camera:
+  width: 640
+  height: 360
+  fps: 15
+
+# Recognition tuning
+recognition:
+  # Recognition threshold (0.0 = very strict, 1.0 = very loose)
+  # Default 0.4 works well for most people
+  # Lower = stricter matching (more rejections)
+  # Higher = looser matching (more false positives)
+  threshold: 0.4
+  
+  # Number of frames to average for temporal smoothing
+  # Higher = more stable but slower response
+  temporal_frames: 3
+
+# Performance tuning
+performance:
+  # Number of threads for face detection
+  # Increase for faster detection on multi-core systems
+  threads: 2
+
+# Fingerprint timing
+fingerprint:
+  # Delay before enabling fingerprint (milliseconds)
+  # Gives face authentication a head start
+  delay_ms: 500

@@ -1,0 +1,43 @@
+# FaceID Configuration - Minimal & Beginner-Friendly
+# ~/.config/faceid/config.yaml
+#
+# This is the simplest possible config. Most settings use smart defaults.
+# Only change values you specifically need to customize.
+#
+# Lines starting with # are comments.
+
+# Camera Configuration
+camera:
+  # Device to use: "auto" to auto-detect, or a specific device like /dev/video2
+  device: auto
+
+# Authentication Methods
+authentication:
+  # Enable/disable authentication methods
+  face: true
+  fingerprint: true
+  
+  # Authentication timeout in seconds (1-60)
+  timeout: 5
+  
+  # Context-specific behavior
+  lockscreen:
+    # At KDE lock screen, disable fingerprint (KDE uses fprintd for that)
+    fingerprint: false
+  
+  sudo:
+    # For sudo/polkit, enable both face and fingerprint
+    fingerprint: true
+
+# Presence Detection (Auto-Lock)
+presence_detection:
+  # Enable auto-lock when face disappears
+  enabled: true
+  
+  # Lock after this many seconds of absence (10-300)
+  lock_after: 30
+
+# Logging
+logging:
+  # Log level: debug, info, warning, error
+  level: info

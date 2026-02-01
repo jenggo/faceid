@@ -8,6 +8,7 @@ gio_dep = dependency('gio-2.0', required: true)
 glib_dep = dependency('glib-2.0', required: true)
 sdl2_dep = dependency('sdl2', required: true)
 libevdev_dep = dependency('libevdev', required: true)  # NEW: For input monitoring
+yaml_dep = dependency('yaml-cpp', required: true)      # NEW: For YAML config parsing
 
 # Core library
 core_sources = files(
@@ -44,13 +45,17 @@ core_lib = static_library(
 )
 
 # PAM module
-pam_sources = files('pam/pam_faceid.cpp')
+pam_sources = files(
+    'pam/pam_faceid.cpp',
+    'pam/dbus_client.cpp',
+    'pam/context_detector.cpp'
+)
 
 pam_module = shared_module(
     'pam_faceid',
     sources: pam_sources,
     include_directories: inc,
-    dependencies: [pam_dep, ncnn_dep, turbojpeg_dep, libyuv_dep, gio_dep, glib_dep, libevdev_dep],  # Added libevdev_dep
+    dependencies: [pam_dep, libsystemd_dep, gio_dep, glib_dep, libevdev_dep],
     link_with: core_lib,
     cpp_args: cpp_args,
     link_args: ['-ldl', '-lpthread'],  # For threading support
@@ -106,6 +111,33 @@ config_merge_exe = executable(
     sources: files('config_merge.cpp'),
     include_directories: inc,
     cpp_args: cpp_args,
+    install: true,
+    install_dir: get_option('bindir'),
+)
+
+# FaceID Daemon (user-level D-Bus service)
+daemon_sources = files(
+    'daemon/main.cpp',
+    'daemon/dbus_server.cpp',
+    'daemon/validation.cpp',
+    'daemon/config.cpp',
+    'daemon/auth_manager.cpp',
+    'daemon/camera_manager.cpp',
+    'daemon/model_store.cpp',
+    'daemon/face_detector_manager.cpp',
+    'daemon/fingerprint_manager.cpp',
+    'daemon/presence_monitor.cpp',
+    'daemon/enroll_manager.cpp',
+)
+
+daemon_exe = executable(
+    'faceid-daemon',
+    sources: daemon_sources,
+    include_directories: inc,
+    dependencies: [libsystemd_dep, yaml_dep, gio_dep, glib_dep, ncnn_dep, turbojpeg_dep, libyuv_dep],
+    link_with: core_lib,
+    cpp_args: cpp_args,
+    link_args: ['-lpthread'],
     install: true,
     install_dir: get_option('bindir'),
 )

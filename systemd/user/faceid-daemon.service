@@ -1,0 +1,47 @@
+[Unit]
+Description=FaceID Authentication Daemon
+Documentation=man:faceid-daemon(1)
+After=dbus.service graphical-session-pre.target
+Wants=dbus.service graphical-session-pre.target
+
+# Start after session is ready but don't hard require graphical session
+# This allows daemon to work in headless environments too
+PartOf=graphical-session.target
+
+[Service]
+Type=dbus
+BusName=org.freedesktop.FaceID
+
+# Run in user session
+User=%u
+
+# Daemon binary location
+ExecStart=%{bindir}/faceid-daemon
+
+# Restart on failure
+Restart=on-failure
+RestartSec=5
+
+# Timeout for graceful shutdown
+TimeoutStopSec=10
+
+# Hardening directives
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=%{HOME}/.config/faceid %{HOME}/.local/share/faceid
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+RestrictNamespaces=yes
+SystemCallFilter=~@clock @debug @module @obsolete @privileged @reboot @setuid @swap
+SystemCallErrorNumber=EPERM
+
+# Resource limits
+MemoryMax=256M
+CPUQuota=50%
+
+[Install]
+WantedBy=graphical-session.target

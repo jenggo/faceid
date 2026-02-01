@@ -1,0 +1,78 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE node PUBLIC "-//freedesktop//DTD D-BUS Object Introspection 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd">
+<node>
+  <interface name="org.freedesktop.FaceID.Device">
+    
+    <!-- ======================== Authentication ======================== -->
+    
+    <method name="VerifyStart">
+      <arg name="username" type="s" direction="in"/>
+      <arg name="context" type="s" direction="in"/>
+      <annotation name="org.freedesktop.DBus.Method.NoReply" value="true"/>
+    </method>
+    
+    <method name="VerifyStop">
+      <annotation name="org.freedesktop.DBus.Method.NoReply" value="true"/>
+    </method>
+    
+    <signal name="VerifyStatus">
+      <arg name="result" type="s"/>
+      <arg name="done" type="b"/>
+    </signal>
+    
+    <!-- ======================== Enrollment ======================== -->
+    
+    <method name="EnrollStart">
+      <arg name="username" type="s" direction="in"/>
+      <annotation name="org.freedesktop.DBus.Method.NoReply" value="true"/>
+    </method>
+    
+    <method name="EnrollStop">
+      <annotation name="org.freedesktop.DBus.Method.NoReply" value="true"/>
+    </method>
+    
+    <signal name="EnrollStatus">
+      <arg name="result" type="s"/>
+      <arg name="progress" type="i"/>
+      <arg name="done" type="b"/>
+    </signal>
+    
+    <!-- ======================== Presence Detection ======================== -->
+    
+    <method name="StartPresenceMonitoring">
+      <annotation name="org.freedesktop.DBus.Method.NoReply" value="true"/>
+    </method>
+    
+    <method name="StopPresenceMonitoring">
+      <annotation name="org.freedesktop.DBus.Method.NoReply" value="true"/>
+    </method>
+    
+    <signal name="PresenceChanged">
+      <arg name="present" type="b"/>
+      <arg name="confidence" type="d"/>
+    </signal>
+    
+    <!-- ======================== Management ======================== -->
+    
+    <method name="GetStatus">
+      <arg name="status" type="a{sv}" direction="out"/>
+    </method>
+    
+    <method name="ListUsers">
+      <arg name="usernames" type="as" direction="out"/>
+    </method>
+    
+    <method name="DeleteModel">
+      <arg name="username" type="s" direction="in"/>
+      <arg name="success" type="b" direction="out"/>
+    </method>
+    
+    <!-- ======================== Properties ======================== -->
+    
+    <property name="Version" type="s" access="read"/>
+    <property name="CameraReady" type="b" access="read"/>
+    <property name="ModelsLoaded" type="i" access="read"/>
+    
+  </interface>
+</node>

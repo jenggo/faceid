@@ -46,6 +46,9 @@ endif
 # Requires version >= 232 for sd_bus_* API support
 libsystemd_dep = dependency('libsystemd', required: true, version: '>=232')
 
+# yaml-cpp for YAML configuration parsing
+yaml_dep = dependency('yaml-cpp', required: true)
+
 # Configuration variables
 config_dir = get_option('sysconfdir') / 'faceid'
 models_dir = config_dir / 'models'
@@ -87,10 +90,16 @@ install_data(
     install_dir: get_option('datadir') / 'doc' / 'faceid',
 )
 
-# Install systemd service
+# Install systemd user service for FaceID daemon
 install_data(
-    'systemd/faceid-presence.service',
-    install_dir: get_option('prefix') / 'lib' / 'systemd' / 'system',
+    'systemd/user/faceid-daemon.service',
+    install_dir: get_option('prefix') / 'lib' / 'systemd' / 'user',
+)
+
+# Install D-Bus service file for auto-activation
+install_data(
+    'dbus/org.freedesktop.FaceID.service',
+    install_dir: get_option('datadir') / 'dbus-1' / 'services',
 )
 
 # Install systemd tmpfiles.d configuration

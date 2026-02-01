@@ -1,0 +1,62 @@
+# FaceID Expert Configuration (Optional)
+# ~/.config/faceid/expert.yaml
+#
+# All available settings for power users and fine-tuning.
+# This file is optional - if it doesn't exist, defaults are used.
+#
+# Values here override config.yaml and advanced.yaml
+
+# Image preprocessing
+preprocessing:
+  gamma_correction: true
+  adaptive_clahe: true
+  clahe_clip_limit: 2.0
+  clahe_tile_size: 8
+
+# Quality thresholds
+quality_thresholds:
+  # Minimum acceptable face size in pixels
+  min_face_size: 80
+  
+  # Maximum head rotation angles in degrees
+  max_yaw_angle: 30
+  max_pitch_angle: 20
+  max_roll_angle: 20
+  
+  # Minimum detection confidence
+  min_confidence: 0.8
+
+# Enrollment settings
+enrollment:
+  # Capture multiple frames per pose for better accuracy
+  extended_poses: true
+  frames_per_pose: 5
+
+# Face detection model settings
+face_detection:
+  confidence_threshold: 0.6
+  nms_threshold: 0.3
+  top_k: 5000
+
+# Adaptive authentication (learns from user behavior)
+adaptive_auth:
+  enabled: true
+  learning_rate: 0.1
+  history_size: 100
+
+# Presence detection advanced settings
+presence_detection:
+  # Scanning interval in seconds
+  scan_interval: 2
+  
+  # Consecutive frames required for state change
+  stability_frames: 3
+
+# Debug options
+debug:
+  # Save debug images (requires filesystem space)
+  save_frames: false
+  frame_path: ~/.cache/faceid/debug/
+  
+  # Profile performance timing
+  profile_performance: false

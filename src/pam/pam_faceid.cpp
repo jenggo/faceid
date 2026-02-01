@@ -1,924 +1,144 @@
 #include <security/pam_appl.h>
 #include <security/pam_modules.h>
 #include <syslog.h>
-#include <thread>
-#include <atomic>
-#include <future>
 #include <unistd.h>
-#include <systemd/sd-login.h>
 #include <string.h>
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <errno.h>
-#include "../config.h"
-#include "../logger.h"
-#include "../fingerprint_auth.h"
-#include "../lid_detector.h"
-#include "../display_detector.h"
-#include "../models/model_cache.h"
-#include "../adaptive_auth.h"
-
-// Suppress external library warnings
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Woverloaded-virtual"
-#include "../camera.h"
-#include "../face_detector.h"
-#pragma GCC diagnostic pop
-
-#include "config_paths.h"
-
-using namespace faceid;
-
-// System-wide file-based lock to prevent concurrent authentication attempts
-// Uses POSIX file locking (fcntl) for robust cross-process synchronization
-class SystemWideLock {
-private:
-    int lock_fd;
-    bool is_locked;
-    std::string lock_file_path;
-    
-public:
-    SystemWideLock(const char* username) : lock_fd(-1), is_locked(false) {
-        // Use per-user lock file to avoid permission issues
-        lock_file_path = std::string("/run/faceid/faceid-") + username + ".lock";
-    }
-    
-    ~SystemWideLock() {
-        if (is_locked) {
-            release();
-        }
-    }
-    
-    // Acquire lock with blocking wait (returns true on success, false on error)
-    // This will WAIT until the lock is available (no timeout)
-    bool acquire() {
-        // Temporarily set umask to 0 to ensure lock file is world-writable
-        mode_t old_umask = umask(0);
-        
-        // Open or create lock file (mode 0666 = world-readable/writable)
-        lock_fd = open(lock_file_path.c_str(), O_CREAT | O_RDWR, 0666);
-        
-        // Restore original umask
-        umask(old_umask);
-        
-        if (lock_fd == -1) {
-            syslog(LOG_ERR, "pam_faceid: Failed to open lock file %s: %s", 
-                   lock_file_path.c_str(), strerror(errno));
-            return false;
-        }
-        
-        pid_t pid = getpid();
-        
-        // Set up file lock structure
-        struct flock fl;
-        fl.l_type = F_WRLCK;    // Exclusive write lock
-        fl.l_whence = SEEK_SET; // Lock from beginning of file
-        fl.l_start = 0;         // Start at byte 0
-        fl.l_len = 0;           // Lock entire file
-        fl.l_pid = pid;
-        
-        syslog(LOG_INFO, "pam_faceid: Attempting to acquire system-wide lock (PID: %d)", pid);
-        
-        // F_SETLKW: Set lock and WAIT (blocks until lock is available)
-        if (fcntl(lock_fd, F_SETLKW, &fl) == -1) {
-            syslog(LOG_ERR, "pam_faceid: Failed to acquire lock: %s", strerror(errno));
-            close(lock_fd);
-            lock_fd = -1;
-            return false;
-        }
-        
-        is_locked = true;
-        
-        // Write current PID to lock file for debugging (AFTER acquiring lock)
-        if (ftruncate(lock_fd, 0) == -1) {
-            syslog(LOG_WARNING, "pam_faceid: Failed to truncate lock file: %s", strerror(errno));
-        }
-        lseek(lock_fd, 0, SEEK_SET);
-        std::string pid_str = std::to_string(pid) + "\n";
-        if (write(lock_fd, pid_str.c_str(), pid_str.length()) == -1) {
-            syslog(LOG_WARNING, "pam_faceid: Failed to write PID to lock file: %s", 
-                   strerror(errno));
-        }
-        
-        syslog(LOG_INFO, "pam_faceid: System-wide lock acquired successfully (PID: %d)", pid);
-        return true;
-    }
-    
-    // Acquire lock with timeout (for backwards compatibility)
-    // timeout_seconds: Maximum time to wait for lock
-    bool acquireWithTimeout(int timeout_seconds = 10) {
-        // Temporarily set umask to 0 to ensure lock file is world-writable
-        mode_t old_umask = umask(0);
-        
-        // Open or create lock file (mode 0666 = world-readable/writable)
-        lock_fd = open(lock_file_path.c_str(), O_CREAT | O_RDWR, 0666);
-        
-        // Restore original umask
-        umask(old_umask);
-        
-        if (lock_fd == -1) {
-            syslog(LOG_ERR, "pam_faceid: Failed to open lock file %s: %s", 
-                   lock_file_path.c_str(), strerror(errno));
-            return false;
-        }
-        
-        pid_t pid = getpid();
-        
-        // Set up file lock structure
-        struct flock fl;
-        fl.l_type = F_WRLCK;
-        fl.l_whence = SEEK_SET;
-        fl.l_start = 0;
-        fl.l_len = 0;
-        fl.l_pid = pid;
-        
-        syslog(LOG_INFO, "pam_faceid: Attempting to acquire lock with %d second timeout (PID: %d)", 
-               timeout_seconds, pid);
-        
-        // Try to acquire lock with polling (for timeout support)
-        auto start_time = std::chrono::steady_clock::now();
-        while (true) {
-            // F_SETLK: Try to set lock without blocking
-            if (fcntl(lock_fd, F_SETLK, &fl) != -1) {
-                is_locked = true;
-                
-                // Write current PID to lock file for debugging (AFTER acquiring lock)
-                if (ftruncate(lock_fd, 0) == -1) {
-                    syslog(LOG_WARNING, "pam_faceid: Failed to truncate lock file: %s", strerror(errno));
-                }
-                lseek(lock_fd, 0, SEEK_SET);
-                std::string pid_str = std::to_string(pid) + "\n";
-                if (write(lock_fd, pid_str.c_str(), pid_str.length()) == -1) {
-                    syslog(LOG_WARNING, "pam_faceid: Failed to write PID to lock file: %s", 
-                           strerror(errno));
-                }
-                
-                syslog(LOG_INFO, "pam_faceid: Lock acquired successfully (PID: %d)", pid);
-                return true;
-            }
-            
-            if (errno != EACCES && errno != EAGAIN) {
-                syslog(LOG_ERR, "pam_faceid: Lock acquisition failed: %s", strerror(errno));
-                close(lock_fd);
-                lock_fd = -1;
-                return false;
-            }
-            
-            // Check timeout
-            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
-                std::chrono::steady_clock::now() - start_time).count();
-            if (elapsed >= timeout_seconds) {
-                syslog(LOG_WARNING, "pam_faceid: Lock acquisition timeout after %ld seconds", elapsed);
-                close(lock_fd);
-                lock_fd = -1;
-                return false;
-            }
-            
-            // Sleep briefly before retrying
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        }
-    }
-    
-    // Release the lock
-    void release() {
-        if (!is_locked || lock_fd == -1) {
-            return;
-        }
-        
-        // Set up unlock structure
-        struct flock fl;
-        fl.l_type = F_UNLCK;    // Unlock
-        fl.l_whence = SEEK_SET;
-        fl.l_start = 0;
-        fl.l_len = 0;
-        fl.l_pid = getpid();
-        
-        // Release the lock
-        if (fcntl(lock_fd, F_SETLK, &fl) == -1) {
-            syslog(LOG_ERR, "pam_faceid: Failed to release lock: %s", strerror(errno));
-        } else {
-            syslog(LOG_INFO, "pam_faceid: System-wide lock released (PID: %d)", getpid());
-        }
-        
-        close(lock_fd);
-        lock_fd = -1;
-        is_locked = false;
-    }
-};
-
-// Check if we should skip biometric authentication
-// Returns true if biometric should be skipped, false if it should proceed
-static bool should_skip_biometric(pam_handle_t *pamh, const char* username, const std::string& camera_device) {
-    // Check 1: Password already in PAM stack?
-    // This happens when:
-    // - SDDM/GDM pre-provided password
-    // - Previous PAM module already prompted
-    // - try_first_pass flag used
-    const char *password = nullptr;
-    int ret = pam_get_item(pamh, PAM_AUTHTOK, (const void **)&password);
-    
-    if (ret == PAM_SUCCESS && password != nullptr && strlen(password) > 0) {
-        syslog(LOG_INFO, "pam_faceid: Password already in PAM stack for user %s, skipping biometric", username);
-        return true;
-    }
-    
-    // Check 2: SSH/remote session detected?
-    // No point trying biometric in headless/SSH sessions (no camera)
-    int is_remote = sd_session_is_remote(nullptr);
-    if (is_remote > 0) {
-        syslog(LOG_INFO, "pam_faceid: Remote SSH session detected for user %s, skipping biometric", username);
-        return true;
-    }
-    
-    // Check 3: Camera device accessible?
-    // Check the configured camera device (from config), not hardcoded /dev/video0
-    // Polkit and other restricted contexts may not have camera visible
-    if (access(camera_device.c_str(), F_OK) != 0) {
-        syslog(LOG_INFO, "pam_faceid: Camera device %s not accessible (in use or permission issue), skipping biometric for user %s", 
-               camera_device.c_str(), username);
-        return true;
-    }
-    
-    // Proceed with biometric authentication
-    syslog(LOG_DEBUG, "pam_faceid: Camera device %s accessible, proceeding with biometric", camera_device.c_str());
-    return false;
-}
-
-static bool authenticate_user(const char* username) {
-    const auto auth_start = std::chrono::steady_clock::now();
-    
-    // Set environment variable to signal Logger we're in PAM context
-    // This prevents stderr warnings that break pkttyagent authentication
-    setenv("FACEID_PAM_CONTEXT", "1", 1);
-    
-    // Initialize logger
-    Logger& logger = Logger::getInstance();
-    openlog("pam_faceid", LOG_PID, LOG_AUTH);
-    
-    // Load configuration
-    Config& config = Config::getInstance();
-    const std::string config_path = std::string(CONFIG_DIR) + "/faceid.conf";
-    if (!config.load(config_path)) {
-        syslog(LOG_ERR, "Failed to load configuration");
-        logger.auditAuthFailure(username, "biometric", "config_load_failed");
-        closelog();
-        return false;
-    }
-    
-    // Get camera resolution for adaptive auth shared memory sizing
-    int camera_width = config.getInt("camera", "width").value_or(640);
-    int camera_height = config.getInt("camera", "height").value_or(360);
-    
-    // Initialize adaptive authentication manager with camera resolution
-    AdaptiveAuthManager adaptive_mgr;
-    if (!adaptive_mgr.initialize(camera_width, camera_height, 3)) {
-        syslog(LOG_WARNING, "pam_faceid: Failed to initialize adaptive auth manager, continuing without adaptive optimization");
-    }
-    
-    // Check lid state
-    const bool check_lid = config.getBool("authentication", "check_lid_state").value_or(true);
-    if (check_lid) {
-        LidDetector lid_detector;
-        const LidState lid_state = lid_detector.getLidState();
-        
-        if (lid_state == LidState::CLOSED) {
-            logger.info(std::string("Lid is CLOSED, skipping biometric authentication for user ") + username);
-            logger.auditAuthFailure(username, "biometric", "lid_closed");
-            syslog(LOG_INFO, "Lid closed, skipping biometric auth for user %s", username);
-            closelog();
-            return false;
-        }
-        
-        if (lid_state == LidState::OPEN) {
-            logger.debug("Lid is OPEN (" + lid_detector.getDetectionMethod() + "), proceeding with biometric authentication");
-            syslog(LOG_DEBUG, "Lid open, proceeding with biometric auth");
-        } else {
-            logger.warning("Could not determine lid state (" + lid_detector.getLastError() + "), proceeding with biometric auth");
-            syslog(LOG_WARNING, "Unknown lid state, proceeding with biometric auth");
-        }
-    }
-    
-    // Check display state
-    const bool check_display = config.getBool("authentication", "check_display_state").value_or(true);
-    if (check_display) {
-        DisplayDetector display_detector;
-        DisplayState display_state = display_detector.getDisplayState();
-        
-        // If on lock screen, add delay before checking display state
-        if (display_detector.isLockScreenGreeter() || display_detector.isScreenLocked()) {
-            const int delay_ms = config.getInt("authentication", "lock_screen_delay_ms").value_or(1000);
-            if (delay_ms > 0) {
-                logger.debug("Lock screen detected, waiting " + std::to_string(delay_ms) + "ms before checking display state");
-                std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
-                display_state = display_detector.getDisplayState();
-            }
-        }
-        
-        // Check if using external monitor only (laptop screen off, external on)
-        const bool skip_external_only = config.getBool("authentication", "skip_external_monitor_only").value_or(true);
-        if (skip_external_only && display_detector.isExternalMonitorOnly()) {
-            logger.info(std::string("External monitor only detected (laptop screen off), skipping biometric authentication for user ") + username);
-            logger.auditAuthFailure(username, "biometric", "external_monitor_only");
-            syslog(LOG_INFO, "External monitor only, skipping biometric auth for user %s", username);
-            closelog();
-            return false;
-        }
-        
-        if (display_state == DisplayState::OFF) {
-            logger.info("Display is OFF (" + display_detector.getDetectionMethod() + 
-                       "), skipping biometric authentication for user " + username);
-            logger.auditAuthFailure(username, "biometric", "display_off");
-            syslog(LOG_INFO, "Display off, skipping biometric auth for user %s", username);
-            closelog();
-            return false;
-        }
-        
-        if (display_state == DisplayState::ON) {
-            logger.debug("Display is ON (" + display_detector.getDetectionMethod() + "), proceeding with biometric authentication");
-            syslog(LOG_DEBUG, "Display on, proceeding with biometric auth");
-        } else {
-            logger.warning("Could not determine display state (" + display_detector.getLastError() + "), proceeding with biometric auth");
-            syslog(LOG_WARNING, "Unknown display state, proceeding with biometric auth");
-        }
-    }
-    
-    logger.auditAuthAttempt(username, "face+fingerprint");
-    
-    // Check for face enrollment
-    auto& cache = ModelCache::getInstance();
-    const bool face_enrolled = cache.hasUserModel(username);
-    
-    if (!face_enrolled) {
-        logger.info(std::string("No face model found for user ") + username);
-    } else {
-        logger.debug(std::string("Face model(s) found for user ") + username);
-    }
-    
-    // Get fingerprint configuration
-    int fingerprint_delay_ms = config.getInt("authentication", "fingerprint_delay_ms").value_or(500);
-    FingerprintAuth fingerprint;
-    const bool fingerprint_enabled = config.getBool("authentication", "enable_fingerprint").value_or(true);
-    
-    // Check if optimization is in progress - prioritize fingerprint if so
-    bool optimization_in_progress = adaptive_mgr.isOptimizationInProgress();
-    if (optimization_in_progress && fingerprint_enabled) {
-        fingerprint_delay_ms = 0;  // No delay - start fingerprint immediately
-        logger.info("Adaptive optimization in progress - prioritizing fingerprint authentication");
-        syslog(LOG_INFO, "pam_faceid: Optimization in progress, prioritizing fingerprint (no delay)");
-    }
-    
-    // If neither method is available, fail early
-    if (!face_enrolled && !fingerprint_enabled) {
-        logger.auditAuthFailure(username, "face+fingerprint", "no_auth_methods_available");
-        closelog();
-        return false;
-    }
-    
-    int timeout = config.getInt("recognition", "timeout").value_or(5);
-    std::atomic<bool> auth_success(false);
-    std::atomic<bool> cancel_flag(false);
-    std::atomic<bool> face_finished(false);
-    std::atomic<bool> fingerprint_finished(false);
-    std::string success_method;
-    
-    // Store last captured frame for adaptive optimization
-    std::shared_ptr<faceid::Image> last_frame = std::make_shared<faceid::Image>();
-    std::mutex frame_mutex;
-    
-    // Launch face authentication in separate thread (if enrolled)
-    std::future<bool> face_future;
-    if (face_enrolled) {
-        face_future = std::async(std::launch::async, [&]() -> bool {
-            try {
-                // Load model using ModelCache
-                auto& cache = ModelCache::getInstance();
-                BinaryFaceModel model;
-                if (!cache.loadUserModel(username, model)) {
-                    logger.error(std::string("Failed to load face model for user ") + username);
-                    face_finished.store(true);
-                    return false;
-                }
-                
-                // Load ALL users' models for verification (prevent false positives)
-                std::vector<BinaryFaceModel> all_users = cache.loadAllUsersParallel(4);
-                logger.debug("Loaded " + std::to_string(all_users.size()) + " user models for verification");
-                
-                // Initialize camera
-                auto device = config.getString("camera", "device").value_or("/dev/video0");
-                Camera camera(device);
-                
-                auto width = config.getInt("camera", "width").value_or(640);
-                auto height = config.getInt("camera", "height").value_or(480);
-                
-                if (!camera.open(width, height)) {
-                    logger.error("Failed to open camera");
-                    face_finished.store(true);
-                    return false;
-                }
-                
-                // Initialize face detector
-                FaceDetector detector;
-                
-                if (!detector.loadModels()) {  // Use default MODELS_DIR/sface path
-                    logger.error("Failed to load face recognition model");
-                    face_finished.store(true);
-                    return false;
-                }
-                
-                // Quick Win #3: Per-User Thresholds
-                // Try to get user-specific threshold first, fallback to global
-                std::string per_user_key = std::string("recognition.") + username + ".threshold";
-                double threshold = config.getDouble(per_user_key, "").value_or(
-                    config.getDouble("recognition", "threshold").value_or(0.6)
-                );
-                
-                // Log which threshold is being used
-                if (config.getDouble(per_user_key, "").has_value()) {
-                    logger.debug(std::string("Using per-user threshold for ") + username + ": " + 
-                               std::to_string(threshold));
-                    syslog(LOG_DEBUG, "pam_faceid: Using per-user threshold for %s: %.3f", username, threshold);
-                } else {
-                    logger.debug(std::string("Using global threshold: ") + std::to_string(threshold));
-                }
-                
-                // Get detection confidence threshold from config
-                float detection_confidence = config.getDouble("face_detection", "confidence").value_or(0.31);
-                
-                // Check if adaptive auth has new optimal values (from previous optimization)
-                float opt_confidence, opt_threshold;
-                if (adaptive_mgr.hasNewOptimalValues()) {
-                    adaptive_mgr.getOptimalValues(opt_confidence, opt_threshold);
-                    detection_confidence = opt_confidence;
-                    threshold = opt_threshold;
-                    logger.info(std::string("Using adaptive optimized values: confidence=") + 
-                              std::to_string(detection_confidence) + ", threshold=" + 
-                              std::to_string(threshold));
-                    syslog(LOG_INFO, "pam_faceid: Using adaptive values (confidence: %.3f, threshold: %.3f)", 
-                           detection_confidence, threshold);
-                }
-                
-                logger.debug(std::string("Starting face detection with cascading detection (confidence: ") + 
-                           std::to_string(detection_confidence) + ")");
-                syslog(LOG_DEBUG, "pam_faceid: Using cascading detection with confidence: %.3f", detection_confidence);
-                
-                // PHASE 4: Temporal smoothing configuration
-                bool enable_temporal_smoothing = config.getBool("recognition", "enable_temporal_smoothing").value_or(true);
-                int temporal_frames = config.getInt("recognition", "temporal_frames").value_or(3);
-                int required_matches = config.getInt("recognition", "required_consecutive_matches").value_or(2);
-                
-                if (enable_temporal_smoothing) {
-                    logger.debug(std::string("Temporal smoothing enabled: requiring ") + 
-                               std::to_string(required_matches) + "/" + std::to_string(temporal_frames) + " frames");
-                    syslog(LOG_DEBUG, "pam_faceid: Temporal smoothing: %d/%d frames required", 
-                           required_matches, temporal_frames);
-                }
-                
-                auto start = std::chrono::steady_clock::now();
-                while (!cancel_flag.load() && std::chrono::duration_cast<std::chrono::seconds>(
-                       std::chrono::steady_clock::now() - start).count() < timeout) {
-                    
-                    // PHASE 4: Temporal smoothing - capture multiple consecutive frames
-                    std::vector<bool> frame_matches;
-                    int frames_to_capture = enable_temporal_smoothing ? temporal_frames : 1;
-                    
-                    for (int frame_idx = 0; frame_idx < frames_to_capture; frame_idx++) {
-                        // Check cancellation between frames
-                        if (cancel_flag.load()) {
-                            break;
-                        }
-                        
-                        faceid::Image frame;
-                        if (!camera.read(frame)) {
-                            continue;
-                        }
-                        
-                        // Store frame data for potential adaptive optimization
-                        {
-                            std::lock_guard<std::mutex> lock(frame_mutex);
-                            // Only clone if last_frame is empty or different size
-                            if (last_frame->empty() || 
-                                last_frame->width() != frame.width() || 
-                                last_frame->height() != frame.height()) {
-                                *last_frame = frame.clone();
-                            } else {
-                                // Copy data directly for efficiency
-                                std::memcpy(last_frame->data(), frame.data(), 
-                                           frame.width() * frame.height() * frame.channels());
-                            }
-                        }
-                        
-                        // Use cascading detection for robust face detection across all lighting conditions
-                        // This automatically tries 3 stages: standard CLAHE, aggressive CLAHE, and fallback detector
-                        auto cascade_result = detector.detectFacesCascade(frame.view(), false, detection_confidence);
-                        
-                        if (cascade_result.faces.empty()) {
-                            if (enable_temporal_smoothing) {
-                                frame_matches.push_back(false);
-                                continue;
-                            } else {
-                                continue;  // Legacy mode: skip to next frame in outer loop
-                            }
-                        }
-                        
-                        // Log which cascade stage was used for detection
-                        if (cascade_result.stage_used > 1) {
-                            logger.debug(std::string("Face detected using cascade stage ") + 
-                                       std::to_string(cascade_result.stage_used) + 
-                                       " (brightness: " + std::to_string(cascade_result.avg_brightness) + ")");
-                            syslog(LOG_DEBUG, "pam_faceid: Cascade stage %d used (brightness: %.2f)", 
-                                   cascade_result.stage_used, cascade_result.avg_brightness);
-                        }
-                        
-                        // Encode faces using the preprocessed frame from cascade
-                        // Use adaptive quality threshold (0.50) matching enrollment behavior
-                        auto encodings = detector.encodeFaces(cascade_result.processed_frame.view(), 
-                                                             cascade_result.faces, 0.50);
-                        if (encodings.empty()) {
-                            if (enable_temporal_smoothing) {
-                                frame_matches.push_back(false);
-                                continue;
-                            } else {
-                                continue;
-                            }
-                        }
-                        
-                        // Deduplicate faces - filter out multiple detections of the same person
-                        // This prevents false positives from the same face detected at different angles/positions
-                        auto unique_indices = FaceDetector::deduplicateFaces(cascade_result.faces, encodings, 0.15);
-                        
-                        // Filter to only unique faces
-                        std::vector<FaceEncoding> unique_encodings;
-                        for (size_t idx : unique_indices) {
-                            if (idx < encodings.size()) {
-                                unique_encodings.push_back(encodings[idx]);
-                            }
-                        }
-                        
-                        // Track if this frame matched
-                        bool frame_matched = false;
-                        
-                        // Compare detected faces against ALL users to find best match
-                        for (const auto& detected_encoding : unique_encodings) {
-                            double best_distance = 999.0;
-                            std::string best_match_user = "";
-                            
-                            // PHASE 3: Get quality-based filtering and early-exit thresholds
-                            double min_quality_threshold = config.getDouble("recognition", "min_encoding_quality").value_or(0.5);
-                            double early_exit_threshold = threshold * 0.5;  // Strong match = 50% of threshold
-                            
-                            // Compare against all enrolled users (V2 format only)
-                            for (const auto& user_model : all_users) {
-                                // V2 format: compare against all encodings with quality weighting
-                                for (size_t pose_idx = 0; pose_idx < user_model.sample_encodings.size(); ++pose_idx) {
-                                    const auto& pose_encodings = user_model.sample_encodings[pose_idx];
-                                    const auto& pose_qualities = user_model.quality_scores[pose_idx];
-                                    
-                                    for (size_t var_idx = 0; var_idx < pose_encodings.size(); ++var_idx) {
-                                        // Skip low-quality encodings
-                                        if (pose_qualities[var_idx] < min_quality_threshold) {
-                                            continue;
-                                        }
-                                        
-                                        // Use quality-weighted comparison
-                                        double distance = detector.compareFacesWeighted(
-                                            detected_encoding,
-                                            pose_encodings[var_idx],
-                                            pose_qualities[var_idx]
-                                        );
-                                        
-                                        if (distance < best_distance) {
-                                            best_distance = distance;
-                                            best_match_user = user_model.username;
-                                        }
-                                        
-                                        // Early exit on strong match (significant optimization)
-                                        // Only in legacy mode (temporal smoothing disabled)
-                                        if (!enable_temporal_smoothing && distance < early_exit_threshold && user_model.username == username) {
-                                            logger.info(std::string("Strong face match (early exit) for user ") + username + 
-                                                      " (distance: " + std::to_string(distance) + 
-                                                      ", quality: " + std::to_string(pose_qualities[var_idx]) + 
-                                                      ", cascade stage: " + std::to_string(cascade_result.stage_used) + ")");
-                                            syslog(LOG_INFO, "pam_faceid: Face match success - early exit (distance: %.3f, quality: %.2f, cascade stage: %d)", 
-                                                   distance, pose_qualities[var_idx], cascade_result.stage_used);
-                                            return true;
-                                        }
-                                    }
-                                }
-                            }
-                            
-                            // Only accept if:
-                            // 1. Distance is below threshold
-                            // 2. Best match is the current user (not another user)
-                            if (best_distance < threshold && best_match_user == username) {
-                                frame_matched = true;
-                                
-                                // Legacy mode: immediate success
-                                if (!enable_temporal_smoothing) {
-                                    logger.info(std::string("Face matched for user ") + username + 
-                                              " (distance: " + std::to_string(best_distance) + 
-                                              ", cascade stage: " + std::to_string(cascade_result.stage_used) + ")");
-                                    syslog(LOG_INFO, "pam_faceid: Face match success (distance: %.3f, cascade stage: %d)", 
-                                           best_distance, cascade_result.stage_used);
-                                    return true;
-                                }
-                                
-                                // Temporal smoothing mode: log and continue
-                                logger.debug(std::string("Frame ") + std::to_string(frame_idx + 1) + "/" + 
-                                           std::to_string(frames_to_capture) + " matched (distance: " + 
-                                           std::to_string(best_distance) + ")");
-                                break;  // Stop checking other encodings for this frame
-                            } else if (best_distance < threshold && best_match_user != username) {
-                                // Face matched a different user - log security event
-                                logger.warning(std::string("Face matched different user '") + best_match_user + 
-                                             "' instead of '" + username + "' (distance: " + 
-                                             std::to_string(best_distance) + "), rejecting authentication");
-                            }
-                        }
-                        
-                        // Record frame match result (temporal smoothing mode only)
-                        if (enable_temporal_smoothing) {
-                            frame_matches.push_back(frame_matched);
-                            
-                            // Early exit: if we have enough matches already, stop capturing frames
-                            int matches_so_far = std::count(frame_matches.begin(), frame_matches.end(), true);
-                            if (matches_so_far >= required_matches) {
-                                logger.info(std::string("Temporal smoothing: ") + std::to_string(matches_so_far) + "/" + 
-                                          std::to_string(frame_idx + 1) + " frames matched, authenticating user " + username);
-                                syslog(LOG_INFO, "pam_faceid: Temporal smoothing success (%d/%d frames matched)", 
-                                       matches_so_far, frame_idx + 1);
-                                return true;
-                            }
-                        }
-                    }
-                    
-                    // PHASE 4: Temporal smoothing final decision (after capturing all frames)
-                    if (enable_temporal_smoothing && !frame_matches.empty()) {
-                        int total_matches = std::count(frame_matches.begin(), frame_matches.end(), true);
-                        
-                        if (total_matches >= required_matches) {
-                            logger.info(std::string("Temporal smoothing: ") + std::to_string(total_matches) + "/" + 
-                                      std::to_string(frame_matches.size()) + " frames matched, authenticating user " + username);
-                            syslog(LOG_INFO, "pam_faceid: Temporal smoothing success (%d/%d frames matched)", 
-                                   total_matches, static_cast<int>(frame_matches.size()));
-                            return true;
-                        } else {
-                            logger.debug(std::string("Temporal smoothing: insufficient matches (") + 
-                                       std::to_string(total_matches) + "/" + 
-                                       std::to_string(frame_matches.size()) + "), continuing...");
-                        }
-                    }
-                }
-                
-                face_finished.store(true);
-                return false;
-            } catch (const std::exception& e) {
-                logger.error(std::string("Face auth exception: ") + e.what());
-                face_finished.store(true);
-                return false;
-            }
-        });
-    }
-    
-    // Launch fingerprint authentication in separate thread (if available)
-    // Delayed launch to give face auth a head start (face is typically faster)
-    std::future<bool> fingerprint_future;
-    std::atomic<bool> fingerprint_started(false);
-    
-    if (fingerprint_enabled) {
-        fingerprint_future = std::async(std::launch::async, [&]() -> bool {
-            try {
-                // Wait for configured delay before initializing fingerprint
-                if (fingerprint_delay_ms > 0) {
-                    logger.debug(std::string("Delaying fingerprint init by ") + 
-                               std::to_string(fingerprint_delay_ms) + "ms (face auth head start)");
-                    std::this_thread::sleep_for(std::chrono::milliseconds(fingerprint_delay_ms));
-                    
-                    // Check if face auth already succeeded
-                    if (cancel_flag.load()) {
-                        logger.debug("Face auth succeeded, skipping fingerprint initialization");
-                        fingerprint_finished.store(true);
-                        return false;
-                    }
-                }
-                
-                // Initialize fingerprint (delayed)
-                bool fingerprint_available = fingerprint.initialize() && fingerprint.isAvailable();
-                fingerprint_started.store(true);
-                
-                if (!fingerprint_available) {
-                    logger.info("Fingerprint authentication not available");
-                    fingerprint_finished.store(true);
-                    return false;
-                }
-                
-                logger.debug("Fingerprint reader initialized, starting authentication");
-                bool result = fingerprint.authenticate(username, timeout, cancel_flag);
-                fingerprint_finished.store(true);
-                return result;
-            } catch (const std::exception& e) {
-                logger.error(std::string("Fingerprint auth exception: ") + e.what());
-                fingerprint_finished.store(true);
-                return false;
-            }
-        });
-    }
-    
-    // Wait for first successful authentication
-    auto check_start = std::chrono::steady_clock::now();
-    while (std::chrono::duration_cast<std::chrono::seconds>(
-           std::chrono::steady_clock::now() - check_start).count() < timeout) {
-        
-        // Check face authentication
-        if (face_enrolled && face_future.valid()) {
-            auto status = face_future.wait_for(std::chrono::milliseconds(100));
-            if (status == std::future_status::ready && face_future.get()) {
-                cancel_flag.store(true);  // Cancel fingerprint
-                success_method = "face";
-                auth_success.store(true);
-                break;
-            }
-        }
-        
-        // Check fingerprint authentication
-        if (fingerprint_enabled && fingerprint_future.valid()) {
-            auto status = fingerprint_future.wait_for(std::chrono::milliseconds(100));
-            if (status == std::future_status::ready && fingerprint_future.get()) {
-                cancel_flag.store(true);  // Cancel face
-                success_method = "fingerprint";
-                auth_success.store(true);
-                break;
-            }
-        }
-        
-        // Early exit if both methods have finished (failed)
-        bool face_done = !face_enrolled || face_finished.load();
-        bool fingerprint_done = !fingerprint_enabled || fingerprint_finished.load();
-        if (face_done && fingerprint_done && !auth_success.load()) {
-            syslog(LOG_INFO, "pam_faceid: Both authentication methods finished without success, exiting early");
-            break;
-        }
-        
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    }
-    
-    // Ensure cancellation
-    cancel_flag.store(true);
-    
-    // Calculate duration
-    auto auth_end = std::chrono::steady_clock::now();
-    double duration_ms = std::chrono::duration<double, std::milli>(auth_end - auth_start).count();
-    
-    if (auth_success.load()) {
-        syslog(LOG_INFO, "Authentication successful for user %s via %s", username, success_method.c_str());
-        logger.auditAuthSuccess(username, success_method, duration_ms);
-        
-        // Record success for adaptive auth
-        adaptive_mgr.recordSuccess();
-        
-        closelog();
-        return true;
-    }
-    
-    // Authentication failed - record failure and potentially trigger optimization
-    adaptive_mgr.recordFailure();
-    
-    // Check if we should trigger optimization (after 5 consecutive failures)
-    if (adaptive_mgr.shouldTriggerOptimization(5) && !last_frame->empty()) {
-        syslog(LOG_INFO, "pam_faceid: Triggering adaptive optimization after 5 consecutive failures");
-        logger.info("Triggering adaptive optimization after repeated failures");
-        
-        // Capture last frame to shared memory for background optimization
-        {
-            std::lock_guard<std::mutex> lock(frame_mutex);
-            adaptive_mgr.captureFrame(last_frame->data(), last_frame->width(), 
-                                     last_frame->height(), last_frame->channels());
-        }
-        
-        syslog(LOG_INFO, "pam_faceid: Frame captured for optimization (size: %dx%dx%d)", 
-               last_frame->width(), last_frame->height(), last_frame->channels());
-    }
-    
-    // Provide detailed failure reason
-    std::string failure_reason;
-    if (!face_enrolled && !fingerprint_enabled) {
-        failure_reason = "no_methods_available";
-        syslog(LOG_WARNING, "Authentication failed for user %s: no face or fingerprint enrolled", username);
-    } else if (face_enrolled && !fingerprint_enabled) {
-        failure_reason = "face_timeout_or_no_match";
-        syslog(LOG_WARNING, "Face authentication failed for user %s: timeout or no match", username);
-    } else if (!face_enrolled && fingerprint_enabled) {
-        failure_reason = "fingerprint_timeout_or_no_match";
-        syslog(LOG_WARNING, "Fingerprint authentication failed for user %s: timeout or no match", username);
-    } else {
-        failure_reason = "both_timeout_or_no_match";
-        syslog(LOG_WARNING, "Face+fingerprint authentication failed for user %s: timeout or no match", username);
-    }
-    
-    logger.auditAuthFailure(username, "face+fingerprint", failure_reason);
-    closelog();
-    return false;
-}
+#include <pwd.h>
+#include "dbus_client.h"
+#include "context_detector.h"
 
 extern "C" {
 
+/**
+ * pam_sm_authenticate - PAM authentication module entry point
+ * 
+ * This is the refactored D-Bus client version that delegates to faceid-daemon.
+ * Much simpler than the old monolithic version:
+ * 1. Get username
+ 2. Detect authentication context (lockscreen, sudo, polkit, etc.)
+ * 3. Call daemon via D-Bus VerifyStart
+ * 4. Wait for signals (VerifyStatus)
+ * 5. Return success/failure
+ */
 PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags,
                                    int argc, const char **argv) {
-    // Unused parameters (required by PAM interface)
+    // Silence unused parameter warnings
     (void)flags;
     (void)argc;
     (void)argv;
     
-    // Debug: Log that PAM module was called
     openlog("pam_faceid", LOG_PID, LOG_AUTH);
+    syslog(LOG_INFO, "pam_faceid: authenticate called (PID: %d, UID: %d)", 
+           getpid(), getuid());
     
-    // Get process info for debugging
-    char exe_path[256] = {0};
-    ssize_t len = readlink("/proc/self/exe", exe_path, sizeof(exe_path)-1);
-    if (len != -1) {
-        exe_path[len] = '\0';
-    }
-    
-    syslog(LOG_INFO, "pam_faceid: authenticate called (PID: %d, UID: %d, GID: %d, exe: %s)", 
-           getpid(), getuid(), getgid(), len != -1 ? exe_path : "unknown");
-    
-    // Get username first (before lock acquisition)
+    // ═══════════════════════════════════════════════════════════════
+    // Step 1: Get username
+    // ═══════════════════════════════════════════════════════════════
     const char* username = nullptr;
     int ret = pam_get_user(pamh, &username, nullptr);
     
-    if (ret != PAM_SUCCESS || username == nullptr) {
+    if (ret != PAM_SUCCESS || !username) {
+        syslog(LOG_ERR, "pam_faceid: Failed to get username");
         closelog();
         return PAM_USER_UNKNOWN;
     }
     
-    // Load configuration EARLY (before skip checks) to read camera device
-    Config& config = Config::getInstance();
-    const std::string config_path = std::string(CONFIG_DIR) + "/faceid.conf";
-    if (!config.load(config_path)) {
-        syslog(LOG_ERR, "pam_faceid: Failed to load configuration from %s", config_path.c_str());
+    syslog(LOG_DEBUG, "pam_faceid: Authenticating user: %s", username);
+    
+    // ═══════════════════════════════════════════════════════════════
+    // Step 2: Detect authentication context
+    // ═══════════════════════════════════════════════════════════════
+    std::string context = ContextDetector::detect_context(pamh);
+    
+    syslog(LOG_DEBUG, "pam_faceid: Detected context: %s", context.c_str());
+    
+    // ═══════════════════════════════════════════════════════════════
+    // Step 3: Connect to daemon and start verification
+    // ═══════════════════════════════════════════════════════════════
+    DBusAuthClient client;
+    
+    if (!client.connect()) {
+        syslog(LOG_ERR, "pam_faceid: Failed to connect to D-Bus");
         closelog();
         return PAM_AUTH_ERR;
     }
     
-    // Get configured camera device
-    auto camera_device = config.getString("camera", "device").value_or("/dev/video0");
-    syslog(LOG_DEBUG, "pam_faceid: Using camera device: %s", camera_device.c_str());
-    
-    // Check if we should skip biometric authentication (before acquiring lock)
-    // This allows fast-path exit for SSH, no camera, password already provided, etc.
-    if (should_skip_biometric(pamh, username, camera_device)) {
-        syslog(LOG_INFO, "pam_faceid: Skipping biometric auth (no lock acquired)");
-        closelog();
-        return PAM_AUTH_ERR;  // Let next PAM module handle authentication
-    }
-    
-    // Only acquire lock if we're actually going to perform biometric authentication
-    // This prevents unnecessary lock contention for cases where biometric is not needed
-    syslog(LOG_DEBUG, "pam_faceid: Biometric auth required, acquiring system-wide lock");
-    SystemWideLock lock(username);
-    if (!lock.acquireWithTimeout(10)) {
-        syslog(LOG_WARNING, "pam_faceid: Failed to acquire system-wide lock (timeout or error) - another auth in progress");
-        
-        // Don't show error to user - just skip and let password auth handle it
-        // This happens when lock screen auth is running while user tries sudo
-        
+    if (!client.is_daemon_available()) {
+        syslog(LOG_WARNING, "pam_faceid: FaceID daemon not available on D-Bus");
         closelog();
         return PAM_AUTH_ERR;
     }
     
-    // Don't close syslog yet - authenticate_user() needs it
-    syslog(LOG_DEBUG, "pam_faceid: Lock acquired, proceeding with authentication");
+    // Callback to log signals
+    auto status_callback = [username](const std::string& status, bool done) {
+        syslog(LOG_DEBUG, "pam_faceid: VerifyStatus signal - %s (done: %s)",
+               status.c_str(), done ? "yes" : "no");
+    };
     
-    bool success = authenticate_user(username);
+    // ═══════════════════════════════════════════════════════════════
+    // Step 4: Call daemon to start verification
+    // ═══════════════════════════════════════════════════════════════
+    if (!client.verify_start(username, context, status_callback)) {
+        syslog(LOG_ERR, "pam_faceid: Failed to call VerifyStart on daemon");
+        closelog();
+        return PAM_AUTH_ERR;
+    }
     
-    // Lock will be automatically released by RAII destructor
+    // ═══════════════════════════════════════════════════════════════
+    // Step 5: Wait for verification signals
+    // ═══════════════════════════════════════════════════════════════
+    // Default timeout: 10 seconds (configurable in daemon)
+    int timeout_ms = 10000;
     
-    closelog();
+    if (!client.wait_for_verification(timeout_ms)) {
+        syslog(LOG_WARNING, "pam_faceid: Verification failed or timeout");
+        client.verify_stop();  // Clean up
+        closelog();
+        return PAM_AUTH_ERR;
+    }
     
-    if (success) {
+    // ═══════════════════════════════════════════════════════════════
+    // Step 6: Check result and return
+    // ═══════════════════════════════════════════════════════════════
+    if (client.was_successful()) {
+        syslog(LOG_INFO, "pam_faceid: Authentication successful for user %s", username);
+        closelog();
         return PAM_SUCCESS;
+    } else {
+        syslog(LOG_WARNING, "pam_faceid: Authentication failed for user %s", username);
+        closelog();
+        return PAM_AUTH_ERR;
     }
-    
-    return PAM_AUTH_ERR;
 }
 
+/**
+ * pam_sm_setcred - Set credentials (optional)
+ * Required by PAM interface but not used for biometric auth
+ */
 PAM_EXTERN int pam_sm_setcred(pam_handle_t *pamh, int flags,
                               int argc, const char **argv) {
-    // Unused parameters (required by PAM interface)
+    // Silence unused parameter warnings
     (void)pamh;
     (void)flags;
     (void)argc;
     (void)argv;
+    
     return PAM_SUCCESS;
 }
 
+/**
+ * pam_sm_acct_mgmt - Account management (optional)
+ * Required by PAM interface but not used for biometric auth
+ */
 PAM_EXTERN int pam_sm_acct_mgmt(pam_handle_t *pamh, int flags,
-                                int argc, const char **argv) {
-    // Unused parameters (required by PAM interface)
+                               int argc, const char **argv) {
+    // Silence unused parameter warnings
     (void)pamh;
     (void)flags;
     (void)argc;
     (void)argv;
+    
     return PAM_SUCCESS;
 }
 
-} // extern "C"
+}  // extern "C"
