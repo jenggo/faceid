@@ -131,30 +131,122 @@ install: build
 		$(MESON) install -C $(BUILD_DIR) --no-rebuild; \
 	fi
 	@printf " \n"
-	@printf "$(COLOR_CYAN)Checking configuration file...$(COLOR_RESET)\n"
-	@SOURCE_CONFIG="config/faceid.conf"; \
-	DEST_CONFIG="/etc/faceid/faceid.conf"; \
-	MERGE_UTIL="$(BUILD_DIR)/src/faceid-config-merge"; \
-	if [ ! -f "$$MERGE_UTIL" ]; then \
-		printf "$(COLOR_RED)✗ Config merge utility not found: $$MERGE_UTIL$(COLOR_RESET)\n"; \
-		printf "$(COLOR_YELLOW)⚠ Falling back to simple copy...$(COLOR_RESET)\n"; \
-		if [ ! -f "$$DEST_CONFIG" ]; then \
-			if [ "$$(id -u)" != "0" ]; then \
-				sudo cp "$$SOURCE_CONFIG" "$$DEST_CONFIG"; \
-				sudo chmod 644 "$$DEST_CONFIG"; \
-			else \
-				cp "$$SOURCE_CONFIG" "$$DEST_CONFIG"; \
-				chmod 644 "$$DEST_CONFIG"; \
-			fi; \
-			printf "$(COLOR_GREEN)✓ New config installed: $$DEST_CONFIG$(COLOR_RESET)\n"; \
+	@printf "$(COLOR_CYAN)Setting up FHS-compliant directories...$(COLOR_RESET)\n"
+	# FHS-compliant paths:
+	# - /etc/faceid/     → Configuration files (YAML only)
+	# - /var/lib/faceid/ → Mutable data (models, faces, fingerprints)
+	# - /var/log/faceid/ → Log files
+	@CONFIG_DIR="/etc/faceid"; \
+	VAR_LIB_DIR="/var/lib/faceid"; \
+	VAR_LOG_DIR="/var/log/faceid"; \
+	if [ "$$(id -u)" != "0" ]; then \
+		sudo mkdir -p "$$CONFIG_DIR"; \
+		sudo mkdir -p "$$VAR_LIB_DIR"; \
+		sudo mkdir -p "$$VAR_LIB_DIR/models"; \
+		sudo mkdir -p "$$VAR_LIB_DIR/faces"; \
+		sudo mkdir -p "$$VAR_LIB_DIR/fingerprints"; \
+		sudo mkdir -p "$$VAR_LOG_DIR"; \
+	else \
+		mkdir -p "$$CONFIG_DIR"; \
+		mkdir -p "$$VAR_LIB_DIR"; \
+		mkdir -p "$$VAR_LIB_DIR/models"; \
+		mkdir -p "$$VAR_LIB_DIR/faces"; \
+		mkdir -p "$$VAR_LIB_DIR/fingerprints"; \
+		mkdir -p "$$VAR_LOG_DIR"; \
+	fi; \
+	# Set permissions: base dirs 0755, biometric dirs 0700
+	if [ "$$(id -u)" != "0" ]; then \
+		sudo chmod 755 "$$VAR_LIB_DIR"; \
+		sudo chmod 755 "$$VAR_LIB_DIR/models"; \
+		sudo chmod 700 "$$VAR_LIB_DIR/faces"; \
+		sudo chmod 700 "$$VAR_LIB_DIR/fingerprints"; \
+		sudo chmod 755 "$$VAR_LOG_DIR"; \
+	else \
+		chmod 755 "$$VAR_LIB_DIR"; \
+		chmod 755 "$$VAR_LIB_DIR/models"; \
+		chmod 700 "$$VAR_LIB_DIR/faces"; \
+		chmod 700 "$$VAR_LIB_DIR/fingerprints"; \
+		chmod 755 "$$VAR_LOG_DIR"; \
+	fi; \
+	printf "$(COLOR_GREEN)✓ FHS directories created:$(COLOR_RESET)\n"; \
+	printf "  - $$CONFIG_DIR (config)\n"; \
+	printf "  - $$VAR_LIB_DIR/models (0755)\n"; \
+	printf "  - $$VAR_LIB_DIR/faces (0700)\n"; \
+	printf "  - $$VAR_LIB_DIR/fingerprints (0700)\n"; \
+	printf "  - $$VAR_LOG_DIR (logs)\n"
+	@printf " \n"
+	@printf "$(COLOR_CYAN)Installing configuration files...$(COLOR_RESET)\n"
+	@CONFIG_DIR="/etc/faceid"; \
+	if [ ! -f "$$CONFIG_DIR/config.yaml" ]; then \
+		if [ "$$(id -u)" != "0" ]; then \
+			sudo cp "config/examples/config.yaml" "$$CONFIG_DIR/config.yaml"; \
+			sudo chmod 644 "$$CONFIG_DIR/config.yaml"; \
+			sudo chown root:root "$$CONFIG_DIR/config.yaml"; \
 		else \
-			printf "$(COLOR_YELLOW)⚠ Existing config unchanged: $$DEST_CONFIG$(COLOR_RESET)\n"; \
+			cp "config/examples/config.yaml" "$$CONFIG_DIR/config.yaml"; \
+			chmod 644 "$$CONFIG_DIR/config.yaml"; \
+			chown root:root "$$CONFIG_DIR/config.yaml"; \
+		fi; \
+		printf "$(COLOR_GREEN)✓ Installed config.yaml: $$CONFIG_DIR/config.yaml$(COLOR_RESET)\n"; \
+	else \
+		printf "$(COLOR_YELLOW)⚠ Existing config.yaml preserved: $$CONFIG_DIR/config.yaml$(COLOR_RESET)\n"; \
+	fi; \
+	if [ -f "config/examples/advanced.yaml" ] && [ ! -f "$$CONFIG_DIR/advanced.yaml" ]; then \
+		if [ "$$(id -u)" != "0" ]; then \
+			sudo cp "config/examples/advanced.yaml" "$$CONFIG_DIR/advanced.yaml"; \
+			sudo chmod 644 "$$CONFIG_DIR/advanced.yaml"; \
+		else \
+			cp "config/examples/advanced.yaml" "$$CONFIG_DIR/advanced.yaml"; \
+			chmod 644 "$$CONFIG_DIR/advanced.yaml"; \
+		fi; \
+		printf "$(COLOR_GREEN)✓ Installed advanced.yaml: $$CONFIG_DIR/advanced.yaml$(COLOR_RESET)\n"; \
+	fi
+	# === Setup per-user models directory and copy recognition models if available ===
+	@ACTUAL_USER="$$(logname 2>/dev/null || echo $$SUDO_USER)"; \
+	if [ -n "$$SUDO_USER" ]; then \
+		REAL_HOME="$$(getent passwd $$SUDO_USER | cut -d: -f6)"; \
+		FACEID_BASE_DIR="$$REAL_HOME/.local/share/faceid"; \
+		USER_MODELS_DIR="$$FACEID_BASE_DIR/models"; \
+		USER_FACES_DIR="$$FACEID_BASE_DIR/faces"; \
+		printf "$(COLOR_CYAN)Setting up per-user directories for $$SUDO_USER$(COLOR_RESET)\n"; \
+		if [ ! -d "$$FACEID_BASE_DIR" ]; then \
+			mkdir -p "$$FACEID_BASE_DIR"; \
+			chown "$$SUDO_USER:$$SUDO_USER" "$$FACEID_BASE_DIR"; \
+			chmod 700 "$$FACEID_BASE_DIR"; \
+			printf "$(COLOR_GREEN)✓ Created: $$FACEID_BASE_DIR (owner: $$SUDO_USER)$(COLOR_RESET)\n"; \
+		fi; \
+		if [ ! -d "$$USER_MODELS_DIR" ]; then \
+			mkdir -p "$$USER_MODELS_DIR"; \
+			chown "$$SUDO_USER:$$SUDO_USER" "$$USER_MODELS_DIR"; \
+			chmod 700 "$$USER_MODELS_DIR"; \
+			printf "$(COLOR_GREEN)✓ Created: $$USER_MODELS_DIR (owner: $$SUDO_USER)$(COLOR_RESET)\n"; \
+		fi; \
+		if [ ! -d "$$USER_FACES_DIR" ]; then \
+			mkdir -p "$$USER_FACES_DIR"; \
+			chown "$$SUDO_USER:$$SUDO_USER" "$$USER_FACES_DIR"; \
+			chmod 700 "$$USER_FACES_DIR"; \
+			printf "$(COLOR_GREEN)✓ Created: $$USER_FACES_DIR (owner: $$SUDO_USER)$(COLOR_RESET)\n"; \
+		fi; \
+		if [ -f "/etc/faceid/models/recognition.param" ] && [ -f "/etc/faceid/models/recognition.bin" ]; then \
+			cp /etc/faceid/models/recognition.* "$${USER_MODELS_DIR}/"; \
+			chown "$$SUDO_USER:$$SUDO_USER" "$${USER_MODELS_DIR}/"* || true; \
+			chmod 644 "$${USER_MODELS_DIR}/"*; \
+			printf "$(COLOR_GREEN)✓ Copied recognition models to $$USER_MODELS_DIR$(COLOR_RESET)\n"; \
+		else \
+			printf "$(COLOR_YELLOW)⚠ Recognition models not found in /etc/faceid/models - user must install them manually$(COLOR_RESET)\n"; \
 		fi; \
 	else \
-		if [ "$$(id -u)" != "0" ]; then \
-			sudo "$$MERGE_UTIL" "$$SOURCE_CONFIG" "$$DEST_CONFIG"; \
-		else \
-			"$$MERGE_UTIL" "$$SOURCE_CONFIG" "$$DEST_CONFIG"; \
+		REAL_HOME="$$HOME"; \
+		FACEID_BASE_DIR="$$REAL_HOME/.local/share/faceid"; \
+		USER_MODELS_DIR="$$FACEID_BASE_DIR/models"; \
+		USER_FACES_DIR="$$FACEID_BASE_DIR/faces"; \
+		mkdir -p "$$FACEID_BASE_DIR" "$$USER_MODELS_DIR" "$$USER_FACES_DIR"; \
+		chmod 700 "$$FACEID_BASE_DIR" "$$USER_MODELS_DIR" "$$USER_FACES_DIR"; \
+		printf "$(COLOR_GREEN)✓ Ensured user directories: $$FACEID_BASE_DIR$$$(COLOR_RESET)\n"; \
+		if [ -f "/etc/faceid/models/recognition.param" ] && [ -f "/etc/faceid/models/recognition.bin" ]; then \
+			cp /etc/faceid/models/recognition.* "$${USER_MODELS_DIR}/" 2>/dev/null || true; \
+			chmod 644 "$${USER_MODELS_DIR}/"* 2>/dev/null || true; \
+			printf "$(COLOR_GREEN)✓ Copied recognition models to $$USER_MODELS_DIR (if available)$(COLOR_RESET)\n"; \
 		fi; \
 	fi
 	@printf " \n"
@@ -170,13 +262,48 @@ install: build
 	fi
 	@printf "$(COLOR_GREEN)✓ Log file created: /var/log/faceid.log (root:log 664 - writable by log group)$(COLOR_RESET)\n"
 	@printf " \n"
-	@printf "$(COLOR_CYAN)Installing systemd service...$(COLOR_RESET)\n"
-	@if [ -f "$(INSTALL_PREFIX)/lib/systemd/system/faceid-presence.service" ]; then \
-		printf "$(COLOR_GREEN)✓ Systemd service installed: faceid-presence.service$(COLOR_RESET)\n"; \
-		printf "$(COLOR_CYAN)To enable: sudo systemctl enable --now faceid-presence$(COLOR_RESET)\n"; \
+	@printf "$(COLOR_CYAN)Installing system-wide recognition models...$(COLOR_RESET)\n"
+	@mkdir -p $(INSTALL_PREFIX)/share/faceid/models
+	@chmod 755 $(INSTALL_PREFIX)/share/faceid
+	@chmod 755 $(INSTALL_PREFIX)/share/faceid/models
+	@if [ -f "/etc/faceid/models/recognition.param" ] && [ -f "/etc/faceid/models/recognition.bin" ]; then \
+		if [ "$$(id -u)" != "0" ]; then \
+			sudo cp /etc/faceid/models/recognition.* $(INSTALL_PREFIX)/share/faceid/models/; \
+			sudo chmod 644 $(INSTALL_PREFIX)/share/faceid/models/*; \
+		else \
+			cp /etc/faceid/models/recognition.* $(INSTALL_PREFIX)/share/faceid/models/; \
+			chmod 644 $(INSTALL_PREFIX)/share/faceid/models/*; \
+		fi; \
+		printf "$(COLOR_GREEN)✓ Copied recognition models to $(INSTALL_PREFIX)/share/faceid/models$(COLOR_RESET)\n"; \
 	else \
-		printf "$(COLOR_YELLOW)⚠ Systemd service file not found$(COLOR_RESET)\n"; \
+		printf "$(COLOR_YELLOW)⚠ Recognition models not found in /etc/faceid/models - models must be installed separately$(COLOR_RESET)\n"; \
 	fi
+	@if [ "$$(id -u)" != "0" ]; then \
+		sudo install -D -m 644 dbus/system-services/org.freedesktop.FaceID.conf $(INSTALL_PREFIX)/share/dbus-1/system.d/org.freedesktop.FaceID.conf; \
+	else \
+		install -D -m 644 dbus/system-services/org.freedesktop.FaceID.conf $(INSTALL_PREFIX)/share/dbus-1/system.d/org.freedesktop.FaceID.conf; \
+	fi
+	@printf "$(COLOR_GREEN)✓ D-Bus policy installed: $(INSTALL_PREFIX)/share/dbus-1/system.d/org.freedesktop.FaceID.conf$(COLOR_RESET)\n"
+	@printf " \n"
+	@printf "$(COLOR_CYAN)Installing systemd system service...$(COLOR_RESET)\n"
+	@if [ "$$(id -u)" != "0" ]; then \
+		sudo install -D -m 644 systemd/system/faceid.service $(INSTALL_PREFIX)/lib/systemd/system/faceid.service; \
+		sudo install -D -m 644 dbus/system-services/org.freedesktop.FaceID.service $(INSTALL_PREFIX)/share/dbus-1/system-services/org.freedesktop.FaceID.service; \
+	else \
+		install -D -m 644 systemd/system/faceid.service $(INSTALL_PREFIX)/lib/systemd/system/faceid.service; \
+		install -D -m 644 dbus/system-services/org.freedesktop.FaceID.service $(INSTALL_PREFIX)/share/dbus-1/system-services/org.freedesktop.FaceID.service; \
+	fi
+	@printf "$(COLOR_GREEN)✓ Systemd system service installed: $(INSTALL_PREFIX)/lib/systemd/system/faceid.service$(COLOR_RESET)\n"
+	@printf "$(COLOR_GREEN)✓ D-Bus system service installed: $(INSTALL_PREFIX)/share/dbus-1/system-services/org.freedesktop.FaceID.service$(COLOR_RESET)\n"
+	@printf "$(COLOR_CYAN)Reloading system D-Bus configuration...$(COLOR_RESET)\n"
+	@if [ "$$(id -u)" != "0" ]; then \
+		sudo systemctl daemon-reload; \
+		sudo dbus-send --system --print-reply --dest=org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus.ReloadConfig 2>/dev/null || true; \
+	else \
+		systemctl daemon-reload; \
+		dbus-send --system --print-reply --dest=org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus.ReloadConfig 2>/dev/null || true; \
+	fi
+	@printf "$(COLOR_GREEN)✓ System configuration reloaded$(COLOR_RESET)\n"
 	@printf " \n"
 	@printf "$(COLOR_CYAN)Setting up runtime directory...$(COLOR_RESET)\n"
 	@if [ -f "$(INSTALL_PREFIX)/lib/tmpfiles.d/faceid-tmpfiles.conf" ]; then \
@@ -236,12 +363,9 @@ full-install: deps check-deps setup build install
 	@printf "$(COLOR_GREEN)$(COLOR_BOLD)Full installation completed successfully!$(COLOR_RESET)\n"
 	@printf " \n"
 	@printf "$(COLOR_CYAN)Next steps:$(COLOR_RESET)\n"
-	@printf "  1. Verify installation: faceid --version\n"
-	@printf "  2. Check PAM module: ls -la /usr/lib/security/pam_faceid.so\n"
-	@printf "  3. Check presence daemon: faceid-presence --help\n"
-	@printf "  4. Configure PAM: make pam-install\n"
-	@printf "  5. Enable presence detection: sudo make systemd-enable\n"
-	@printf "  6. Review configuration: /etc/faceid/faceid.conf\n"
+	@printf "  1. Review configuration: /etc/faceid/config.yaml\n"
+	@printf "  2. Enable daemon (user mode): systemctl --user enable --now faceid-daemon\n"
+	@printf "  3. Configure PAM (optional): sudo make pam-install\n"
 	@printf " \n"
 
 # Run tests
@@ -381,20 +505,23 @@ pam-status:
 		printf "$(COLOR_RED)✗ system-local-login not configured$(COLOR_RESET)\n"; \
 	fi
 	@printf " \n"
-	@if [ -f "/etc/faceid/faceid.conf" ]; then \
+	@if [ -f "/etc/faceid/config.yaml" ]; then \
 		printf "$(COLOR_CYAN)FaceID Configuration:$(COLOR_RESET)\n"; \
-		if grep -q "check_lid_state = true" /etc/faceid/faceid.conf 2>/dev/null; then \
-			printf "$(COLOR_GREEN)✓ Lid detection enabled$(COLOR_RESET)\n"; \
+		if grep -q "enabled: true" /etc/faceid/config.yaml 2>/dev/null | grep -A2 "presence_detection" | grep -q "enabled: true"; then \
+			printf "$(COLOR_GREEN)✓ Presence detection enabled$(COLOR_RESET)\n"; \
 		else \
-			printf "$(COLOR_YELLOW)⚠ Lid detection disabled in config$(COLOR_RESET)\n"; \
+			printf "$(COLOR_YELLOW)⚠ Presence detection may be disabled in config$(COLOR_RESET)\n"; \
 		fi; \
-		if grep -q "enable_fingerprint = true" /etc/faceid/faceid.conf 2>/dev/null; then \
+		if grep -q "enabled: true" /etc/faceid/config.yaml 2>/dev/null | grep -A2 "fingerprint" | grep -q "enabled: true"; then \
 			printf "$(COLOR_GREEN)✓ Fingerprint support enabled$(COLOR_RESET)\n"; \
 		else \
-			printf "$(COLOR_YELLOW)⚠ Fingerprint support disabled in config$(COLOR_RESET)\n"; \
+			printf "$(COLOR_YELLOW)⚠ Fingerprint support may be disabled in config$(COLOR_RESET)\n"; \
 		fi; \
+	elif [ -f "/etc/faceid/faceid.conf" ]; then \
+		printf "$(COLOR_YELLOW)⚠ Old config format detected: /etc/faceid/faceid.conf$(COLOR_RESET)\n"; \
+		printf "  Consider migrating to YAML: /etc/faceid/config.yaml\n"; \
 	else \
-		printf "$(COLOR_YELLOW)⚠ Config file not found: /etc/faceid/faceid.conf$(COLOR_RESET)\n"; \
+		printf "$(COLOR_YELLOW)⚠ Config file not found: /etc/faceid/config.yaml$(COLOR_RESET)\n"; \
 	fi
 	@printf " \n"
 	@BACKUPS=$$(ls -1t /etc/pam.d/*.backup.* 2>/dev/null | head -3); \
@@ -495,19 +622,29 @@ systemd-enable:
 		exit 1; \
 	fi
 	@printf "$(COLOR_CYAN)Checking configuration...$(COLOR_RESET)\n"
-	@if ! grep -q "enabled = true" /etc/faceid/faceid.conf 2>/dev/null; then \
-		printf "$(COLOR_YELLOW)⚠ Presence detection is disabled in config$(COLOR_RESET)\n"; \
-		printf "  Edit /etc/faceid/faceid.conf and set: enabled = true\n"; \
-		printf "  in [presence_detection] section\n"; \
-		printf " \n"; \
-		read -p "Enable now in config? [y/N] " -n 1 -r; \
-		echo; \
-		if [ "$$REPLY" = "y" ] || [ "$$REPLY" = "Y" ]; then \
-			sed -i 's/^enabled = false/enabled = true/' /etc/faceid/faceid.conf; \
-			printf "$(COLOR_GREEN)✓ Enabled presence detection in config$(COLOR_RESET)\n"; \
+	@if [ -f "/etc/faceid/config.yaml" ]; then \
+		if ! grep -A5 "presence_detection:" /etc/faceid/config.yaml | grep -q "enabled: true" 2>/dev/null; then \
+			printf "$(COLOR_YELLOW)⚠ Presence detection is disabled in config$(COLOR_RESET)\n"; \
+			printf "  Edit /etc/faceid/config.yaml and set:\n"; \
+			printf "  presence_detection:\n"; \
+			printf "    enabled: true\n"; \
+			printf " \n"; \
+			read -p "Enable now in config? [y/N] " -n 1 -r; \
+			echo; \
+			if [ "$$REPLY" = "y" ] || [ "$$REPLY" = "Y" ]; then \
+				sed -i '/presence_detection:/,/enabled:/ s/enabled: false/enabled: true/' /etc/faceid/config.yaml; \
+				printf "$(COLOR_GREEN)✓ Enabled presence detection in config$(COLOR_RESET)\n"; \
+			fi; \
+		else \
+			printf "$(COLOR_GREEN)✓ Presence detection enabled in config$(COLOR_RESET)\n"; \
 		fi; \
+	elif [ -f "/etc/faceid/faceid.conf" ]; then \
+		printf "$(COLOR_YELLOW)⚠ Old config format detected$(COLOR_RESET)\n"; \
+		printf "  Please migrate to /etc/faceid/config.yaml\n"; \
 	else \
-		printf "$(COLOR_GREEN)✓ Presence detection enabled in config$(COLOR_RESET)\n"; \
+		printf "$(COLOR_RED)✗ No config file found$(COLOR_RESET)\n"; \
+		printf "  Run 'sudo make install' first\n"; \
+		exit 1; \
 	fi
 	@printf " \n"
 	@printf "$(COLOR_CYAN)Reloading systemd daemon...$(COLOR_RESET)\n"
@@ -592,21 +729,20 @@ presence-status:
 	fi
 	@printf " \n"
 	@printf "$(COLOR_CYAN)Configuration:$(COLOR_RESET)\n"
-	@if [ -f "/etc/faceid/faceid.conf" ]; then \
-		if grep -q "enabled = true" /etc/faceid/faceid.conf 2>/dev/null; then \
+	@if [ -f "/etc/faceid/config.yaml" ]; then \
+		if grep -A5 "presence_detection:" /etc/faceid/config.yaml | grep -q "enabled: true" 2>/dev/null; then \
 			printf "$(COLOR_GREEN)✓ Presence detection enabled in config$(COLOR_RESET)\n"; \
-			THRESHOLD=$$(grep "inactive_threshold_seconds" /etc/faceid/faceid.conf | awk '{print $$3}'); \
-			INTERVAL=$$(grep "scan_interval_seconds" /etc/faceid/faceid.conf | awk '{print $$3}'); \
-			FAILURES=$$(grep "max_scan_failures" /etc/faceid/faceid.conf | awk '{print $$3}'); \
-			IDLE=$$(grep "max_idle_time_minutes" /etc/faceid/faceid.conf | awk '{print $$3}'); \
-			printf "  • Inactive threshold: $${THRESHOLD}s\n"; \
-			printf "  • Scan interval: $${INTERVAL}s\n"; \
-			printf "  • Max failures: $${FAILURES}\n"; \
-			printf "  • Max idle time: $${IDLE} min\n"; \
+			THRESHOLD=$$(grep -A10 "presence_detection:" /etc/faceid/config.yaml | grep "lock_after:" | awk '{print $$2}'); \
+			printf "  • Lock after: $${THRESHOLD}s\n"; \
 		else \
 			printf "$(COLOR_YELLOW)⚠ Presence detection disabled in config$(COLOR_RESET)\n"; \
-			printf "  Enable: sudo sed -i 's/enabled = false/enabled = true/' /etc/faceid/faceid.conf\n"; \
+			printf "  Enable: Edit /etc/faceid/config.yaml and set:\n"; \
+			printf "  presence_detection:\n"; \
+			printf "    enabled: true\n"; \
 		fi; \
+	elif [ -f "/etc/faceid/faceid.conf" ]; then \
+		printf "$(COLOR_YELLOW)⚠ Old config format: /etc/faceid/faceid.conf$(COLOR_RESET)\n"; \
+		printf "  Migrate to YAML format: /etc/faceid/config.yaml\n"; \
 	else \
 		printf "$(COLOR_RED)✗ Config file not found$(COLOR_RESET)\n"; \
 	fi

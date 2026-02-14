@@ -10,7 +10,7 @@ using namespace faceid;
 using namespace faceid::cli;
 
 int cmd_remove(const std::string& username, const std::string& face_id) {
-    std::string faces_dir = FACES_DIR;
+    std::string faces_dir = cli::getFacesDir(username);
     
     // If no face_id specified, remove entire user model
     if (face_id.empty()) {

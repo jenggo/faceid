@@ -1,6 +1,7 @@
 #include "commands.h"
 #include "cli_common.h"
 #include "cli_helpers.h"
+#include "dbus_client_cli.h"
 #include <chrono>
 #include <vector>
 #include <string>
@@ -10,7 +11,7 @@
 #include <fnmatch.h>
 #include "../models/binary_model.h"
 #include "../models/model_cache.h"
-#include "../config.h"
+#include "../daemon/config.h"
 #include "config_paths.h"
 
 namespace faceid {
@@ -52,7 +53,8 @@ static bool hasInvalidValues(const std::vector<float>& vec) {
 }
 
 // Perform integrity checks on face encodings
-static bool checkEncodingIntegrity(const BinaryFaceModel& model, const FaceDetector& detector, bool verbose = true) {
+// Assumes daemon uses 512-dimensional embeddings (standard for modern face recognition)
+static bool checkEncodingIntegrity(const BinaryFaceModel& model, bool verbose = true) {
     if (verbose) {
         std::cout << "\n=== Encoding Integrity Check ===" << std::endl;
         // V2 format: count total encodings across all poses
@@ -64,7 +66,7 @@ static bool checkEncodingIntegrity(const BinaryFaceModel& model, const FaceDetec
     }
     
     bool has_issues = false;
-    size_t current_model_dim = detector.getEncodingDimension();
+    const size_t DAEMON_ENCODING_DIM = 512;  // D-Bus daemon uses 512D embeddings
     
     // Flatten all encodings for checking
     std::vector<FaceEncoding> all_encodings;
@@ -110,11 +112,10 @@ static bool checkEncodingIntegrity(const BinaryFaceModel& model, const FaceDetec
         std::cout << "✓ No NaN or Inf values found" << std::endl;
     }
     
-    // Check 3: Size validation - check against current model dimension
+    // Check 3: Size validation - check against daemon encoding dimension
     bool all_valid_size = true;
-    size_t expected_dim = current_model_dim;
     for (const auto& enc : all_encodings) {
-        if (enc.size() != expected_dim) {
+        if (enc.size() != DAEMON_ENCODING_DIM) {
             all_valid_size = false;
             break;
         }
@@ -122,13 +123,12 @@ static bool checkEncodingIntegrity(const BinaryFaceModel& model, const FaceDetec
     
     if (!all_valid_size) {
         std::cout << "✗ CRITICAL: Some encodings have incorrect dimensions" << std::endl;
-        std::cout << "  Expected: " << expected_dim << "D vectors (current model: " 
-                  << detector.getModelName() << ")" << std::endl;
+        std::cout << "  Expected: " << DAEMON_ENCODING_DIM << "D vectors (daemon standard)" << std::endl;
         std::cout << "  Found: " << (all_encodings.empty() ? 0 : all_encodings[0].size()) << "D vectors" << std::endl;
         std::cout << "  Solution: Re-enroll with 'sudo faceid add " << model.username << "'" << std::endl;
         has_issues = true;
     } else if (verbose) {
-        std::cout << "✓ All encodings have correct dimensions (" << expected_dim << "D)" << std::endl;
+        std::cout << "✓ All encodings have correct dimensions (" << DAEMON_ENCODING_DIM << "D)" << std::endl;
     }
     
     // Check 4: Self-similarity (optional, detailed check)
@@ -166,10 +166,11 @@ int cmd_test(const std::string& username, bool auto_adjust) {
 
     std::cout << "Loaded " << all_models.size() << " enrolled user(s)" << std::endl;
 
-    // Initialize face detector early (needed for integrity checks)
-    faceid::FaceDetector detector;
-    if (!detector.loadModels()) {
-        std::cerr << "Error: Failed to load face recognition model" << std::endl;
+    // Initialize D-Bus connection for face detection and embedding
+    DBusClientCLI& dbus_client = DBusClientCLI::instance();
+    if (!dbus_client.connect()) {
+        std::cerr << "Error: Failed to connect to face recognition daemon" << std::endl;
+        std::cerr << "Make sure the daemon is running with: sudo systemctl start faceid-daemon" << std::endl;
         return 1;
     }
 
@@ -178,7 +179,7 @@ int cmd_test(const std::string& username, bool auto_adjust) {
         for (const auto& model : all_models) {
             if (model.username == username) {
                 std::cout << "\nRunning integrity checks for user: " << username << std::endl;
-                bool integrity_ok = checkEncodingIntegrity(model, detector, true);
+                bool integrity_ok = checkEncodingIntegrity(model, true);
                 if (!integrity_ok) {
                     std::cout << "\n⚠ Continuing with live test despite integrity issues..." << std::endl;
                 }
@@ -188,15 +189,17 @@ int cmd_test(const std::string& username, bool auto_adjust) {
     }
     
     // Load configuration
-    faceid::Config& config = faceid::Config::getInstance();
     std::string config_path = std::string(CONFIG_DIR) + "/faceid.conf";
-    config.load(config_path);
+    auto config_ptr = ::Config::load();
+    if (!config_ptr) {
+        std::cerr << "Warning: Could not load config, using defaults" << std::endl;
+    }
+    ::Config& config = config_ptr ? *config_ptr : ::Config::instance();
     
-    auto device = config.getString("camera", "device").value_or("/dev/video0");
-    auto width = config.getInt("camera", "width").value_or(640);
-    auto height = config.getInt("camera", "height").value_or(480);
-    double threshold = config.getDouble("recognition", "threshold").value_or(0.6);
-    int tracking_interval = config.getInt("face_detection", "tracking_interval").value_or(10);
+    auto device = config.camera.device;
+    auto width = config.camera.width;
+    auto height = config.camera.height;
+    double threshold = config.recognition.threshold;
     
     std::cout << "Using camera: " << device << " (" << width << "x" << height << ")" << std::endl;
     std::cout << "Recognition threshold: " << threshold << std::endl;
@@ -243,22 +246,28 @@ int cmd_test(const std::string& username, bool auto_adjust) {
             continue;
         }
         
-        // Preprocess and detect faces
+        // Encode frame as PNG and send to daemon for detection
         auto detect_start = std::chrono::high_resolution_clock::now();
-        faceid::Image processed_frame = detector.preprocessFrame(frame.view());
-        auto faces = detector.detectOrTrackFaces(processed_frame.view(), tracking_interval);
+        std::vector<uint8_t> png_data = DBusClientCLI::encode_frame_as_jpeg(frame);
+        auto detect_result = dbus_client.detect_face(png_data);
         auto detect_end = std::chrono::high_resolution_clock::now();
         double detection_time = std::chrono::duration<double, std::milli>(detect_end - detect_start).count();
         
-        if (!faces.empty()) {
-            // Encode and match faces
+        if (!detect_result.boxes.empty()) {
+            // Generate embeddings and match faces
             auto recog_start = std::chrono::high_resolution_clock::now();
-            // Use adaptive quality threshold (0.50) for testing, matching enrollment behavior
-            auto encodings = detector.encodeFaces(processed_frame.view(), faces, 0.50);
+            
+            std::vector<FaceEncoding> encodings;
+            for (const auto& bbox : detect_result.boxes) {
+                auto embedding_result = dbus_client.generate_embedding(png_data, bbox);
+                if (!embedding_result.embedding.empty()) {
+                    encodings.push_back(embedding_result.embedding);
+                }
+            }
             
             // Match against enrolled users
             bool matched = false;
-            for (size_t i = 0; i < encodings.size() && i < faces.size(); i++) {
+            for (size_t i = 0; i < encodings.size() && i < detect_result.boxes.size(); i++) {
                 double best_distance = 999.0;
                 std::string best_match = "";
 
@@ -271,7 +280,7 @@ int cmd_test(const std::string& username, bool auto_adjust) {
                                                    pose_encodings.end());
                     }
                     for (const auto& stored_encoding : model_flat_encodings) {
-                        double distance = detector.compareFaces(stored_encoding, encodings[i]);
+                        double distance = cosineDistance(stored_encoding, encodings[i]);
                         if (distance < best_distance) {
                             best_distance = distance;
                             best_match = model.username;
@@ -355,9 +364,10 @@ int cmd_test(const std::string& username, bool auto_adjust) {
                 continue;
             }
             
-            // Use cascading detection for robust face detection in all lighting conditions
-            auto cascade_result = detector.detectFacesCascade(frame.view(), false, 0.5f);
-            auto test_faces = cascade_result.faces;
+            // Use D-Bus for face detection
+            std::vector<uint8_t> png_data = DBusClientCLI::encode_frame_as_jpeg(frame);
+            auto detect_result = dbus_client.detect_face(png_data);
+            auto test_faces = detect_result.boxes;
             
             // Draw visualization
             faceid::Image display_frame = frame.clone();
@@ -373,11 +383,8 @@ int cmd_test(const std::string& username, bool auto_adjust) {
                 std::string status_text = "Face detected! Analyzing optimal settings...";
                 faceid::drawFilledRectangle(display_frame, 0, 0, display_frame.width(), 40, faceid::Color::Black());
                 
-                // Show which cascade stage was used
-                if (cascade_result.stage_used > 1) {
-                    status_text = "Face detected (cascade stage " + std::to_string(cascade_result.stage_used) + 
-                                 ", brightness: " + std::to_string(static_cast<int>(cascade_result.avg_brightness * 100)) + "%)";
-                }
+                // Note: cascade stage info not available from D-Bus, just show quality
+                status_text = "Face detected (quality: " + std::to_string(static_cast<int>(detect_result.quality * 100)) + "%)";
                 
                 std::string status_reversed = status_text;
                 std::reverse(status_reversed.begin(), status_reversed.end());
@@ -411,26 +418,27 @@ int cmd_test(const std::string& username, bool auto_adjust) {
         
         std::cout << "detected!" << std::endl;
         
-        // Step 2: Use cascade detection - no need for manual confidence optimization
+        // Step 2: Use D-Bus detection - no need for manual confidence optimization
         std::cout << std::endl;
-        std::cout << "=== Using Cascading Detection ===" << std::endl;
-        std::cout << "Automatic 3-stage detection with CLAHE enhancement" << std::endl;
+        std::cout << "=== Using D-Bus Face Detection ===" << std::endl;
+        std::cout << "Using system daemon for face detection" << std::endl;
         std::cout << "This adapts automatically to your lighting conditions" << std::endl;
         
-        // Test cascade detection on reference frame
-        auto cascade_result = detector.detectFacesCascade(reference_frame.view(), false, 0.5f);
+        // Test detection on reference frame
+        std::vector<uint8_t> ref_png = DBusClientCLI::encode_frame_as_jpeg(reference_frame);
+        auto detect_result = dbus_client.detect_face(ref_png);
         
-        if (cascade_result.faces.empty()) {
+        if (detect_result.boxes.empty()) {
             std::cerr << "✗ No faces detected in reference frame" << std::endl;
             return 1;
         }
         
-        std::cout << "✓ Cascade detection successful" << std::endl;
-        std::cout << "  Stage used: " << cascade_result.stage_used << "/3" << std::endl;
-        std::cout << "  Brightness: " << std::fixed << std::setprecision(1) 
-                  << (cascade_result.avg_brightness * 100) << "%" << std::endl;
+        std::cout << "✓ Face detection successful" << std::endl;
+        std::cout << "  Detected faces: " << detect_result.boxes.size() << std::endl;
+        std::cout << "  Detection quality: " << std::fixed << std::setprecision(1) 
+                  << (detect_result.quality * 100) << "%" << std::endl;
         
-        // Use default confidence (cascade handles it automatically)
+        // Use default confidence (daemon handles it automatically)
         float optimal_confidence = 0.5f;
         
         // Step 3: Capture samples in current conditions to calculate optimal threshold
@@ -462,15 +470,16 @@ int cmd_test(const std::string& username, bool auto_adjust) {
                     std::chrono::steady_clock::now() - capture_start).count();
                 
                 if (elapsed >= 3000) {
-                    // Capture now using cascade detection
+                    // Capture now using D-Bus detection
                     faceid::Image frame;
                     if (camera.read(frame)) {
-                        auto cascade_result = detector.detectFacesCascade(frame.view(), false, optimal_confidence);
+                        std::vector<uint8_t> png_data = DBusClientCLI::encode_frame_as_jpeg(frame);
+                        auto detect_result = dbus_client.detect_face(png_data);
                         
-                        if (cascade_result.faces.size() == 1) {
-                            auto encodings = detector.encodeFaces(cascade_result.processed_frame.view(), cascade_result.faces, 0.50);
-                            if (!encodings.empty()) {
-                                captured_encoding = encodings[0];
+                        if (detect_result.boxes.size() == 1) {
+                            auto embedding_result = dbus_client.generate_embedding(png_data, detect_result.boxes[0]);
+                            if (!embedding_result.embedding.empty()) {
+                                captured_encoding = embedding_result.embedding;
                                 captured = true;
                                 std::cout << "✓ OK" << std::endl;
                             }
@@ -482,11 +491,12 @@ int cmd_test(const std::string& username, bool auto_adjust) {
                         capture_start = std::chrono::steady_clock::now();  // Retry
                     }
                 } else {
-                    // Show live preview during countdown using cascade
+                    // Show live preview during countdown using D-Bus
                     faceid::Image frame;
                     if (camera.read(frame)) {
-                        auto cascade_result = detector.detectFacesCascade(frame.view(), false, optimal_confidence);
-                        auto faces = cascade_result.faces;
+                        std::vector<uint8_t> png_data = DBusClientCLI::encode_frame_as_jpeg(frame);
+                        auto detect_result = dbus_client.detect_face(png_data);
+                        auto faces = detect_result.boxes;
                         
                         faceid::Image display_frame = frame.clone();
                         
@@ -639,12 +649,13 @@ int cmd_test(const std::string& username, bool auto_adjust) {
             for (int sample = 0; sample < 3; sample++) {
                 faceid::Image adj_frame;
                 if (camera.read(adj_frame)) {
-                    auto cascade_result = detector.detectFacesCascade(adj_frame.view(), false, 0.5f);
+                    std::vector<uint8_t> png_data = DBusClientCLI::encode_frame_as_jpeg(adj_frame);
+                    auto detect_result = dbus_client.detect_face(png_data);
                     
-                    if (cascade_result.faces.size() == 1) {
-                        auto adj_encodings = detector.encodeFaces(cascade_result.processed_frame.view(), cascade_result.faces, 0.50);
-                        if (!adj_encodings.empty() && isValidFace(cascade_result.faces[0], adj_frame.width(), adj_frame.height(), adj_encodings[0])) {
-                            adjustment_encodings.push_back(adj_encodings[0]);
+                    if (detect_result.boxes.size() == 1) {
+                        auto embedding_result = dbus_client.generate_embedding(png_data, detect_result.boxes[0]);
+                        if (!embedding_result.embedding.empty() && isValidFace(detect_result.boxes[0], adj_frame.width(), adj_frame.height(), embedding_result.embedding)) {
+                            adjustment_encodings.push_back(embedding_result.embedding);
                         }
                     }
                 }
@@ -688,9 +699,10 @@ int cmd_test(const std::string& username, bool auto_adjust) {
             is_adjusting = false;
         }
 
-        // Use cascading detection for robust face detection in all lighting conditions
-        auto cascade_result = detector.detectFacesCascade(frame.view(), false, 0.5f);
-        auto faces = cascade_result.faces;
+        // Use D-Bus detection for robust face detection in all lighting conditions
+        std::vector<uint8_t> png_data = DBusClientCLI::encode_frame_as_jpeg(frame);
+        auto detect_result = dbus_client.detect_face(png_data);
+        auto faces = detect_result.boxes;
 
         // Clone frame for drawing
         faceid::Image display_frame = frame.clone();
@@ -700,7 +712,14 @@ int cmd_test(const std::string& username, bool auto_adjust) {
         std::vector<double> matched_distances(faces.size(), 999.0);
 
         if (!faces.empty()) {
-            auto encodings = detector.encodeFaces(cascade_result.processed_frame.view(), faces, 0.50);
+            // Generate embeddings for all detected faces
+            std::vector<FaceEncoding> encodings;
+            for (const auto& bbox : faces) {
+                auto embedding_result = dbus_client.generate_embedding(png_data, bbox);
+                if (!embedding_result.embedding.empty()) {
+                    encodings.push_back(embedding_result.embedding);
+                }
+            }
             
             // Deduplicate faces - filter out multiple detections of the same person
             // This prevents false positives from the same face detected at different angles/positions
@@ -742,7 +761,7 @@ int cmd_test(const std::string& username, bool auto_adjust) {
                     }
                     
                     for (const auto& stored_encoding : model_flat_encodings) {
-                        double distance = detector.compareFaces(stored_encoding, encodings[i]);
+                        double distance = cosineDistance(stored_encoding, encodings[i]);
                         
                         if (distance < best_distance) {
                             // Shift best to second best

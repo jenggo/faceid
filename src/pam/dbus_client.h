@@ -19,7 +19,14 @@ public:
      * Connect to the faceid daemon on session bus
      * Returns true if connection established, false otherwise
      */
+    // Connect to the D-Bus session bus for the current process (legacy)
     bool connect();
+
+    // Connect to a specific user's session bus by username.
+    // This attempts to open the user bus at /run/user/<uid>/bus which allows
+    // PAM (running as root) to reach the user's faceid-daemon even when
+    // the PAM process does not share the user's session environment.
+    bool connect_for_user(const std::string& username);
     
     /**
      * Check if daemon is available on D-Bus

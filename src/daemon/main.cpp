@@ -1,26 +1,29 @@
 #include <iostream>
 #include <cstdlib>
 #include <cstring>
+#include <cerrno>
 #include <syslog.h>
 #include <systemd/sd-daemon.h>
 #include <systemd/sd-bus.h>
 #include <unistd.h>
 #include <signal.h>
 #include "validation.h"
+#include "config.h"
 #include "dbus_server.h"
+#include "path_utils.h"
 
 /**
- * FaceID Daemon - User-level D-Bus service for biometric authentication
+ * FaceID Daemon - System-level D-Bus service for biometric authentication
  * 
- * This daemon runs as a systemd --user service and provides D-Bus methods for:
+ * This daemon runs as a systemd system service and provides D-Bus methods for:
  * - Face/fingerprint authentication
  * - Face enrollment
  * - Presence detection and auto-lock
  * - Model management
  * 
  * Architecture:
- * - Runs as unprivileged user (rejects root)
- * - Uses D-Bus session bus (user-isolated)
+ * - Runs as root (system service)
+ * - Uses D-Bus system bus (accessible from PAM and all users)
  * - Pre-loads camera and ML models
  * - Shared resource access for auth/enrollment/presence
  */
@@ -48,46 +51,42 @@ int main(int argc, char** argv) {
     // VALIDATION PHASE
     // ═════════════════════════════════════════════════════════════════════
     
-    // Check 1: Must not be root
-    if (validation::is_root()) {
-        std::cerr << "❌ faceid-daemon MUST NOT run as root\n"
-                  << "   This is a user-level service (systemd --user)\n"
-                  << "   Enable it with: systemctl --user enable faceid-daemon\n";
-        syslog(LOG_ERR, "Rejected: Running as root");
+    // Check 1: Must run as root (system service)
+    if (!validation::is_root()) {
+        std::cerr << "❌ faceid-daemon MUST run as root\n"
+                  << "   This is a system-level service\n"
+                  << "   Enable it with: systemctl enable faceid\n";
+        syslog(LOG_ERR, "Rejected: Not running as root");
         return EXIT_FAILURE;
     }
-    syslog(LOG_INFO, "✓ UID validation passed (UID: %d)", getuid());
+    syslog(LOG_INFO, "✓ UID validation passed (running as root)");
 
-    // Check 2: Must have user session
-    if (!validation::has_user_session()) {
-        std::cerr << "❌ No XDG_RUNTIME_DIR - not in a user session\n"
-                  << "   faceid-daemon requires an active user session\n";
-        syslog(LOG_ERR, "Rejected: No user session (XDG_RUNTIME_DIR missing)");
+     // ═════════════════════════════════════════════════════════════════════
+     // INITIALIZATION PHASE
+     // ═════════════════════════════════════════════════════════════════════
+
+    // Load and validate configuration
+    auto config_ptr = Config::load();
+    if (!config_ptr) {
+        std::cerr << "❌ Failed to load configuration\n";
+        syslog(LOG_ERR, "Failed to load configuration");
         return EXIT_FAILURE;
     }
-    std::string xdg_runtime = validation::get_xdg_runtime_dir();
-    syslog(LOG_INFO, "✓ User session validation passed (XDG_RUNTIME_DIR: %s)", 
-           xdg_runtime.c_str());
+    syslog(LOG_INFO, "✓ Configuration loaded and validated");
 
-    // Check 3: Verify config path is user-level
-    std::string config_dir = validation::get_config_dir();
-    if (!validation::is_user_level_path(config_dir)) {
-        std::cerr << "❌ Config path is system-wide: " << config_dir << "\n"
-                  << "   Expected user-level path like ~/.config/faceid/\n";
-        syslog(LOG_ERR, "Rejected: Config path is system-wide: %s", config_dir.c_str());
-        return EXIT_FAILURE;
-    }
-    syslog(LOG_INFO, "✓ Config path validation passed (config_dir: %s)", 
-           config_dir.c_str());
+    /* 
+     * NOTE: We do NOT ensure user directories at startup anymore.
+     * The daemon runs as root, so ensure_user_directories() would try to create 
+     * /root/.local/share/faceid which fails if /root/.local doesn't exist.
+     * Instead, we ensure target user directories on demand (in SaveEmbedding).
+     */
+    // if (!ensure_user_directories(&mkdir_err)) { ... } removed
+    syslog(LOG_INFO, "✓ User data directories will be created on demand");
 
-    // ═════════════════════════════════════════════════════════════════════
-    // INITIALIZATION PHASE
-    // ═════════════════════════════════════════════════════════════════════
-
-    // Setup signal handlers
-    signal(SIGTERM, signal_handler);
-    signal(SIGINT, signal_handler);
-    syslog(LOG_INFO, "✓ Signal handlers registered");
+     // Setup signal handlers
+     signal(SIGTERM, signal_handler);
+     signal(SIGINT, signal_handler);
+     syslog(LOG_INFO, "✓ Signal handlers registered");
 
     // Initialize D-Bus server
     auto dbus_server = DBusServer::create();
@@ -106,8 +105,19 @@ int main(int argc, char** argv) {
 
     syslog(LOG_INFO, "Entering main loop");
     while (g_running) {
-        // TODO: Process D-Bus events and handle timeout
-        sleep(1);
+        // Process D-Bus events with 1-second timeout
+        int ret = sd_bus_wait(g_bus, 1000000);  // 1 second in microseconds
+        if (ret < 0 && ret != -EINTR) {
+            syslog(LOG_ERR, "sd_bus_wait failed: %s", strerror(-ret));
+            break;
+        }
+        
+        // Process pending D-Bus messages
+        ret = sd_bus_process(g_bus, nullptr);
+        if (ret < 0) {
+            syslog(LOG_ERR, "sd_bus_process failed: %s", strerror(-ret));
+            break;
+        }
     }
 
     // ═════════════════════════════════════════════════════════════════════

@@ -350,4 +350,236 @@ std::string FingerprintAuth::getLastError() const {
     return last_error_;
 }
 
+// Signal handler for EnrollStatus during enrollment
+struct EnrollState {
+    bool completed = false;
+    bool success = false;
+    int sample_count = 0;
+    std::string error_message;
+    std::string device_path;
+    GDBusConnection* connection = nullptr;
+    GDBusProxy* device_proxy = nullptr;
+    GMainLoop* loop = nullptr;
+    std::function<void(const std::string&, int)> progress_callback;
+};
+
+static void on_enroll_signal(GDBusProxy* proxy, gchar* sender_name, gchar* signal_name,
+                             GVariant* parameters, gpointer user_data) {
+    EnrollState* state = static_cast<EnrollState*>(user_data);
+    
+    if (g_strcmp0(signal_name, "EnrollStatus") == 0) {
+        const gchar* status = nullptr;
+        gboolean done = FALSE;
+        g_variant_get(parameters, "(&sb)", &status, &done);
+        
+        Logger::getInstance().debug(std::string("Enroll status: ") + status + " done=" + (done ? "true" : "false"));
+        
+        if (g_strcmp0(status, "enroll-completed") == 0) {
+            state->success = true;
+        } else if (g_strcmp0(status, "enroll-stage-passed") == 0) {
+            // Sample collected successfully
+            state->sample_count++;
+            if (state->progress_callback) {
+                int progress = (state->sample_count * 100) / 5; // Assume 5 samples total
+                state->progress_callback(std::string("sample_") + std::to_string(state->sample_count) + "/5", progress);
+            }
+        } else if (g_strcmp0(status, "enroll-retry-scan") == 0) {
+            Logger::getInstance().warning("Enrollment: bad scan, please retry");
+        }
+        
+        if (done) {
+            state->completed = true;
+            if (state->loop) {
+                g_main_loop_quit(state->loop);
+            }
+        }
+    }
+}
+
+bool FingerprintAuth::enroll(const std::string& username, int timeout_seconds, 
+                            std::atomic<bool>& cancel_flag,
+                            std::function<void(const std::string&, int)> progress_callback) {
+    if (!available_) {
+        last_error_ = "Fingerprint authentication not available";
+        Logger::getInstance().warning("Enroll: " + last_error_);
+        return false;
+    }
+    
+    Logger::getInstance().info("Starting fingerprint enrollment for user: " + username);
+    
+    EnrollState state;
+    state.progress_callback = progress_callback;
+    
+    GError* error = nullptr;
+    
+    // Get device proxy
+    GDBusProxy* device_proxy = g_dbus_proxy_new_sync(
+        impl_->state.connection,
+        G_DBUS_PROXY_FLAGS_NONE,
+        nullptr,
+        "net.reactivated.Fprint",
+        impl_->state.device_path.c_str(),
+        "net.reactivated.Fprint.Device",
+        nullptr,
+        &error
+    );
+    
+    if (error) {
+        last_error_ = std::string("Failed to get device proxy: ") + error->message;
+        Logger::getInstance().warning("Enroll: " + last_error_);
+        g_error_free(error);
+        return false;
+    }
+    
+    state.device_proxy = device_proxy;
+    
+    // Check enrolled fingers
+    GVariant* props = g_dbus_proxy_get_cached_property(device_proxy, "fingers");
+    if (!props) {
+        g_dbus_proxy_call_sync(device_proxy, "GetInfo",
+                              nullptr, G_DBUS_CALL_FLAGS_NONE, -1, nullptr, nullptr);
+        props = g_dbus_proxy_get_cached_property(device_proxy, "fingers");
+    }
+    
+    if (error) {
+        g_error_free(error);
+        g_object_unref(device_proxy);
+        return false;
+    }
+    
+    // Claim device
+    GVariant* claim_result = g_dbus_proxy_call_sync(
+        device_proxy,
+        "Claim",
+        g_variant_new("(s)", username.c_str()),
+        G_DBUS_CALL_FLAGS_NONE,
+        -1,
+        nullptr,
+        &error
+    );
+    
+    if (error) {
+        last_error_ = std::string("Failed to claim device for enrollment: ") + error->message;
+        Logger::getInstance().warning("Enroll: " + last_error_);
+        g_error_free(error);
+        g_object_unref(device_proxy);
+        return false;
+    }
+    
+    g_variant_unref(claim_result);
+    
+    // Reset state
+    state.completed = false;
+    state.success = false;
+    state.sample_count = 0;
+    state.loop = g_main_loop_new(nullptr, FALSE);
+    
+    // Connect to signals
+    gulong signal_id = g_signal_connect(device_proxy, "g-signal",
+                                       G_CALLBACK(on_enroll_signal), &state);
+    
+    // Start enrollment
+    GVariant* enroll_result = g_dbus_proxy_call_sync(
+        device_proxy,
+        "EnrollStart",
+        g_variant_new("(s)", "right-index-finger"), // Specify finger
+        G_DBUS_CALL_FLAGS_NONE,
+        -1,
+        nullptr,
+        &error
+    );
+    
+    if (error) {
+        last_error_ = std::string("Failed to start enrollment: ") + error->message;
+        Logger::getInstance().warning("Enroll: " + last_error_);
+        g_error_free(error);
+        g_signal_handler_disconnect(device_proxy, signal_id);
+        g_object_unref(device_proxy);
+        return false;
+    }
+    
+    g_variant_unref(enroll_result);
+    
+    Logger::getInstance().info("Enrollment started for user: " + username);
+    
+    // Run main loop in a separate thread
+    std::thread loop_thread([&state]() {
+        if (state.loop) {
+            g_main_loop_run(state.loop);
+        }
+    });
+    
+    // Wait for completion or timeout/cancel
+    auto start = std::chrono::steady_clock::now();
+    
+    while (!state.completed && !cancel_flag.load()) {
+        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::steady_clock::now() - start).count();
+        
+        if (elapsed >= timeout_seconds) {
+            Logger::getInstance().warning("Fingerprint enrollment timeout");
+            break;
+        }
+        
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    
+    // Stop enrollment
+    GVariant* stop_result = g_dbus_proxy_call_sync(
+        device_proxy,
+        "EnrollStop",
+        nullptr,
+        G_DBUS_CALL_FLAGS_NONE,
+        -1,
+        nullptr,
+        nullptr
+    );
+    
+    if (stop_result) {
+        g_variant_unref(stop_result);
+    }
+    
+    // Cleanup
+    if (state.loop) {
+        if (g_main_loop_is_running(state.loop)) {
+            g_main_loop_quit(state.loop);
+        }
+    }
+    
+    if (loop_thread.joinable()) {
+        loop_thread.join();
+    }
+    
+    if (state.loop) {
+        g_main_loop_unref(state.loop);
+    }
+    
+    // Release device
+    g_dbus_proxy_call_sync(device_proxy, "Release",
+                          nullptr, G_DBUS_CALL_FLAGS_NONE,
+                          -1, nullptr, nullptr);
+    
+    g_signal_handler_disconnect(device_proxy, signal_id);
+    g_object_unref(device_proxy);
+    
+    if (cancel_flag.load()) {
+        Logger::getInstance().info("Fingerprint enrollment cancelled by flag");
+        return false;
+    }
+    
+    if (state.success) {
+        Logger::getInstance().info("Fingerprint enrollment succeeded for user: " + username);
+        return true;
+    }
+    
+    if (state.error_message.empty()) {
+        last_error_ = "Enrollment failed: insufficient samples or other error";
+    } else {
+        last_error_ = state.error_message;
+    }
+    
+    Logger::getInstance().warning("Fingerprint enrollment failed for user " + username + ": " + last_error_);
+    return false;
+}
+
 } // namespace faceid

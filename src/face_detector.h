@@ -131,6 +131,13 @@ public:
     // Check if detection2 model is loaded
     bool hasDetection2Model() const { return detection2_model_loaded_; }
     
+    // Enable Vulkan GPU acceleration (must be called before loadModels)
+    // use_fp16: Use FP16 precision (faster on AMD GPU, slightly lower precision)
+    void enableVulkan(bool use_fp16 = true);
+    
+    // Disable Vulkan GPU acceleration (use CPU)
+    void disableVulkan();
+    
     // Get current detection model type as string
     std::string getDetectionModelType() const {
         switch (detection_model_type_) {

@@ -2,26 +2,30 @@
 
 #include <memory>
 #include <string>
+#include <vector>
+#include <mutex>
+#include "../face_detector.h"
+#include "../image.h"
 
 /**
  * Face Detector Manager - Wrapper for face detection ML models
  * 
- * This is a facade that will be implemented with actual ML models
- * (YuNet for detection, SFace for recognition) when the full implementation
- * is integrated. For now, this is a placeholder.
+ * Integrates YuNet (face detection) and SFace (face recognition) models.
+ * Thread-safe for concurrent authentication requests.
  * 
  * Responsibilities:
- * - Load face detection and recognition models
- * - Provide face verification interface
+ * - Load face detection and recognition models (YuNet + SFace)
+ * - Provide face detection interface (detect bounding boxes)
+ * - Provide face recognition interface (extract features, compare)
  * - Cache models in memory for reuse
- * - Report model availability status
+ * - Thread safety for multi-user parallel authentication
  */
 class FaceDetectorManager {
 public:
     static FaceDetectorManager& instance();
     
     /**
-     * Initialize face detection models
+     * Initialize face detection models (YuNet + SFace)
      * Returns true if models loaded successfully
      */
     bool initialize();
@@ -32,10 +36,27 @@ public:
     bool is_ready() const { return models_ready_; }
     
     /**
-     * Verify a face against a user's model
+     * Detect faces in a frame
+     * Returns bounding boxes for detected faces
+     */
+    std::vector<faceid::Rect> detect_faces(const faceid::Image& frame);
+    
+    /**
+     * Verify a face against stored user models
      * Returns confidence score (0.0 to 1.0), or -1.0 on error
      */
-    float verify_face(const std::string& username);
+    float verify_face(const faceid::Image& frame,
+                      const std::vector<faceid::Rect>& faces,
+                      const std::vector<faceid::FaceEncoding>& stored_models);
+    
+    /**
+     * Extract face encoding from a single detected face (for enrollment)
+     * frame: input image
+     * face_box: bounding box of the face to encode
+     * Returns: FaceEncoding (std::vector<float>) with 512 dimensions, or empty vector on error
+     */
+    faceid::FaceEncoding encode_face(const faceid::Image& frame,
+                                     const faceid::Rect& face_box);
     
     /**
      * Get status string for logging
@@ -45,8 +66,9 @@ public:
     ~FaceDetectorManager();
     
 private:
-    FaceDetectorManager() = default;
+    FaceDetectorManager();
     
     bool models_ready_ = false;
-    // TODO: Add actual model objects when integrating YuNet and SFace
+    std::unique_ptr<faceid::FaceDetector> detector_;
+    std::mutex detector_mutex_;  // Thread safety for NCNN models
 };

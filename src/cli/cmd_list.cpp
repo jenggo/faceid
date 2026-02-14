@@ -13,7 +13,7 @@ using namespace faceid;
 using namespace faceid::cli;
 
 int cmd_list(const std::string& username) {
-    std::string faces_dir = FACES_DIR;
+    std::string faces_dir = cli::getFacesDir(username);
     
     // List faces for specific user
     if (!username.empty()) {

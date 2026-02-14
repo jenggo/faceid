@@ -32,8 +32,9 @@ public:
     /**
      * Start enrollment for a user
      * Returns: true if started, false if already enrolling
+     * bus: D-Bus connection for emitting signals
      */
-    bool enroll_start(const std::string& username);
+    bool enroll_start(sd_bus* bus, const std::string& username);
 
     /**
      * Stop ongoing enrollment
@@ -52,8 +53,18 @@ public:
 
     /**
      * Emit EnrollStatus signal via D-Bus
+     * Parameters: username, status (in_progress/success/error/etc), progress (0-100), message
      */
-    void emit_enroll_status(sd_bus* bus, const std::string& result, int progress, bool done);
+    void emit_enroll_status(sd_bus* bus, const std::string& username, 
+                           const std::string& status, int progress, 
+                           const std::string& message);
+    
+    /**
+     * Enroll user's fingerprint via fprintd.
+     * @param bus D-Bus connection for progress signals
+     * @param username User to enroll
+     */
+    void enroll_fingerprint(sd_bus* bus, const std::string& username);
 
 private:
     std::atomic<EnrollStatus> status_{EnrollStatus::IDLE};

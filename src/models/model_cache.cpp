@@ -1,6 +1,7 @@
 #include "model_cache.h"
 #include "binary_model.h"
 #include "../logger.h"
+#include "../path_utils.h"
 #include <thread>
 #include <mutex>
 #include <dirent.h>
@@ -8,6 +9,7 @@
 #include <vector>
 #include <algorithm>
 #include "config_paths.h"
+
 namespace faceid {
 
 ModelCache& ModelCache::getInstance() {
@@ -18,10 +20,20 @@ ModelCache& ModelCache::getInstance() {
 // Helper function to find user model files (both username.bin and username.*.bin)
 static std::vector<std::string> findUserModelFiles(const std::string& username) {
     std::vector<std::string> files;
-    std::string faces_dir = FACES_DIR;
+    // Use FHS-compliant faces directory
+    std::string faces_dir = path_utils::get_user_faces_dir(username);
+    if (faces_dir.empty()) {
+        faceid::Logger::getInstance().error("Invalid username for face directory");
+        return files;
+    }
+    
+    // Ensure FaceID directories exist
+    std::string mkdir_err;
+    path_utils::ensure_faceid_directories(&mkdir_err);
     
     DIR* dir = opendir(faces_dir.c_str());
     if (!dir) {
+        faceid::Logger::getInstance().debug("Faces directory not accessible: " + faces_dir);
         return files;
     }
     
@@ -161,10 +173,12 @@ std::vector<BinaryFaceModel> ModelCache::loadUsersParallel(
 std::vector<BinaryFaceModel> ModelCache::loadAllUsersParallel(int num_threads) {
     std::vector<std::string> usernames;
     
-    // Scan FACES_DIR for *.bin files (user face data only)
-    DIR* dir = opendir(FACES_DIR);
+    // Scan FHS-compliant faces directory for *.bin files (user face data only)
+    std::string faces_dir = FACEID_FACES;
+    
+    DIR* dir = opendir(faces_dir.c_str());
     if (!dir) {
-        faceid::Logger::getInstance().error("Failed to open faces directory: " + std::string(FACES_DIR));
+        faceid::Logger::getInstance().error("Failed to open faces directory: " + faces_dir);
         return {};
     }
     

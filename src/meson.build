@@ -11,13 +11,16 @@ libevdev_dep = dependency('libevdev', required: true)  # NEW: For input monitori
 yaml_dep = dependency('yaml-cpp', required: true)      # NEW: For YAML config parsing
 
 # Core library
-core_sources = files(
-    'config.cpp',
-    'camera.cpp',
-    'face_detector.cpp',
-    'clahe.cpp',
-    'logger.cpp',
-    'fingerprint_auth.cpp',
+# NOTE: daemon/config.cpp provides the YAML-based Config class
+# Include it here so CLI and other tools can use it
+    core_sources = files(
+        'daemon/config.cpp',              # YAML config system (shared)
+        'camera.cpp',
+        'face_detector.cpp',
+        'clahe.cpp',
+        'logger.cpp',
+        'path_utils.cpp',
+        'fingerprint_auth.cpp',
     'lid_detector.cpp',
     'display_detector.cpp',
     'systemd_helper.cpp',
@@ -39,7 +42,7 @@ core_lib = static_library(
     'faceid-core',
     sources: core_sources,
     include_directories: inc,
-    dependencies: [ncnn_dep, turbojpeg_dep, libyuv_dep, gio_dep, glib_dep, libsystemd_dep, libevdev_dep],  # Added libevdev_dep
+    dependencies: [ncnn_dep, turbojpeg_dep, libyuv_dep, gio_dep, glib_dep, libsystemd_dep, libevdev_dep, yaml_dep],  # Added yaml_dep for daemon/config.cpp
     cpp_args: cpp_args,
     link_args: ['-lpthread', '-lrt'],  # pthread for mutex, rt for shm_open
 )
@@ -75,8 +78,10 @@ cli_sources = files(
     'cli/cmd_test.cpp',
     'cli/cmd_test_image.cpp',
     'cli/cmd_bench.cpp',
+    'cli/cmd_bench_gpu.cpp',
     'cli/cmd_use.cpp',
     'cli/cmd_help.cpp',
+    'cli/dbus_client_cli.cpp',
     'display.cpp'
 )
 
@@ -84,7 +89,7 @@ cli_exe = executable(
     'faceid',
     sources: cli_sources,
     include_directories: inc,
-    dependencies: [ncnn_dep, turbojpeg_dep, libyuv_dep, sdl2_dep],
+    dependencies: [ncnn_dep, turbojpeg_dep, libyuv_dep, sdl2_dep, libsystemd_dep],
     link_with: core_lib,
     cpp_args: cpp_args,
     install: true,

@@ -12,7 +12,7 @@ std::unique_ptr<Config> Config::load() {
     // Load config files in order: tier 1 → tier 2 → tier 3
     // Each later file overrides earlier ones
     
-    std::string config_dir = validation::get_config_dir();
+    std::string config_dir = "/etc/faceid";
     
     // Tier 1: Minimal config (required, but missing is OK - use defaults)
     std::string config_file = config_dir + "/config.yaml";
@@ -127,6 +127,30 @@ bool Config::merge_yaml(const std::string& config_path) {
                 recognition.threshold = yaml["recognition"]["threshold"].as<double>();
             if (yaml["recognition"]["temporal_frames"])
                 recognition.temporal_frames = yaml["recognition"]["temporal_frames"].as<int>();
+            if (yaml["recognition"]["min_face_quality"])
+                recognition.min_face_quality = yaml["recognition"]["min_face_quality"].as<double>();
+            if (yaml["recognition"]["timeout"])
+                recognition.timeout = yaml["recognition"]["timeout"].as<int>();
+            if (yaml["recognition"]["num_threads"])
+                recognition.num_threads = yaml["recognition"]["num_threads"].as<int>();
+            if (yaml["recognition"]["enable_head_pose_correction"])
+                recognition.enable_head_pose_correction = yaml["recognition"]["enable_head_pose_correction"].as<bool>();
+            if (yaml["recognition"]["enable_gamma_correction"])
+                recognition.enable_gamma_correction = yaml["recognition"]["enable_gamma_correction"].as<bool>();
+            if (yaml["recognition"]["enable_brightness_normalization"])
+                recognition.enable_brightness_normalization = yaml["recognition"]["enable_brightness_normalization"].as<bool>();
+            if (yaml["recognition"]["enable_adaptive_clahe"])
+                recognition.enable_adaptive_clahe = yaml["recognition"]["enable_adaptive_clahe"].as<bool>();
+            if (yaml["recognition"]["debug_face_quality"])
+                recognition.debug_face_quality = yaml["recognition"]["debug_face_quality"].as<bool>();
+        }
+        
+        // Face detection configuration
+        if (yaml["face_detection"]) {
+            if (yaml["face_detection"]["confidence_threshold"])
+                face_detection.confidence_threshold = yaml["face_detection"]["confidence_threshold"].as<double>();
+            if (yaml["face_detection"]["tracking_interval"])
+                face_detection.tracking_interval = yaml["face_detection"]["tracking_interval"].as<int>();
         }
         
         // Preprocessing configuration
@@ -137,6 +161,14 @@ bool Config::merge_yaml(const std::string& config_path) {
                 preprocessing.adaptive_clahe = yaml["preprocessing"]["adaptive_clahe"].as<bool>();
             if (yaml["preprocessing"]["clahe_clip_limit"])
                 preprocessing.clahe_clip_limit = yaml["preprocessing"]["clahe_clip_limit"].as<double>();
+            if (yaml["preprocessing"]["brightness_normalization"])
+                preprocessing.brightness_normalization = yaml["preprocessing"]["brightness_normalization"].as<bool>();
+            if (yaml["preprocessing"]["enable_gamma_correction"])
+                preprocessing.enable_gamma_correction = yaml["preprocessing"]["enable_gamma_correction"].as<bool>();
+            if (yaml["preprocessing"]["enable_brightness_normalization"])
+                preprocessing.enable_brightness_normalization = yaml["preprocessing"]["enable_brightness_normalization"].as<bool>();
+            if (yaml["preprocessing"]["enable_adaptive_clahe"])
+                preprocessing.enable_adaptive_clahe = yaml["preprocessing"]["enable_adaptive_clahe"].as<bool>();
         }
         
         // Quality thresholds
@@ -145,8 +177,28 @@ bool Config::merge_yaml(const std::string& config_path) {
                 quality.min_face_size = yaml["quality_thresholds"]["min_face_size"].as<int>();
             if (yaml["quality_thresholds"]["max_yaw_angle"])
                 quality.max_yaw_angle = yaml["quality_thresholds"]["max_yaw_angle"].as<int>();
+            if (yaml["quality_thresholds"]["max_pitch_angle"])
+                quality.max_pitch_angle = yaml["quality_thresholds"]["max_pitch_angle"].as<int>();
+            if (yaml["quality_thresholds"]["max_roll_angle"])
+                quality.max_roll_angle = yaml["quality_thresholds"]["max_roll_angle"].as<int>();
             if (yaml["quality_thresholds"]["min_confidence"])
                 quality.min_confidence = yaml["quality_thresholds"]["min_confidence"].as<double>();
+        }
+        
+        // Temporal smoothing configuration
+        if (yaml["temporal_smoothing"]) {
+            if (yaml["temporal_smoothing"]["enabled"])
+                temporal_smoothing.enabled = yaml["temporal_smoothing"]["enabled"].as<bool>();
+            if (yaml["temporal_smoothing"]["frames"])
+                temporal_smoothing.frames = yaml["temporal_smoothing"]["frames"].as<int>();
+            if (yaml["temporal_smoothing"]["required_matches"])
+                temporal_smoothing.required_matches = yaml["temporal_smoothing"]["required_matches"].as<int>();
+        }
+        
+        // Enrollment configuration
+        if (yaml["enrollment"]) {
+            if (yaml["enrollment"]["extended_enrollment"])
+                enrollment.extended_enrollment = yaml["enrollment"]["extended_enrollment"].as<bool>();
         }
         
         // Presence detection
@@ -159,13 +211,13 @@ bool Config::merge_yaml(const std::string& config_path) {
                 presence.scan_interval = yaml["presence_detection"]["scan_interval"].as<int>();
         }
         
-        // Performance
-        if (yaml["performance"]) {
-            if (yaml["performance"]["threads"])
-                performance.threads = yaml["performance"]["threads"].as<int>();
-        }
-        
-        // Logging
+         // Performance
+         if (yaml["performance"]) {
+             if (yaml["performance"]["threads"])
+                 performance.threads = yaml["performance"]["threads"].as<int>();
+         }
+         
+         // Logging
         if (yaml["logging"]) {
             if (yaml["logging"]["level"]) {
                 std::string level_str = yaml["logging"]["level"].as<std::string>();
@@ -217,13 +269,13 @@ bool Config::validate() {
         return false;
     }
     
-    // Validate presence detection
-    if (presence.lock_after < 10 || presence.lock_after > 300) {
-        syslog(LOG_ERR, "Invalid presence_detection.lock_after: %d (must be 10-300)", 
-               presence.lock_after);
-        return false;
-    }
-    
-    syslog(LOG_INFO, "✓ Configuration validation passed");
-    return true;
+     // Validate presence detection
+     if (presence.lock_after < 10 || presence.lock_after > 300) {
+         syslog(LOG_ERR, "Invalid presence_detection.lock_after: %d (must be 10-300)", 
+                presence.lock_after);
+         return false;
+     }
+     
+     syslog(LOG_INFO, "✓ Configuration validation passed");
+     return true;
 }

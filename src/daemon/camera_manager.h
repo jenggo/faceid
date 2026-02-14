@@ -2,6 +2,8 @@
 
 #include <memory>
 #include <string>
+#include "../camera.h"
+#include "../image.h"
 
 /**
  * Camera Manager - Singleton for managing camera lifecycle
@@ -23,6 +25,12 @@ public:
     bool initialize();
     
     /**
+     * Capture a frame from the camera
+     * Returns empty Image on failure
+     */
+    faceid::Image capture_frame();
+    
+    /**
      * Check if camera is ready to use
      */
     bool is_ready() const { return camera_ready_; }
@@ -40,11 +48,11 @@ public:
     ~CameraManager();
     
 private:
-    CameraManager() = default;
+    CameraManager();
     
     bool camera_ready_ = false;
     std::string device_path_;
-    int camera_fd_ = -1;  // File descriptor for camera device
-    
-    bool find_and_open_camera();
+    std::unique_ptr<faceid::Camera> camera_;
+    int width_ = 640;
+    int height_ = 480;
 };

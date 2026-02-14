@@ -1,5 +1,4 @@
 [D-BUS Service]
 Name=org.freedesktop.FaceID
 Exec=%{bindir}/faceid-daemon
-User=%u
 SystemdService=faceid-daemon.service

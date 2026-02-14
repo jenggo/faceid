@@ -3,32 +3,31 @@
 #include <vector>
 #include "commands.h"
 #include "config_paths.h"
-#include "../config.h"
+#include "../daemon/config.h"
 #include "../logger.h"
 
 using namespace faceid;
 
 int main(int argc, char* argv[]) {
     // Load configuration to set log level
-    auto& config = faceid::Config::getInstance();
-    std::string config_path = std::string(CONFIG_DIR) + "/faceid.conf";
-    config.load(config_path);
+    auto config_ptr = ::Config::load();
+    if (!config_ptr) {
+        std::cerr << "Warning: Could not load config, using defaults" << std::endl;
+    }
+    ::Config& config = config_ptr ? *config_ptr : ::Config::instance();
     
     // Configure log level from config file
     auto& logger = faceid::Logger::getInstance();
-    std::string log_level_str = config.getString("logging", "log_level").value_or("INFO");
+    ::LogLevel log_level = config.logging.level;
     
-    faceid::LogLevel log_level = faceid::LogLevel::INFO;
-    if (log_level_str == "DEBUG") {
-        log_level = faceid::LogLevel::DEBUG;
-    } else if (log_level_str == "INFO") {
-        log_level = faceid::LogLevel::INFO;
-    } else if (log_level_str == "WARNING") {
-        log_level = faceid::LogLevel::WARNING;
-    } else if (log_level_str == "ERROR") {
-        log_level = faceid::LogLevel::ERROR;
+    faceid::LogLevel faceid_log_level = faceid::LogLevel::INFO;
+    switch (log_level) {
+        case ::LogLevel::DEBUG: faceid_log_level = faceid::LogLevel::DEBUG; break;
+        case ::LogLevel::INFO: faceid_log_level = faceid::LogLevel::INFO; break;
+        case ::LogLevel::WARNING: faceid_log_level = faceid::LogLevel::WARNING; break;
+        case ::LogLevel::ERROR: faceid_log_level = faceid::LogLevel::ERROR; break;
     }
-    logger.setLogLevel(log_level);
+    logger.setLogLevel(faceid_log_level);
     
     if (argc < 2) {
         print_usage();
@@ -166,6 +165,25 @@ int main(int argc, char* argv[]) {
         }
         
         return cmd_bench(test_dir, show_detail, custom_image_path);
+    }
+    
+    if (command == "bench-gpu" || command == "benchmark-gpu") {
+        std::string models_dir = ".";  // Will auto-detect from default locations
+        bool verbose = false;
+        std::string custom_image;
+        
+        for (int i = 2; i < argc; i++) {
+            std::string arg = argv[i];
+            if (arg == "-v" || arg == "--verbose") {
+                verbose = true;
+            } else if (arg == "--image" && i + 1 < argc) {
+                custom_image = argv[++i];
+            } else if (arg[0] != '-') {
+                models_dir = arg;
+            }
+        }
+        
+        return cmd_bench_gpu(models_dir, verbose, custom_image);
     }
     
     if (command == "use") {

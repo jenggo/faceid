@@ -12,11 +12,8 @@ PartOf=graphical-session.target
 Type=dbus
 BusName=org.freedesktop.FaceID
 
-# Run in user session
-User=%u
-
 # Daemon binary location
-ExecStart=%{bindir}/faceid-daemon
+ExecStart=/usr/bin/faceid-daemon
 
 # Restart on failure
 Restart=on-failure
@@ -25,22 +22,22 @@ RestartSec=5
 # Timeout for graceful shutdown
 TimeoutStopSec=10
 
-# Hardening directives
+# Hardening directives (relaxed for user service)
+# User services don't need strict sandboxing like system daemons
 NoNewPrivileges=yes
 PrivateTmp=yes
-ProtectHome=yes
-ProtectSystem=strict
-ReadWritePaths=%{HOME}/.config/faceid %{HOME}/.local/share/faceid
+# Note: ProtectSystem=strict is too restrictive for user services
+# that need to access home directory configs
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
-ProtectControlGroups=yes
 RestrictAddressFamilies=AF_UNIX AF_NETLINK
 RestrictNamespaces=yes
 SystemCallFilter=~@clock @debug @module @obsolete @privileged @reboot @setuid @swap
 SystemCallErrorNumber=EPERM
 
 # Resource limits
-MemoryMax=256M
+# Temporarily disable memory limit for debugging OOM issue
+# MemoryMax=512M
 CPUQuota=50%
 
 [Install]

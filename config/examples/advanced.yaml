@@ -1,5 +1,5 @@
 # FaceID Advanced Configuration (Optional)
-# ~/.config/faceid/advanced.yaml
+# /etc/faceid/advanced.yaml
 #
 # Use this file if you want to tune performance or accuracy.
 # This file is optional - if it doesn't exist, defaults are used.
@@ -23,6 +23,78 @@ recognition:
   # Number of frames to average for temporal smoothing
   # Higher = more stable but slower response
   temporal_frames: 3
+  
+  # Timeout for face recognition in seconds (1-60)
+  timeout: 5
+  
+  # Number of threads for face recognition inference
+  # Increase for faster recognition on multi-core systems
+  num_threads: 4
+  
+  # Enable head pose correction for better recognition at angles
+  enable_head_pose_correction: true
+  
+  # Enable preprocessing options
+  enable_gamma_correction: true
+  enable_brightness_normalization: true
+  enable_adaptive_clahe: true
+  
+  # Enable debug logging for face quality assessment
+  debug_face_quality: false
+
+# Face detection tuning
+face_detection:
+  # Detection confidence threshold (0.0-1.0)
+  # Lower = detects more faces but may include false positives
+  # Higher = more strict detection, fewer false positives
+  confidence_threshold: 0.8
+  
+  # How many frames to track before re-detecting
+  # Lower = more frequent detection, higher accuracy but more CPU
+  # Higher = less frequent detection, better performance
+  tracking_interval: 5
+
+# Image preprocessing tuning
+preprocessing:
+  # CLAHE clip limit (1.0-4.0)
+  # Higher = stronger contrast enhancement
+  # Lower = more subtle enhancement
+  clahe_clip_limit: 2.0
+
+# Quality thresholds for face enrollment
+quality_thresholds:
+  # Minimum overall face quality (0.0-1.0) for enrollment
+  # Lower values accept lower quality faces (useful for IR cameras)
+  # Higher values ensure only high-quality faces are enrolled
+  min_face_quality: 0.50
+  
+  # Minimum face size in pixels
+  min_face_size: 80
+  
+  # Maximum head rotation angles (degrees)
+  max_yaw_angle: 30
+  max_pitch_angle: 20
+  max_roll_angle: 20
+  
+  # Minimum detection confidence (0.0-1.0)
+  min_confidence: 0.8
+
+# Temporal smoothing configuration
+temporal_smoothing:
+  # Enable temporal smoothing for more stable recognition
+  enabled: true
+  
+  # Number of frames to average (1-10)
+  frames: 3
+  
+  # Required matches for temporal consistency
+  required_matches: 2
+
+# Enrollment configuration
+enrollment:
+  # Enable extended enrollment with synthetic lighting variations
+  # Creates multiple face models under different simulated lighting
+  extended_enrollment: false
 
 # Performance tuning
 performance:

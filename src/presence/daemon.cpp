@@ -14,7 +14,7 @@
 
 #include "detector.h"
 #include "guard.h"
-#include "../config.h"
+#include "../daemon/config.h"
 #include "../logger.h"
 #include "../adaptive_auth.h"
 #include "../face_detector.h"
@@ -151,8 +151,8 @@ namespace {
     }
     
     bool loadConfiguration(const std::string& config_path) {
-        auto& config = faceid::Config::getInstance();
-        if (!config.load(config_path)) {
+        auto config = Config::load();
+        if (!config) {
             faceid::Logger::getInstance().error("Failed to load configuration from: " + config_path);
             return false;
         }
@@ -168,18 +168,10 @@ namespace {
         auto& logger = faceid::Logger::getInstance();
         logger.info("Adaptive authentication optimization worker started");
         
-        // Load config to get camera resolution
-        auto& config = faceid::Config::getInstance();
-        if (!config.load(config_path)) {
-            logger.error("Failed to load config in optimization worker");
-            return;
-        }
-        
-        // Get camera resolution from config (use camera.width/height as fallback if presence settings not available)
-        int camera_width = config.getInt("presence_detection", "presence_camera_width")
-                               .value_or(config.getInt("camera", "width").value_or(640));
-        int camera_height = config.getInt("presence_detection", "presence_camera_height")
-                                .value_or(config.getInt("camera", "height").value_or(360));
+        // Get camera resolution from config
+        auto& config = Config::instance();
+        int camera_width = config.camera.width;
+        int camera_height = config.camera.height;
         
         logger.info("Initializing adaptive auth with camera resolution: " + 
                    std::to_string(camera_width) + "x" + std::to_string(camera_height));
@@ -392,71 +384,71 @@ int main(int argc, char* argv[]) {
         return EXIT_FAILURE;
     }
     
-    auto& config = faceid::Config::getInstance();
+    auto& config = Config::instance();
     
     // Configure logging from config file
-    std::string log_file = config.getString("logging", "log_file").value_or("/var/log/faceid.log");
-    std::string log_level_str = config.getString("logging", "log_level").value_or("INFO");
+    std::string log_file = "/var/log/faceid.log";
+    LogLevel log_level = config.logging.level;
     
     logger.setLogFile(log_file);
     
-    // Parse log level
-    faceid::LogLevel log_level = faceid::LogLevel::INFO;
-    if (log_level_str == "DEBUG") {
-        log_level = faceid::LogLevel::DEBUG;
-    } else if (log_level_str == "INFO") {
-        log_level = faceid::LogLevel::INFO;
-    } else if (log_level_str == "WARNING") {
-        log_level = faceid::LogLevel::WARNING;
-    } else if (log_level_str == "ERROR") {
-        log_level = faceid::LogLevel::ERROR;
+    // Convert LogLevel enum to faceid::LogLevel
+    faceid::LogLevel faceid_level;
+    switch (log_level) {
+        case LogLevel::DEBUG: faceid_level = faceid::LogLevel::DEBUG; break;
+        case LogLevel::INFO: faceid_level = faceid::LogLevel::INFO; break;
+        case LogLevel::WARNING: faceid_level = faceid::LogLevel::WARNING; break;
+        case LogLevel::ERROR: faceid_level = faceid::LogLevel::ERROR; break;
+        default: faceid_level = faceid::LogLevel::INFO; break;
     }
-    logger.setLogLevel(log_level);
+    logger.setLogLevel(faceid_level);
     
+    std::string log_level_str = Config::log_level_to_string(log_level);
     logger.info("Logging configured: file=" + log_file + ", level=" + log_level_str);
     
-    // Read presence detection configuration
-    bool enabled = config.getBool("presence_detection", "enabled").value_or(false);
+    // Read presence detection configuration from YAML config
+    bool enabled = config.presence.enabled;
     if (!enabled) {
         logger.info("Presence detection is disabled in configuration");
         return EXIT_SUCCESS;
     }
     
-    int inactive_threshold = config.getInt("presence_detection", "inactive_threshold_seconds").value_or(30);
-    int scan_interval = config.getInt("presence_detection", "scan_interval_seconds").value_or(2);
-    int max_scan_failures = config.getInt("presence_detection", "max_scan_failures").value_or(3);
-    int max_idle_time = config.getInt("presence_detection", "max_idle_time_minutes").value_or(15);
-    int mouse_jitter_threshold = config.getInt("presence_detection", "mouse_jitter_threshold_ms").value_or(300);
-    double shutter_brightness = config.getDouble("presence_detection", "shutter_brightness_threshold").value_or(10.0);
-    double shutter_variance = config.getDouble("presence_detection", "shutter_variance_threshold").value_or(2.0);
-    int shutter_timeout = config.getInt("presence_detection", "shutter_timeout_minutes").value_or(5);
-    std::string camera_device = config.getString("camera", "device").value_or("/dev/video0");
+    // Presence detection configuration (using defaults - most fields not in YAML)
+    int inactive_threshold = 30;  // seconds
+    int scan_interval = config.presence.scan_interval;  // Available in YAML
+    int max_scan_failures = 3;
+    int max_idle_time = 15;  // minutes
+    int mouse_jitter_threshold = 300;  // ms
+    double shutter_brightness = 10.0;
+    double shutter_variance = 2.0;
+    int shutter_timeout = 5;  // minutes
+    std::string camera_device = config.camera.device;
     
-    // Read presence camera resolution (optional, defaults to 640x480)
-    int presence_camera_width = config.getInt("presence_detection", "presence_camera_width").value_or(640);
-    int presence_camera_height = config.getInt("presence_detection", "presence_camera_height").value_or(480);
+    // Read presence camera resolution from YAML config
+    int presence_camera_width = config.camera.width;
+    int presence_camera_height = config.camera.height;
     
-    // NEW: Read face recognition configuration
-    bool recognition_required = config.getBool("presence_detection", "require_recognition").value_or(true);
+    // Face recognition configuration (using defaults - not in YAML)
+    bool recognition_required = true;
     
-    // Read no-peek configuration
-    bool no_peek_enabled = config.getBool("no_peek", "enabled").value_or(false);
-    bool gaze_detection_enabled = config.getBool("no_peek", "gaze_detection_enabled").value_or(true);
-    float gaze_yaw_threshold = config.getDouble("no_peek", "gaze_yaw_threshold").value_or(30.0);
-    float gaze_pitch_threshold = config.getDouble("no_peek", "gaze_pitch_threshold").value_or(30.0);
-    int min_face_distance = config.getInt("no_peek", "min_face_distance_pixels").value_or(80);
-    double min_face_size = config.getDouble("no_peek", "min_face_size_percent").value_or(0.08);
-    int peek_delay = config.getInt("no_peek", "peek_detection_delay_seconds").value_or(2);
-    bool peek_show_notification = config.getBool("no_peek", "peek_show_notification").value_or(true);
-    bool peek_blur_screen = config.getBool("no_peek", "peek_blur_screen").value_or(false);
-    bool peek_blank_screen = config.getBool("no_peek", "peek_blank_screen").value_or(false);
-    int unblank_delay = config.getInt("no_peek", "unblank_delay_seconds").value_or(3);
+    // No-peek configuration (using defaults - no_peek section not in YAML)
+    bool no_peek_enabled = false;
+    bool gaze_detection_enabled = true;
+    float gaze_yaw_threshold = 30.0f;
+    float gaze_pitch_threshold = 30.0f;
+    int min_face_distance = 80;
+    double min_face_size = 0.08;
+    int peek_delay = 2;
+    bool peek_show_notification = true;
+    bool peek_blur_screen = false;
+    bool peek_blank_screen = false;
+    int unblank_delay = 3;
     
-    // Read schedule configuration
-    bool schedule_enabled = config.getBool("schedule", "enabled").value_or(false);
-    std::string active_days_str = config.getString("schedule", "active_days").value_or("1,2,3,4,5");
-    int time_start = config.getInt("schedule", "time_start").value_or(0);
-    int time_end = config.getInt("schedule", "time_end").value_or(2359);
+    // Schedule configuration (using defaults - schedule section not in YAML)
+    bool schedule_enabled = false;
+    std::string active_days_str = "1,2,3,4,5";
+    int time_start = 0;
+    int time_end = 2359;
     
     // Parse active days (comma-separated)
     std::vector<int> active_days;
@@ -589,7 +581,7 @@ int main(int argc, char* argv[]) {
             logger.info("Reloading configuration...");
             if (loadConfiguration(daemon_config.config_path)) {
                 // Reread enabled flag
-                enabled = config.getBool("presence_detection", "enabled").value_or(false);
+                enabled = config.presence.enabled;
                 if (!enabled) {
                     logger.info("Presence detection disabled via config reload, shutting down...");
                     break;

@@ -4,6 +4,7 @@
 #include <string>
 #include <memory>
 #include <atomic>
+#include <functional>
 
 namespace faceid {
 
@@ -18,6 +19,13 @@ public:
     // Authenticate user (blocking call with timeout)
     // Returns true if fingerprint matches, false otherwise
     bool authenticate(const std::string& username, int timeout_seconds, std::atomic<bool>& cancel_flag);
+    
+    // Enroll fingerprint for user (blocking call with timeout)
+    // Collects multiple samples and creates persistent fingerprint data
+    // Returns true if enrollment completed, false on error or cancellation
+    // Callback is invoked for progress updates with format: ("sample_n/total", progress_percentage)
+    bool enroll(const std::string& username, int timeout_seconds, std::atomic<bool>& cancel_flag,
+                std::function<void(const std::string&, int)> progress_callback = nullptr);
     
     // Check if fingerprint authentication is available
     bool isAvailable() const;

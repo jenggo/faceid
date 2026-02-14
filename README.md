@@ -39,12 +39,24 @@ make build && sudo make install
 **Note**: Detection models (YuNet + RetinaFace) are embedded in the binary. Only recognition models need to be downloaded separately.
 
 ### Download Recognition Models
+
+**Storage Location**: Models are stored in **per-user XDG directories** (not system-wide):
+- Primary: `~/.local/share/faceid/models/` (XDG_DATA_HOME/faceid/models)
+- Fallback: `~/.local/share/faceid/models/` if XDG_DATA_HOME is not set
+- Temp fallback: `/tmp/faceid/models/` (session-only)
+
+**Installation**:
 ```bash
+# The installer (sudo make install) automatically sets up your user's models directory
+# and copies recognition models to ~/.local/share/faceid/models/ if they're available
+
+# To manually download a recognition model:
 pip3 install pnnx
-cd /etc/faceid/models
+mkdir -p ~/.local/share/faceid/models
+cd ~/.local/share/faceid/models
 wget https://github.com/opencv/opencv_zoo/raw/main/models/face_recognition_sface/face_recognition_sface_2021dec.onnx
 pnnx face_recognition_sface_2021dec.onnx
-sudo mv face_recognition_sface_2021dec.ncnn.{param,bin} sface.{param,bin}
+mv face_recognition_sface_2021dec.ncnn.{param,bin} recognition.{param,bin}
 ```
 
 ### Model Selection Guide
@@ -89,18 +101,19 @@ faceid bench --image face.jpg /tmp/models
 
 #### Install a Different Model
 
+**Each user has their own model copy** in `~/.local/share/faceid/models/`:
+
 ```bash
 # Option 1: Standard naming (recommended)
-sudo cp model.ncnn.param /etc/faceid/models/recognition.param
-sudo cp model.ncnn.bin /etc/faceid/models/recognition.bin
+cp model.ncnn.param ~/.local/share/faceid/models/recognition.param
+cp model.ncnn.bin ~/.local/share/faceid/models/recognition.bin
 
 # Option 2: Legacy naming  
-sudo cp model.ncnn.param /etc/faceid/models/sface.param
-sudo cp model.ncnn.bin /etc/faceid/models/sface.bin
+cp model.ncnn.param ~/.local/share/faceid/models/sface.param
+cp model.ncnn.bin ~/.local/share/faceid/models/sface.bin
 
 # Re-enroll after changing models (required)
-sudo make install
-sudo faceid add $(whoami)
+faceid add $(whoami)
 ```
 
 **Note:** Switching between different model dimensions (128D ↔ 512D) or different models always requires re-enrollment.
@@ -108,14 +121,17 @@ sudo faceid add $(whoami)
 ### Enroll & Configure
 
 ```bash
-# Enroll face (auto-detects optimal settings)
+# Enable the system daemon (FaceID runs as a system service so PAM can reach it):
+sudo systemctl daemon-reload && sudo systemctl enable --now faceid.service
+
+# Enroll face (daemon handles ML; CLI captures frames and forwards them to the daemon):
 sudo faceid add $(whoami)
 # This automatically:
 # - Finds optimal detection confidence for your face
 # - Captures 5 diverse samples with guided prompts
 # - Calculates optimal recognition threshold based on face matching
 # - Validates matches with margin check to prevent false positives
-# - Updates /etc/faceid/faceid.conf
+# - Stores face data in ~/.local/share/faceid/faces/
 
 # Enroll fingerprint (optional)
 fprintd-enroll
@@ -167,20 +183,27 @@ Landmarks help validate face detection quality and show which facial features ar
 
 **Camera not detected**: `ls -l /dev/video* && sudo usermod -aG video $USER`  
 **Face not recognized**: Good lighting, re-enroll, or adjust threshold in config  
-**Model loading failed**: Check `/etc/faceid/models/` for detection model files (e.g., `mnet-retinaface.{param,bin}`) and recognition model files (e.g., `sface.{param,bin}`)  
+**Model loading failed**: Check `~/.local/share/faceid/models/` for recognition model files (e.g., `recognition.{param,bin}` or `sface.{param,bin}`). Models are per-user; you may need to download them if they weren't copied during installation.  
 **Fingerprint issues**: `systemctl status fprintd && fprintd-verify`  
+**Daemon not running**: `systemctl --user enable --now faceid-daemon && journalctl --user -u faceid-daemon -n 50`  
 **Locked out**: Boot recovery, mount root, edit `/mnt/etc/pam.d/sudo`, remove pam_faceid.so line  
-**False positives**: Re-enroll to update threshold, or manually decrease threshold in `/etc/faceid/faceid.conf`  
+**False positives**: Re-enroll to update threshold, or manually adjust threshold in `~/.config/faceid/config.yaml`  
 **Multiple faces detected**: Use `faceid show` to verify face detection is working correctly; deduplication filters duplicate detections
 
 ## Configuration
 
-Edit `/etc/faceid/faceid.conf`:
+FaceID uses **user-level XDG configuration**:
+- Primary: `~/.config/faceid/config.yaml`
+- System defaults: `/etc/faceid/config.yaml` (reference only)
+- Models: `~/.local/share/faceid/models/` (per-user, auto-created on install)
+- Faces: `~/.local/share/faceid/faces/` (per-user enrollments)
+
+Edit `~/.config/faceid/config.yaml`:
 - `[recognition] threshold = 0.6` - Lower = stricter (auto-set during enrollment)
 - `[recognition] confidence = 0.5` - Detection confidence (auto-set during enrollment)
 - `[authentication] check_lid_state = true` - Skip auth when lid closed
 - `[no_peek]` - Screen blanking when multiple faces detected
-- `[logging] log_level = INFO` - View logs: `tail -f /var/log/faceid.log`
+- `[logging] log_level = INFO` - View logs: `journalctl --user -u faceid-daemon -f`
 
 **Note**: Values are automatically optimized during `faceid add` enrollment. Manual adjustment rarely needed.
 
@@ -196,11 +219,16 @@ Edit `/etc/faceid/faceid.conf`:
 
 ## Technical Details
 
+**Architecture**: User-level D-Bus service (systemd --user) with per-user XDG storage  
 **Pipeline**: Lid check → parallel (face detection + recognition | fprintd) → first success wins  
 **Detection**: YuNet (primary) + RetinaFace (fallback) embedded in binary with 3-stage cascading  
-**Recognition Models**: SFace/MobileFaceNet/ArcFace variants (128D-512D encodings)  
+**Recognition Models**: SFace/MobileFaceNet/ArcFace variants (128D-512D encodings) stored in `~/.local/share/faceid/models/`  
 **Performance**: ~7-15ms detection (YuNet), ~20-33ms recognition, ~50-100MB memory  
-**Storage**: Face models in `/var/lib/faceid/faces/<user>.<faceid>.bin`, logs in `/var/log/faceid.log`  
+**Storage**: 
+  - Models: `~/.local/share/faceid/models/` (per-user, ~18-83MB per user)
+  - Faces: `~/.local/share/faceid/faces/` (per-user enrollments)
+  - Config: `~/.config/faceid/config.yaml` (per-user settings)
+  - Logs: `/var/log/faceid.log` (system-wide audit trail)
 **Enrollment**: Binary search for optimal confidence (0.01 precision), 5 samples with 1s intervals, automatic threshold calculation with deduplication and margin validation  
 **Face Matching**: Two-stage algorithm with threshold check + uniqueness validation + deduplication
 

@@ -1,6 +1,6 @@
 #include "detector.h"
 #include "../logger.h"
-#include "../config.h"
+#include "../daemon/config.h"
 #include "../models/model_cache.h"
 #include <libyuv.h>
 #include <fstream>
@@ -586,9 +586,9 @@ bool PresenceDetector::matchAgainstEnrolledUsers(const FaceEncoding& encoding) {
     }
     
     // Match against enrolled encodings
-    // TODO: Load threshold from config
-    auto& config = Config::getInstance();
-    double threshold = config.getDouble("authentication", "threshold").value_or(0.4);
+    // Load threshold from config
+    auto& config = Config::instance();
+    double threshold = config.recognition.threshold;
     
     for (const auto& enrolled : enrolled_encodings_) {
         double distance = face_detector_->compareFaces(encoding, enrolled);

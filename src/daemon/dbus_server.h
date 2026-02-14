@@ -4,6 +4,7 @@
 #include <string>
 #include <memory>
 #include "auth_manager.h"
+#include "enroll_manager.h"
 
 /**
  * D-Bus server wrapper for org.freedesktop.FaceID.Device interface
@@ -39,9 +40,15 @@ public:
      */
     AuthManager* get_auth_manager() { return auth_manager_.get(); }
 
+    /**
+     * Get enrollment manager (for emitting enrollment signals)
+     */
+    EnrollmentManager* get_enroll_manager() { return enroll_manager_.get(); }
+
 private:
     sd_bus* bus_ = nullptr;
     std::unique_ptr<AuthManager> auth_manager_;
+    std::unique_ptr<EnrollmentManager> enroll_manager_;
 
     // Private constructor - use create() factory method
     DBusServer(sd_bus* bus) : bus_(bus) {}

@@ -1,4 +1,5 @@
 #include "model_store.h"
+#include "../models/binary_model.h"
 #include <syslog.h>
 #include <cstdlib>
 #include <dirent.h>
@@ -9,6 +10,58 @@
 ModelStore& ModelStore::instance() {
     static ModelStore instance;
     return instance;
+}
+
+std::vector<faceid::FaceEncoding> ModelStore::get_user_model(const std::string& username) {
+    std::lock_guard<std::mutex> lock(cache_mutex_);
+    
+    // Check memory cache first
+    auto it = memory_cache_.find(username);
+    if (it != memory_cache_.end()) {
+        syslog(LOG_DEBUG, "ModelStore: Cache hit for user %s", username.c_str());
+        return it->second;
+    }
+    
+    // Check if user has a model file
+    auto path_it = user_model_paths_.find(username);
+    if (path_it == user_model_paths_.end()) {
+        syslog(LOG_INFO, "ModelStore: No model file for user %s", username.c_str());
+        return {};
+    }
+    
+    // Load from disk using ModelCache
+    faceid::BinaryFaceModel binary_model;
+    if (!faceid::ModelCache::getInstance().loadUserModel(username, binary_model)) {
+        syslog(LOG_WARNING, "ModelStore: Failed to load model for user %s", username.c_str());
+        return {};
+    }
+    
+    // Flatten all encodings from all poses into a single vector
+    std::vector<faceid::FaceEncoding> all_encodings;
+    for (const auto& pose_samples : binary_model.sample_encodings) {
+        for (const auto& encoding : pose_samples) {
+            all_encodings.push_back(encoding);
+        }
+    }
+    
+    if (all_encodings.empty()) {
+        syslog(LOG_WARNING, "ModelStore: Model file for user %s contains no encodings", username.c_str());
+        return {};
+    }
+    
+    // Cache in memory for subsequent auth
+    memory_cache_[username] = all_encodings;
+    
+    syslog(LOG_INFO, "ModelStore: Loaded %zu encodings for user %s", 
+           all_encodings.size(), username.c_str());
+    
+    return all_encodings;
+}
+
+void ModelStore::invalidate_cache(const std::string& username) {
+    std::lock_guard<std::mutex> lock(cache_mutex_);
+    memory_cache_.erase(username);
+    syslog(LOG_INFO, "ModelStore: Invalidated cache for user %s", username.c_str());
 }
 
 std::string ModelStore::expand_xdg_paths(const std::string& path) {

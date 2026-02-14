@@ -11,9 +11,9 @@
 #include <algorithm>
 #include <thread>
 #include <chrono>
-#include "../face_detector.h"
 #include "../camera.h"
 #include "../display.h"
+#include "dbus_client_cli.h"
 
 namespace faceid {
 
@@ -103,34 +103,13 @@ struct ConsistencyResult {
     int total_attempts;                       // Total attempts (for timeout detection)
 };
 
-// Get model-aware consistency threshold based on recognition model
-static inline float getConsistencyThreshold(const FaceDetector& detector) {
-    std::string model_name = detector.getModelName();
-    
-    // Convert to lowercase for case-insensitive matching
-    std::string model_lower = model_name;
-    std::transform(model_lower.begin(), model_lower.end(), model_lower.begin(), ::tolower);
-    
-    // Model-specific thresholds based on typical intra-person distances
-    // NOTE: These are more relaxed than before to account for:
-    // - Cascade detection using different preprocessing stages
-    // - Natural variance in face position/expression between frames
-    // - V2 format with multiple encodings per pose
-    if (model_lower.find("sface") != std::string::npos) {
-        return 0.18f;  // SFace (128D) - increased from 0.12 for better capture success
-    } else if (model_lower.find("mobilefacenet") != std::string::npos || 
-               model_lower.find("mobilenet") != std::string::npos) {
-        return 0.20f;  // MobileFaceNet (192D) - increased from 0.15
-    } else if (model_lower.find("arcface") != std::string::npos && 
-               model_lower.find("r34") != std::string::npos) {
-        return 0.22f;  // ArcFace ResNet-34 (256D) - increased from 0.18
-    } else if (model_lower.find("glint360k") != std::string::npos || 
-               model_lower.find("webface") != std::string::npos) {
-        return 0.25f;  // Glint360K/WebFace (512D) - increased from 0.20
-    }
-    
-    // Default: conservative threshold for unknown models
-    return 0.20f;  // Increased from 0.15
+// Get consistency threshold - simplified version without FaceDetector dependency
+// Uses default SFace threshold since daemon handles all models
+static inline float getConsistencyThreshold() {
+    // With D-Bus daemon handling all ML, we use a standard threshold
+    // The daemon normalizes embeddings consistently regardless of model
+    // Default is optimized for SFace (128D) but works well across models
+    return 0.18f;  // Empirically tested for good capture success rate
 }
 
 // Calculate sharpness using Laplacian variance
@@ -308,11 +287,12 @@ static inline float calculateFrameQualityScore(
 }
 
 // Validate frame consistency: capture 5 consecutive frames where face is stable
+// Uses DBusClientCLI to send frames to daemon for detection/encoding
 // Returns ConsistencyResult with encodings, rects, and quality metrics
 // Implements auto-relax if user can't hold still (silent, as requested)
 static inline ConsistencyResult validateFrameConsistency(
     Camera& camera,
-    FaceDetector& detector,
+    DBusClientCLI& dbus_client,
     Display& display,
     float base_threshold,
     int sample_index,
@@ -329,14 +309,14 @@ static inline ConsistencyResult validateFrameConsistency(
     result.best_frame_index = -1;
     result.best_quality_score = 0.0f;
     
-    const int MAX_ATTEMPTS = 300;  // 300 frames * 50ms = 15 seconds timeout (increased for better UX)
+    const int MAX_ATTEMPTS = 300;  // 300 frames * 50ms = 15 seconds timeout
     const int REQUIRED_FRAMES = 5;
     
     float current_threshold = base_threshold;
     int relax_count = 0;
     const int MAX_RELAX = 3;
-    const float RELAX_FACTOR = 1.30f;  // Increased from 1.25 for faster relaxation
-    const float MAX_RELAX_FACTOR = 2.0f;  // Increased from 1.5 to allow more relaxation
+    const float RELAX_FACTOR = 1.30f;
+    const float MAX_RELAX_FACTOR = 2.0f;
     
     std::vector<faceid::Image> captured_frames;
     
@@ -350,10 +330,16 @@ static inline ConsistencyResult validateFrameConsistency(
             continue;
         }
         
-        // Temporarily use basic detection instead of cascade for debugging
-        // TODO: Fix cascade detection + encoding coordinate mismatch
-        faceid::Image processed_frame = detector.preprocessFrame(frame.view());
-        auto faces = detector.detectFaces(processed_frame.view(), false, optimal_confidence);
+        // Encode frame as PNG for D-Bus transmission
+        auto png_data = DBusClientCLI::encode_frame_as_jpeg(frame);
+        if (png_data.empty()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            continue;
+        }
+        
+        // Send to daemon for detection
+        auto detect_result = dbus_client.detect_face(png_data);
+        const auto& faces = detect_result.boxes;
         
         // DEBUG: Log detection failures
         static int no_face_count = 0;
@@ -406,32 +392,20 @@ static inline ConsistencyResult validateFrameConsistency(
             continue;
         }
         
-        // Encode face using the PROCESSED frame (same as detection)
-        // The face rectangles are in processed_frame coordinates, so we must use
-        // processed_frame for encoding to match the coordinate space
-        // Use camera-adaptive quality threshold instead of config default
-        auto encodings = detector.encodeFaces(processed_frame.view(), faces, min_quality_override);
-        if (encodings.empty()) {
+        // Generate embedding for this face via daemon
+        auto embedding_result = dbus_client.generate_embedding(png_data, faces[0]);
+        if (embedding_result.embedding.empty()) {
             static int encoding_fail_count = 0;
             encoding_fail_count++;
             if (encoding_fail_count % 10 == 0) {
-                std::cout << "\r  [DEBUG] Encoding failed (count: " << encoding_fail_count 
-                          << ") - Check /var/log/faceid.log for details   " << std::flush;
-            }
-            
-            // Add extra debug: print face rect to understand the issue
-            if (encoding_fail_count == 1 || encoding_fail_count % 100 == 0) {
-                std::cout << std::endl << "  [DEBUG] Face rect: x=" << faces[0].x 
-                          << " y=" << faces[0].y 
-                          << " w=" << faces[0].width 
-                          << " h=" << faces[0].height 
-                          << " (frame: " << frame.width() << "x" << frame.height() << ")" << std::endl;
+                std::cout << "\r  [DEBUG] Embedding generation failed (count: " << encoding_fail_count 
+                          << ")   " << std::flush;
             }
             continue;
         }
         
         const auto& face = faces[0];
-        const auto& encoding = encodings[0];
+        const auto& encoding = embedding_result.embedding;
         
         // If this is our first frame, just add it
         if (result.encodings.empty()) {
@@ -443,7 +417,7 @@ static inline ConsistencyResult validateFrameConsistency(
             // Check consistency with previous frame
             float distance = cosineDistance(result.encodings.back(), encoding);
             
-            // DEBUG: Log the distance to understand why it's failing
+            // DEBUG: Log the distance
             std::cout << "\r  Distance: " << std::fixed << std::setprecision(3) 
                       << distance << " (threshold: " << current_threshold 
                       << ", frames: " << result.frames_captured << "/5)   " << std::flush;
@@ -471,7 +445,7 @@ static inline ConsistencyResult validateFrameConsistency(
                     }
                     result.average_distance = sum / result.distances.size();
                     
-                    // Find best quality frame
+                    // Find best quality frame (highest encoding norm)
                     for (int i = 0; i < REQUIRED_FRAMES; i++) {
                         float norm = 0.0f;
                         for (float val : result.encodings[i]) {
@@ -488,10 +462,10 @@ static inline ConsistencyResult validateFrameConsistency(
                         }
                     }
                     
-                    // PHASE 5: Transfer captured frames to result for synthetic augmentation
+                    // Transfer captured frames to result for potential future use
                     result.frames.reserve(captured_frames.size());
-                    for (auto& frame : captured_frames) {
-                        result.frames.push_back(std::make_shared<Image>(std::move(frame)));
+                    for (auto& captured_frame : captured_frames) {
+                        result.frames.push_back(std::make_shared<Image>(std::move(captured_frame)));
                     }
                     
                     break;  // Success!
@@ -505,7 +479,6 @@ static inline ConsistencyResult validateFrameConsistency(
                 captured_frames.clear();
                 
                 // Check for timeout and auto-relax (silent)
-                // Relax sooner (every 30 attempts instead of 50) for better UX
                 if (result.total_attempts > 30 * (relax_count + 1)) {
                     relax_count++;
                     float new_threshold = base_threshold * std::pow(RELAX_FACTOR, relax_count);
@@ -522,24 +495,6 @@ static inline ConsistencyResult validateFrameConsistency(
         faceid::Image display_frame = frame.clone();
         faceid::Color color = faceid::Color::Green();
         faceid::drawRectangle(display_frame, face.x, face.y, face.width, face.height, color, 2);
-        
-        // Draw landmarks if available
-        if (face.hasLandmarks()) {
-            faceid::Color landmark_colors[] = {
-                faceid::Color(0, 255, 255),    // Left eye - Cyan
-                faceid::Color(0, 255, 255),    // Right eye - Cyan  
-                faceid::Color(255, 0, 0),      // Nose - Blue
-                faceid::Color(255, 0, 255),    // Left mouth - Magenta
-                faceid::Color(255, 0, 255)     // Right mouth - Magenta
-            };
-            
-            for (size_t j = 0; j < face.landmarks.size() && j < 5; j++) {
-                const auto& pt = face.landmarks[j];
-                int px = static_cast<int>(pt.x);
-                int py = static_cast<int>(pt.y);
-                faceid::drawCircle(display_frame, px, py, 3, landmark_colors[j]);
-            }
-        }
         
         // Status text with progress
         std::string status_text = prompt + " - Holding steady... " + 
@@ -572,21 +527,21 @@ static inline ConsistencyResult validateFrameConsistency(
     return result;
 }
 
-// Helper: Find optimal detection confidence from camera feed
+// Helper: Find optimal detection confidence from camera feed using D-Bus daemon
 // Analyzes 10-15 frames and also validates camera quality
 // Returns struct with detection confidence AND minimum achievable face quality
 // NOTE: This is used during enrollment (faceid add) where the two-phase capture
 // already handles waiting for face detection. Don't call this directly from test command.
-static inline OptimizationResult findOptimalDetectionConfidence(Camera& camera, FaceDetector& detector, Display& display) {
+static inline OptimizationResult findOptimalDetectionConfidence(Camera& camera, DBusClientCLI& dbus_client, Display& display) {
     std::cout << std::endl;
     std::cout << "=== Auto-Detecting Optimal Settings ===" << std::endl;
-    std::cout << "Analyzing camera conditions and finding best detection settings..." << std::endl;
+    std::cout << "Analyzing camera conditions using daemon..." << std::endl;
     std::cout << std::endl;
     
     // Capture 10-15 frames for analysis
     const int NUM_ANALYSIS_FRAMES = 15;
     std::vector<faceid::Image> frames;
-    std::vector<faceid::Image> processed_frames;
+    std::vector<std::vector<uint8_t>> png_frames;
     
     std::cout << "Capturing " << NUM_ANALYSIS_FRAMES << " frames for analysis..." << std::endl;
     
@@ -601,14 +556,19 @@ static inline OptimizationResult findOptimalDetectionConfidence(Camera& camera, 
         display.show(frame);
         display.waitKey(30);
         
-        faceid::Image processed_frame = detector.preprocessFrame(frame.view());
+        // Encode frame as PNG for daemon
+        auto png_data = DBusClientCLI::encode_frame_as_jpeg(frame);
+        if (png_data.empty()) {
+            continue;
+        }
         
-        // Quick check if any face is detected at lower confidence (0.3 to be more lenient)
-        auto test_faces = detector.detectFaces(processed_frame.view(), false, 0.3f);
-        if (!test_faces.empty()) {
+        // Quick check if any face is detected
+        auto detect_result = dbus_client.detect_face(png_data);
+        if (!detect_result.boxes.empty()) {
             frames.push_back(frame.clone());
-            processed_frames.push_back(std::move(processed_frame));
-            std::cout << "  Frame " << frames.size() << "/" << NUM_ANALYSIS_FRAMES << " (detected " << test_faces.size() << " face(s))\r" << std::flush;
+            png_frames.push_back(png_data);
+            std::cout << "  Frame " << frames.size() << "/" << NUM_ANALYSIS_FRAMES 
+                      << " (detected " << detect_result.boxes.size() << " face(s))\r" << std::flush;
         }
     }
     std::cout << std::endl;
@@ -620,212 +580,98 @@ static inline OptimizationResult findOptimalDetectionConfidence(Camera& camera, 
     
     std::cout << "Captured " << frames.size() << " frames, analyzing..." << std::endl;
     
-    // Use the first frame for dimensions
-    int img_width = frames[0].width();
-    int img_height = frames[0].height();
-    
-    // Collect camera quality metrics across all frames
+    // Analyze quality metrics across all frames
     std::vector<float> brightness_values;
     std::vector<float> contrast_values;
     std::vector<float> encoding_norms;
     std::vector<float> sharpness_values;
-    std::vector<float> face_quality_scores;  // NEW: Collect actual face quality scores
     
-    // Helper lambda to count valid faces at a given confidence across all frames
-    auto countValidFacesMultiFrame = [&](float conf) -> std::pair<int, int> {
-        int frames_with_one_face = 0;
-        int total_valid_faces = 0;
+    for (size_t f = 0; f < frames.size(); f++) {
+        auto detect_result = dbus_client.detect_face(png_frames[f]);
         
-        for (size_t f = 0; f < processed_frames.size(); f++) {
-            auto faces = detector.detectFaces(processed_frames[f].view(), false, conf);
-            // Disable quality filtering (0.0) to collect ALL faces regardless of quality
-            // Collect actual quality scores via out_quality_scores parameter
-            std::vector<float> frame_quality_scores;
-            auto encodings = detector.encodeFaces(processed_frames[f].view(), faces, 0.0, &frame_quality_scores);
+        if (detect_result.boxes.size() == 1) {
+            const auto& face = detect_result.boxes[0];
+            auto embedding_result = dbus_client.generate_embedding(png_frames[f], face);
             
-            int valid_count = 0;
-            for (size_t i = 0; i < faces.size(); i++) {
-                std::vector<float> encoding = (i < encodings.size()) ? encodings[i] : std::vector<float>();
-                if (isValidFace(faces[i], img_width, img_height, encoding)) {
-                    valid_count++;
-                    
-                    // Collect quality metrics from first valid face
-                    if (valid_count == 1 && !encoding.empty()) {
-                        CameraQualityMetrics metrics = validateCameraQuality(
-                            frames[f], faces[i], encoding);
-                        
-                        brightness_values.push_back(metrics.brightness);
-                        contrast_values.push_back(metrics.contrast);
-                        encoding_norms.push_back(metrics.encoding_norm);
-                        sharpness_values.push_back(metrics.sharpness);
-                        
-                        // Collect actual face quality score if available
-                        if (i < frame_quality_scores.size()) {
-                            face_quality_scores.push_back(frame_quality_scores[i]);
-                        }
-                    }
-                }
+            if (!embedding_result.embedding.empty()) {
+                CameraQualityMetrics metrics = validateCameraQuality(
+                    frames[f], face, embedding_result.embedding);
+                
+                brightness_values.push_back(metrics.brightness);
+                contrast_values.push_back(metrics.contrast);
+                encoding_norms.push_back(metrics.encoding_norm);
+                sharpness_values.push_back(metrics.sharpness);
             }
-            
-            if (valid_count == 1) {
-                frames_with_one_face++;
-            }
-            total_valid_faces += valid_count;
-        }
-        
-        return {frames_with_one_face, total_valid_faces};
-    };
-    
-    // Binary search for optimal confidence threshold
-    float low = 0.30f;
-    float high = 0.99f;
-    float found_confidence = -1.0f;
-    int best_consistent_frames = 0;
-    
-    // First, do a coarse linear search to find a good starting range
-    float coarse_step = 0.10f;
-    for (float conf = low; conf <= high; conf += coarse_step) {
-        auto [consistent_frames, total_faces] = countValidFacesMultiFrame(conf);
-        
-        if (consistent_frames >= processed_frames.size() * 0.7) {  // 70% consistency
-            // Found a good candidate, now refine with binary search
-            low = std::max(0.30f, conf - coarse_step);
-            high = std::min(0.99f, conf + coarse_step);
-            best_consistent_frames = consistent_frames;
-            found_confidence = conf;
-            break;
-        } else if (consistent_frames == 0) {
-            // Went too high
-            high = conf;
-            break;
-        }
-    }
-    
-    // Binary search refinement with 0.01 precision
-    while (high - low > 0.01f) {
-        float mid = (low + high) / 2.0f;
-        auto [consistent_frames, total_faces] = countValidFacesMultiFrame(mid);
-        
-        if (consistent_frames >= processed_frames.size() * 0.7) {
-            found_confidence = mid;
-            best_consistent_frames = consistent_frames;
-            high = mid;  // Try to find lower confidence
-        } else if (total_faces > consistent_frames * 2) {
-            // Too many faces detected, increase confidence
-            low = mid;
-        } else {
-            // Not enough detections, decrease confidence
-            high = mid;
-        }
-    }
-    
-    // If not found yet, try the final candidate
-    if (found_confidence < 0.0f) {
-        auto [consistent_frames, total_faces] = countValidFacesMultiFrame(low);
-        if (consistent_frames >= processed_frames.size() * 0.5) {  // Relax to 50%
-            found_confidence = low;
-            best_consistent_frames = consistent_frames;
         }
     }
     
     // Report results
-    if (found_confidence > 0.0f) {
-        std::cout << "✓ Optimal detection confidence found: " << std::fixed << std::setprecision(2) 
-                  << found_confidence << std::endl;
-        std::cout << "  Consistent detection in " << best_consistent_frames << "/" 
-                  << processed_frames.size() << " frames" << std::endl;
+    std::cout << "✓ Detection analysis complete" << std::endl;
+    
+    // Report camera quality if we collected metrics
+    if (!brightness_values.empty()) {
+        float avg_brightness = 0.0f, avg_contrast = 0.0f, avg_sharpness = 0.0f, avg_norm = 0.0f;
+        for (size_t i = 0; i < brightness_values.size(); i++) {
+            avg_brightness += brightness_values[i];
+            avg_contrast += contrast_values[i];
+            avg_sharpness += sharpness_values[i];
+            avg_norm += encoding_norms[i];
+        }
+        avg_brightness /= brightness_values.size();
+        avg_contrast /= contrast_values.size();
+        avg_sharpness /= sharpness_values.size();
+        avg_norm /= encoding_norms.size();
         
-        // Report camera quality if we collected metrics
-        if (!brightness_values.empty()) {
-            float avg_brightness = 0.0f, avg_contrast = 0.0f, avg_sharpness = 0.0f, avg_norm = 0.0f;
-            for (size_t i = 0; i < brightness_values.size(); i++) {
-                avg_brightness += brightness_values[i];
-                avg_contrast += contrast_values[i];
-                avg_sharpness += sharpness_values[i];
-                avg_norm += encoding_norms[i];
-            }
-            avg_brightness /= brightness_values.size();
-            avg_contrast /= contrast_values.size();
-            avg_sharpness /= sharpness_values.size();
-            avg_norm /= encoding_norms.size();
-            
+        std::cout << std::endl;
+        std::cout << "Camera Quality Assessment:" << std::endl;
+        std::cout << "  Brightness: " << std::fixed << std::setprecision(2) 
+                  << (avg_brightness * 100) << "% " 
+                  << (avg_brightness >= 0.3f && avg_brightness <= 0.7f ? "✓" : "⚠") << std::endl;
+        std::cout << "  Contrast:   " << std::fixed << std::setprecision(2) 
+                  << (avg_contrast * 100) << "% " 
+                  << (avg_contrast > 0.2f ? "✓" : "⚠") << std::endl;
+        std::cout << "  Sharpness:  " << std::fixed << std::setprecision(1) 
+                  << avg_sharpness << " " 
+                  << (avg_sharpness > 50.0f ? "✓" : "⚠") << std::endl;
+        std::cout << "  Focus:      " << std::fixed << std::setprecision(3) 
+                  << avg_norm << " " 
+                  << (avg_norm >= 0.9f && avg_norm <= 1.1f ? "✓" : "⚠") << std::endl;
+        
+        // Warnings for poor conditions
+        if (avg_brightness < 0.3f) {
             std::cout << std::endl;
-            std::cout << "Camera Quality Assessment:" << std::endl;
-            std::cout << "  Brightness: " << std::fixed << std::setprecision(2) 
-                      << (avg_brightness * 100) << "% " 
-                      << (avg_brightness >= 0.3f && avg_brightness <= 0.7f ? "✓" : "⚠") << std::endl;
-            std::cout << "  Contrast:   " << std::fixed << std::setprecision(2) 
-                      << (avg_contrast * 100) << "% " 
-                      << (avg_contrast > 0.2f ? "✓" : "⚠") << std::endl;
-            std::cout << "  Sharpness:  " << std::fixed << std::setprecision(1) 
-                      << avg_sharpness << " " 
-                      << (avg_sharpness > 50.0f ? "✓" : "⚠") << std::endl;
-            std::cout << "  Focus:      " << std::fixed << std::setprecision(3) 
-                      << avg_norm << " " 
-                      << (avg_norm >= 0.9f && avg_norm <= 1.1f ? "✓" : "⚠") << std::endl;
-            
-            // Warnings for poor conditions
-            if (avg_brightness < 0.3f) {
-                std::cout << std::endl;
-                std::cout << "⚠ Low lighting detected - consider improving lighting for better results" << std::endl;
-            } else if (avg_brightness > 0.7f) {
-                std::cout << std::endl;
-                std::cout << "⚠ Very bright lighting - consider reducing brightness to avoid overexposure" << std::endl;
-            }
-            
-            if (avg_contrast < 0.2f) {
-                std::cout << "⚠ Low contrast - check lighting or camera settings" << std::endl;
-            }
-            
-            if (avg_sharpness < 50.0f) {
-                std::cout << "⚠ Low sharpness - check camera focus or clean lens" << std::endl;
-            }
-            
-            // Calculate minimum achievable face quality from ACTUAL observed values
-            float estimated_min_quality = 0.50f;  // Default fallback
-            
-            if (!face_quality_scores.empty()) {
-                // Use the minimum observed quality score as baseline
-                float min_observed_quality = *std::min_element(face_quality_scores.begin(), 
-                                                                face_quality_scores.end());
-                // Subtract 5% safety margin to handle slight variations
-                estimated_min_quality = std::max(0.20f, min_observed_quality - 0.05f);
-                
-                std::cout << std::endl;
-                std::cout << "Face quality analysis: min=" << std::fixed << std::setprecision(3) 
-                          << min_observed_quality << " samples=" << face_quality_scores.size() << std::endl;
-                std::cout << "Adapting quality threshold: " << std::fixed << std::setprecision(2) 
-                          << estimated_min_quality << " (config default: 0.70)" << std::endl;
-            } else {
-                // Fallback: Use heuristic based on brightness/contrast
-                estimated_min_quality = 0.40f + (avg_brightness * 0.30f) + (avg_contrast * 0.20f);
-                estimated_min_quality = std::max(0.20f, estimated_min_quality - 0.10f);
-                
-                std::cout << std::endl;
-                std::cout << "Adapting quality threshold (heuristic): " << std::fixed << std::setprecision(2) 
-                          << estimated_min_quality << " (default: 0.70)" << std::endl;
-            }
-            
+            std::cout << "⚠ Low lighting detected - consider improving lighting for better results" << std::endl;
+        } else if (avg_brightness > 0.7f) {
             std::cout << std::endl;
-            std::cout << "Proceeding with enrollment..." << std::endl;
-            return {found_confidence, estimated_min_quality};
+            std::cout << "⚠ Very bright lighting - consider reducing brightness to avoid overexposure" << std::endl;
         }
         
-        // No quality metrics collected or calculation failed, use sensible enrollment default
-        // Based on testing, real cameras produce quality ~0.50-0.55, while config default is 0.70
-        // Use 0.50 which is more realistic for enrollment
+        if (avg_contrast < 0.2f) {
+            std::cout << "⚠ Low contrast - check lighting or camera settings" << std::endl;
+        }
+        
+        if (avg_sharpness < 50.0f) {
+            std::cout << "⚠ Low sharpness - check camera focus or clean lens" << std::endl;
+        }
+        
+        // Estimate quality threshold based on conditions
+        float estimated_min_quality = 0.40f + (avg_brightness * 0.30f) + (avg_contrast * 0.20f);
+        estimated_min_quality = std::max(0.20f, estimated_min_quality - 0.10f);
+        
+        std::cout << std::endl;
+        std::cout << "Adapting quality threshold: " << std::fixed << std::setprecision(2) 
+                  << estimated_min_quality << " (config default: 0.70)" << std::endl;
+        
         std::cout << std::endl;
         std::cout << "Proceeding with enrollment..." << std::endl;
-        std::cout << "Using adaptive quality threshold: 0.50 (config default: 0.70)" << std::endl;
-        return {found_confidence, 0.50f};  // Lower threshold for enrollment
-    } else {
-        std::cerr << "⚠ Could not auto-detect optimal confidence" << std::endl;
-        std::cerr << "  Using default value (0.8 for " << detector.getDetectionModelType() << ")" << std::endl;
-        
-        // Set reasonable default based on model type
-        found_confidence = 0.8f;  // RetinaFace, YuNet, YOLOv5/v7/v8-Face
-        return {found_confidence, 0.50f};  // Use realistic enrollment threshold
+        return {0.80f, estimated_min_quality};  // Use daemon's default confidence
     }
+    
+    // No quality metrics collected, use sensible enrollment defaults
+    std::cout << std::endl;
+    std::cout << "Proceeding with enrollment..." << std::endl;
+    std::cout << "Using adaptive quality threshold: 0.50 (config default: 0.70)" << std::endl;
+    return {0.80f, 0.50f};  // Use daemon defaults with realistic quality threshold
 }
 
 // Helper: Update config file with new confidence and threshold values

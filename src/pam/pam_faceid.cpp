@@ -56,11 +56,17 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags,
     // Step 3: Connect to daemon and start verification
     // ═══════════════════════════════════════════════════════════════
     DBusAuthClient client;
-    
+
+    // First try the normal session-bus connection. If PAM runs as root (sudo)
+    // there may be no session environment available; in that case attempt to
+    // connect directly to the target user's runtime bus at /run/user/<uid>/bus.
     if (!client.connect()) {
-        syslog(LOG_ERR, "pam_faceid: Failed to connect to D-Bus");
-        closelog();
-        return PAM_AUTH_ERR;
+        syslog(LOG_INFO, "pam_faceid: standard session-bus connect failed, trying user bus for %s", username);
+        if (!client.connect_for_user(username)) {
+            syslog(LOG_ERR, "pam_faceid: Failed to connect to D-Bus for user %s", username);
+            closelog();
+            return PAM_AUTH_ERR;
+        }
     }
     
     if (!client.is_daemon_available()) {

@@ -1,10 +1,13 @@
 #include "camera_manager.h"
+#include <syslog.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
-#include <syslog.h>
-#include <cstring>
-#include <cerrno>
+
+CameraManager::CameraManager() : camera_ready_(false) {
+    // Default to /dev/video0, will be configurable later
+    device_path_ = "/dev/video0";
+}
 
 CameraManager& CameraManager::instance() {
     static CameraManager instance;
@@ -16,57 +19,44 @@ bool CameraManager::initialize() {
         return true;  // Already initialized
     }
 
-    if (!find_and_open_camera()) {
-        syslog(LOG_ERR, "Failed to initialize camera");
+    // Create camera instance
+    camera_ = std::make_unique<faceid::Camera>(device_path_);
+    
+    // Try to open camera with configured resolution
+    if (!camera_->open(width_, height_)) {
+        syslog(LOG_ERR, "CameraManager: Failed to open camera at %s", device_path_.c_str());
+        camera_.reset();
         return false;
     }
 
     camera_ready_ = true;
-    syslog(LOG_INFO, "✓ Camera initialized (%s)", device_path_.c_str());
+    syslog(LOG_INFO, "CameraManager: Camera opened successfully (%s, %dx%d)", 
+           device_path_.c_str(), width_, height_);
     return true;
 }
 
-bool CameraManager::find_and_open_camera() {
-    // Try common video device paths
-    const char* device_paths[] = {
-        "/dev/video0",
-        "/dev/video1",
-        "/dev/video2",
-        nullptr
-    };
-
-    for (int i = 0; device_paths[i]; i++) {
-        struct stat st;
-        if (stat(device_paths[i], &st) != 0) {
-            continue;
-        }
-
-        // Check if it's a character device
-        if (!S_ISCHR(st.st_mode)) {
-            continue;
-        }
-
-        // Try to open it
-        int fd = open(device_paths[i], O_RDONLY | O_NONBLOCK);
-        if (fd >= 0) {
-            camera_fd_ = fd;
-            device_path_ = device_paths[i];
-            syslog(LOG_INFO, "Found camera at %s", device_path_.c_str());
-            return true;
-        }
+faceid::Image CameraManager::capture_frame() {
+    if (!camera_ready_ || !camera_) {
+        syslog(LOG_WARNING, "CameraManager: Camera not initialized");
+        return faceid::Image();
     }
-
-    syslog(LOG_WARNING, "No camera device found at standard paths");
-    return false;
+    
+    faceid::Image frame;
+    if (!camera_->read(frame)) {
+        syslog(LOG_ERR, "CameraManager: Failed to capture frame");
+        return faceid::Image();
+    }
+    
+    return frame;  // Move semantics - no copy
 }
 
 void CameraManager::shutdown() {
-    if (camera_fd_ >= 0) {
-        close(camera_fd_);
-        camera_fd_ = -1;
+    if (camera_) {
+        camera_->close();
+        camera_.reset();
     }
     camera_ready_ = false;
-    syslog(LOG_INFO, "Camera shutdown");
+    syslog(LOG_INFO, "CameraManager: Camera shutdown");
 }
 
 CameraManager::~CameraManager() {

@@ -1,44 +1,72 @@
-#pragma once
+#ifndef FACEID_DAEMON_FINGERPRINT_MANAGER_H
+#define FACEID_DAEMON_FINGERPRINT_MANAGER_H
 
+#include <atomic>
+#include <mutex>
 #include <string>
-#include <memory>
+#include "fingerprint_auth.h"
+
+namespace faceid {
+namespace daemon {
 
 /**
- * Fingerprint Manager - Manages fingerprint authentication
- * 
- * This is a placeholder wrapper that will integrate with libfprint
- * when available. For now, it's a stub to match the face verification interface.
+ * Manages fingerprint authentication device and operations.
+ * Thread-safe singleton wrapping FingerprintAuth (fprintd D-Bus client).
  */
 class FingerprintManager {
 public:
+    // Get singleton instance
     static FingerprintManager& instance();
     
     /**
-     * Initialize fingerprint subsystem
+     * Initialize fingerprint device via fprintd.
+     * @return true if fingerprint reader available, false otherwise
      */
     bool initialize();
     
     /**
-     * Check if fingerprint reader is available
+     * Verify user's fingerprint.
+     * Blocking call with configurable timeout.
+     * 
+     * @param username User to authenticate
+     * @param cancel_flag Atomic bool to cancel verification
+     * @return 1.0 if match, 0.0 if no match, -1.0 on error
      */
-    bool is_available() const { return reader_available_; }
+    float verify_fingerprint(const std::string& username, 
+                            std::atomic<bool>& cancel_flag);
     
     /**
-     * Verify fingerprint for the given username
-     * Returns confidence score (0.0 to 1.0), or -1.0 on error
+     * Check if fingerprint reader is available.
+     * @return true if reader available and initialized
      */
-    float verify_fingerprint(const std::string& username);
+    bool is_available() const;
     
     /**
-     * Get status string for logging
+     * Get underlying FingerprintAuth instance (for enrollment).
+     * @return Reference to FingerprintAuth
+     */
+    faceid::FingerprintAuth& get_fingerprint_auth();
+    
+    /**
+     * Get status string for debugging.
+     * @return Status description
      */
     std::string get_status() const;
     
-    ~FingerprintManager();
-    
+    ~FingerprintManager() = default;
+
 private:
     FingerprintManager() = default;
+    FingerprintManager(const FingerprintManager&) = delete;
+    FingerprintManager& operator=(const FingerprintManager&) = delete;
     
-    bool reader_available_ = false;
-    // TODO: Add libfprint device object when integrating
+    faceid::FingerprintAuth fingerprint_auth_;
+    std::mutex fingerprint_mutex_;
+    std::atomic<bool> reader_available_{false};
+    bool initialized_{false};
 };
+
+} // namespace daemon
+} // namespace faceid
+
+#endif // FACEID_DAEMON_FINGERPRINT_MANAGER_H

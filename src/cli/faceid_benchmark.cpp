@@ -6,10 +6,11 @@
 #include <iomanip>
 #include "../camera.h"
 #include "../face_detector.h"
-#include "../config.h"
+#include "../daemon/config.h"
 #include "../models/binary_model.h"
 #include "../models/model_cache.h"
 #include "config_paths.h"
+#include "cli_common.h"
 
 namespace faceid {
 
@@ -123,15 +124,18 @@ int main(int argc, char* argv[]) {
     std::cout << "\n" << std::endl;
     
     // Load configuration
-    faceid::Config& config = faceid::Config::getInstance();
     std::string config_path = std::string(CONFIG_DIR) + "/faceid.conf";
-    config.load(config_path);
+    auto config_ptr = ::Config::load();
+    if (!config_ptr) {
+        std::cerr << "Warning: Could not load config, using defaults" << std::endl;
+    }
+    ::Config& config = config_ptr ? *config_ptr : ::Config::instance();
     
-    auto device = config.getString("camera", "device").value_or("/dev/video0");
-    auto width = config.getInt("camera", "width").value_or(640);
-    auto height = config.getInt("camera", "height").value_or(480);
-    double threshold = config.getDouble("recognition", "threshold").value_or(0.6);
-    int tracking_interval = config.getInt("face_detection", "tracking_interval").value_or(10);
+    auto device = config.camera.device;
+    auto width = config.camera.width;
+    auto height = config.camera.height;
+    double threshold = config.recognition.threshold;
+    int tracking_interval = config.face_detection.tracking_interval;
     
     std::cout << "Camera: " << device << " (" << width << "x" << height << ")" << std::endl;
     std::cout << "Recognition threshold: " << threshold << std::endl;
@@ -150,7 +154,7 @@ int main(int argc, char* argv[]) {
     
     if (!detector.loadModels()) {
         std::cerr << "Error: Failed to load face recognition model" << std::endl;
-        std::cerr << "Expected files: " << MODELS_DIR << "/sface.param and sface.bin" << std::endl;
+        std::cerr << "Expected files: " << cli::getModelsDir() << "/sface.param and sface.bin" << std::endl;
         return 1;
     }
     

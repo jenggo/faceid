@@ -1,10 +1,10 @@
-# FaceID Configuration - Minimal & Beginner-Friendly
-# ~/.config/faceid/config.yaml
+# FaceID Configuration - FHS Compliant Unified YAML
+# /etc/faceid/config.yaml
 #
-# This is the simplest possible config. Most settings use smart defaults.
-# Only change values you specifically need to customize.
+# This is the unified YAML configuration for FaceID.
+# All settings previously in faceid.conf are now here.
 #
-# Lines starting with # are comments.
+# For advanced tuning, see: advanced.yaml, expert.yaml
 
 # Camera Configuration
 camera:
@@ -29,6 +29,93 @@ authentication:
     # For sudo/polkit, enable both face and fingerprint
     fingerprint: true
 
+# Face Recognition Settings
+recognition:
+  # Recognition threshold (0.0 = very strict, 1.0 = very loose)
+  threshold: 0.4
+  
+  # Number of frames to average for temporal smoothing
+  temporal_frames: 3
+  
+  # Minimum face quality for enrollment (0.0-1.0)
+  min_face_quality: 0.50
+  
+  # Timeout for face recognition in seconds
+  timeout: 5
+  
+  # Number of threads for face recognition inference
+  num_threads: 4
+  
+  # Enable head pose correction for better recognition at angles
+  enable_head_pose_correction: true
+  
+  # Enable gamma correction preprocessing
+  enable_gamma_correction: true
+  
+  # Enable brightness normalization preprocessing
+  enable_brightness_normalization: true
+  
+  # Enable adaptive CLAHE preprocessing
+  enable_adaptive_clahe: true
+  
+  # Enable debug logging for face quality assessment
+  debug_face_quality: false
+
+# Face Detection Settings
+face_detection:
+  # Detection confidence threshold (0.0-1.0)
+  confidence_threshold: 0.8
+  
+  # How many frames to track before re-detecting (0 = always detect)
+  tracking_interval: 5
+
+# Image Preprocessing Settings
+preprocessing:
+  # Enable gamma correction for variable lighting
+  gamma_correction: true
+  
+  # Enable adaptive CLAHE for contrast enhancement
+  adaptive_clahe: true
+  
+  # CLAHE clip limit (1.0-4.0)
+  clahe_clip_limit: 2.0
+  
+  # Enable brightness normalization
+  brightness_normalization: true
+
+# Quality Thresholds for Face Enrollment
+quality_thresholds:
+  # Minimum face size in pixels
+  min_face_size: 80
+  
+  # Maximum yaw angle in degrees
+  max_yaw_angle: 30
+  
+  # Maximum pitch angle in degrees
+  max_pitch_angle: 20
+  
+  # Maximum roll angle in degrees
+  max_roll_angle: 20
+  
+  # Minimum detection confidence
+  min_confidence: 0.8
+
+# Temporal Smoothing for Recognition
+temporal_smoothing:
+  # Enable temporal smoothing
+  enabled: true
+  
+  # Number of frames to average
+  frames: 3
+  
+  # Required matches for temporal consistency
+  required_matches: 2
+
+# Enrollment Settings
+enrollment:
+  # Enable extended enrollment with synthetic lighting variations
+  extended_enrollment: false
+
 # Presence Detection (Auto-Lock)
 presence_detection:
   # Enable auto-lock when face disappears
@@ -36,6 +123,17 @@ presence_detection:
   
   # Lock after this many seconds of absence (10-300)
   lock_after: 30
+  
+  # Scan interval in seconds
+  scan_interval: 2
+  
+  # Number of stability frames before confirming presence
+  stability_frames: 3
+
+# Performance Settings
+performance:
+  # Number of threads for face detection
+  threads: 2
 
 # Logging
 logging:

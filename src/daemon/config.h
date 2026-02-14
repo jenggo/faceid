@@ -5,6 +5,7 @@
 #include <map>
 #include <vector>
 #include <memory>
+#include <optional>
 
 /**
  * FaceID Configuration System
@@ -44,12 +45,29 @@ struct AuthenticationConfig {
 struct RecognitionConfig {
     double threshold = 0.4;
     int temporal_frames = 3;
+    double min_face_quality = 0.50;  // Overall face quality threshold for encoding
+    int timeout = 5;  // seconds
+    int num_threads = 4;  // Number of threads for NCNN inference
+    bool enable_head_pose_correction = true;
+    bool enable_gamma_correction = true;
+    bool enable_brightness_normalization = true;
+    bool enable_adaptive_clahe = true;
+    bool debug_face_quality = false;
+};
+
+struct FaceDetectionConfig {
+    double confidence_threshold = 0.8;  // Detection confidence threshold
+    int tracking_interval = 5;  // How many frames to track before re-detecting
 };
 
 struct PreprocessingConfig {
     bool gamma_correction = true;
     bool adaptive_clahe = true;
     double clahe_clip_limit = 2.0;
+    bool brightness_normalization = true;
+    bool enable_gamma_correction = true;
+    bool enable_brightness_normalization = true;
+    bool enable_adaptive_clahe = true;
 };
 
 struct QualityConfig {
@@ -58,6 +76,16 @@ struct QualityConfig {
     int max_pitch_angle = 20;
     int max_roll_angle = 20;
     double min_confidence = 0.8;
+};
+
+struct TemporalSmoothingConfig {
+    bool enabled = true;
+    int frames = 3;  // Number of frames to average
+    int required_matches = 2;  // Required matches for temporal consistency
+};
+
+struct EnrollmentConfig {
+    bool extended_enrollment = false;  // Enable extended enrollment with synthetic variations
 };
 
 struct PresenceDetectionConfig {
@@ -90,11 +118,19 @@ public:
     CameraConfig camera;
     AuthenticationConfig authentication;
     RecognitionConfig recognition;
+    FaceDetectionConfig face_detection;
     PreprocessingConfig preprocessing;
     QualityConfig quality;
+    TemporalSmoothingConfig temporal_smoothing;
+    EnrollmentConfig enrollment;
     PresenceDetectionConfig presence;
     PerformanceConfig performance;
     LoggingConfig logging;
+    
+    // Fingerprint configuration
+    std::optional<bool> fingerprint_enabled;
+    std::optional<int> fingerprint_timeout;
+    std::optional<int> fingerprint_max_samples;
 
     /**
      * Default constructor initializes all values to defaults

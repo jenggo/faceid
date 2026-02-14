@@ -1,7 +1,15 @@
 #include "dbus_client.h"
+#include <systemd/sd-bus.h>
 #include <syslog.h>
 #include <cstring>
 #include <cerrno>
+#include <pwd.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#include <errno.h>
+#include <string>
 
 // Helper to convert D-Bus method call errors
 static int handle_dbus_error(int ret, sd_bus_error* error, const char* context) {
@@ -52,15 +60,24 @@ DBusAuthClient::~DBusAuthClient() {
 }
 
 bool DBusAuthClient::connect() {
-    int ret = sd_bus_open_user(&bus_);
-    if (ret < 0) {
-        syslog(LOG_WARNING, "Failed to connect to session bus: %s", strerror(-ret));
-        return false;
+    // Use system bus - always available regardless of session context
+    int ret = sd_bus_open_system(&bus_);
+    if (ret >= 0) {
+        syslog(LOG_DEBUG, "Connected to D-Bus system bus");
+        return true;
     }
-    
-    syslog(LOG_DEBUG, "Connected to D-Bus session bus");
-    return true;
+
+    syslog(LOG_ERR, "Failed to connect to system bus via sd_bus_open_system(): %s", strerror(-ret));
+    return false;
 }
+
+bool DBusAuthClient::connect_for_user(const std::string& username) {
+    // Use system bus for all user authentication
+    // The daemon (running as root on system bus) handles per-user authentication
+    // No need to connect to user's session bus
+    return connect();
+}
+
 
 bool DBusAuthClient::is_daemon_available() {
     if (!bus_) {
@@ -68,22 +85,58 @@ bool DBusAuthClient::is_daemon_available() {
     }
     
     // Query bus to check if service is available
-    sd_bus_message* m = nullptr;
-    int ret = sd_bus_message_new_method_call(bus_, &m,
+    sd_bus_message* reply = nullptr;
+    sd_bus_error error = SD_BUS_ERROR_NULL;
+    
+    int ret = sd_bus_call_method(bus_,
         "org.freedesktop.DBus",
         "/org/freedesktop/DBus",
         "org.freedesktop.DBus",
-        "ListNames");
+        "ListNames",
+        &error,
+        &reply,
+        "");
     
     if (ret < 0) {
-        return false;  // Bus not available
+        syslog(LOG_DEBUG, "Failed to query D-Bus for service list: %s", strerror(-ret));
+        return false;
     }
     
-    sd_bus_message_unref(m);
+    // Read array of strings from reply
+    char** names = nullptr;
+    ret = sd_bus_message_read_strv(reply, &names);
+    if (ret < 0) {
+        syslog(LOG_DEBUG, "Failed to parse service list: %s", strerror(-ret));
+        sd_bus_message_unref(reply);
+        sd_bus_error_free(&error);
+        return false;
+    }
     
-    // For now, assume daemon is available if bus is connected
-    // TODO: More robust check with actual ListNames call
-    return true;
+    // Check if org.freedesktop.FaceID is in the list
+    bool found = false;
+    for (size_t i = 0; names && names[i]; i++) {
+        if (strcmp(names[i], "org.freedesktop.FaceID") == 0) {
+            found = true;
+            break;
+        }
+    }
+    
+    // Free the string array
+    if (names) {
+        for (size_t i = 0; names[i]; i++) {
+            free((void*)names[i]);
+        }
+        free(names);
+    }
+    
+    sd_bus_message_unref(reply);
+    sd_bus_error_free(&error);
+    
+    if (!found) {
+        syslog(LOG_INFO, "FaceID daemon not found on D-Bus (disabled or not running)");
+    }
+    
+    return found;
 }
 
 bool DBusAuthClient::verify_start(const std::string& username, const std::string& context,

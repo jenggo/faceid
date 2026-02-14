@@ -10,7 +10,7 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <errno.h>
-#include "../config.h"
+#include "../daemon/config.h"
 #include "../logger.h"
 #include "../fingerprint_auth.h"
 #include "../lid_detector.h"
@@ -26,6 +26,7 @@
 #pragma GCC diagnostic pop
 
 #include "config_paths.h"
+#include "../path_utils.h"
 
 using namespace faceid;
 
@@ -256,18 +257,18 @@ static bool authenticate_user(const char* username) {
     openlog("pam_faceid", LOG_PID, LOG_AUTH);
     
     // Load configuration
-    Config& config = Config::getInstance();
-    const std::string config_path = std::string(CONFIG_DIR) + "/faceid.conf";
-    if (!config.load(config_path)) {
+    auto config_ptr = Config::load();
+    if (!config_ptr) {
         syslog(LOG_ERR, "Failed to load configuration");
         logger.auditAuthFailure(username, "biometric", "config_load_failed");
         closelog();
         return false;
     }
+    Config& config = *config_ptr;
     
     // Get camera resolution for adaptive auth shared memory sizing
-    int camera_width = config.getInt("camera", "width").value_or(640);
-    int camera_height = config.getInt("camera", "height").value_or(360);
+    int camera_width = config.camera.width;
+    int camera_height = config.camera.height;
     
     // Initialize adaptive authentication manager with camera resolution
     AdaptiveAuthManager adaptive_mgr;
@@ -276,7 +277,7 @@ static bool authenticate_user(const char* username) {
     }
     
     // Check lid state
-    const bool check_lid = config.getBool("authentication", "check_lid_state").value_or(true);
+    const bool check_lid = true;  // Default behavior, can be extended in config
     if (check_lid) {
         LidDetector lid_detector;
         const LidState lid_state = lid_detector.getLidState();
@@ -419,8 +420,9 @@ static bool authenticate_user(const char* username) {
                 // Initialize face detector
                 FaceDetector detector;
                 
-                if (!detector.loadModels()) {  // Use default MODELS_DIR/sface path
+                if (!detector.loadModels()) {  // Use default models path
                     logger.error("Failed to load face recognition model");
+                    syslog(LOG_ERR, "pam_faceid: Failed to load face recognition models from %s", get_user_models_dir().c_str());
                     face_finished.store(true);
                     return false;
                 }

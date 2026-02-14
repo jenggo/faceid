@@ -228,7 +228,7 @@ int cmd_use(const std::string& model_path, bool is_detection2) {
         std::cout << "✓ Model type: " << getModelPurposeName(model_purpose) << std::endl;
     }
     std::cout << std::endl;
-    std::string models_dir = std::string(MODELS_DIR);
+    std::string models_dir = cli::getModelsDir();
     std::string target_param = models_dir + "/" + target_base + ".param";
     std::string target_bin = models_dir + "/" + target_base + ".bin";
     

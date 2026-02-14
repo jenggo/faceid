@@ -2,7 +2,7 @@
 #include "clahe.h"
 #include "optical_flow.h"
 #include "config_paths.h"
-#include "config.h"
+#include "daemon/config.h"
 #include "logger.h"
 #include "detectors/common.h"
 #include "detectors/detectors.h"
@@ -21,6 +21,7 @@
 #include <unordered_map>
 #include <mutex>
 #include <chrono>
+#include <syslog.h>
 
 namespace faceid {
 
@@ -194,48 +195,162 @@ std::pair<std::string, size_t> FaceDetector::findAvailableModel(const std::strin
 }
 
 FaceDetector::FaceDetector() {
-    // Models (recognition + embedded detection) loaded separately via loadModels()
+    // Load detection confidence from config
+    detection_confidence_threshold_ = Config::instance().face_detection.confidence_threshold;
 }
 
-// Helper: Load embedded YuNet model from memory (primary detection)
-bool FaceDetector::loadEmbeddedYuNet() {
-    Logger::getInstance().debug("Loading embedded YuNet detection model...");
+//  ========================================================================
+// GPU/Vulkan Acceleration
+// ========================================================================
+
+void FaceDetector::enableVulkan(bool use_fp16) {
+    // Configure all networks for Vulkan
+    ncnn_net_.opt.use_vulkan_compute = true;
+    yunet_net_.opt.use_vulkan_compute = true;
+    retinaface_net_.opt.use_vulkan_compute = true;
     
-    // Get num_threads from config (default: 4)
-    int num_threads = Config::getInstance().getInt("recognition", "num_threads").value_or(4);
+    if (use_fp16) {
+        ncnn_net_.opt.use_fp16_packed = true;
+        ncnn_net_.opt.use_fp16_storage = true;
+        yunet_net_.opt.use_fp16_packed = true;
+        yunet_net_.opt.use_fp16_storage = true;
+        retinaface_net_.opt.use_fp16_packed = true;
+        retinaface_net_.opt.use_fp16_storage = true;
+    }
     
+    // Disable INT8 on Vulkan
+    ncnn_net_.opt.use_int8_storage = false;
+    ncnn_net_.opt.use_int8_arithmetic = false;
+    yunet_net_.opt.use_int8_storage = false;
+    retinaface_net_.opt.use_int8_storage = false;
+    
+    Logger::getInstance().info("Vulkan GPU acceleration enabled" + std::string(use_fp16 ? " (FP16)" : " (FP32)"));
+}
+
+void FaceDetector::disableVulkan() {
+    ncnn_net_.opt.use_vulkan_compute = false;
     yunet_net_.opt.use_vulkan_compute = false;
-    yunet_net_.opt.num_threads = num_threads;
-    yunet_net_.opt.use_fp16_packed = false;
-    yunet_net_.opt.use_fp16_storage = false;
+    retinaface_net_.opt.use_vulkan_compute = false;
     
-    // Load param from memory (null-terminated string)
-    int ret = yunet_net_.load_param_mem(embedded::yunet_model_param);
-    if (ret != 0) {
-        Logger::getInstance().error("Failed to load YuNet param from memory, ret=" + std::to_string(ret));
+    // Re-enable CPU optimizations
+    ncnn_net_.opt.use_int8_storage = true;
+    ncnn_net_.opt.use_int8_arithmetic = true;
+    
+    Logger::getInstance().info("Vulkan GPU acceleration disabled (using CPU)");
+}
+
+// ========================================================================
+// Model Loading
+// ========================================================================
+
+bool FaceDetector::loadModels(const std::string& model_base_path) {
+    Logger::getInstance().info("Loading face detection models...");
+    
+    // Load embedded detection models (YuNet primary, RetinaFace fallback)
+    if (!loadEmbeddedYuNet()) {
+        Logger::getInstance().error("Failed to load embedded YuNet model");
+        return false;
+    }
+    detection_model_loaded_ = true;
+    
+    if (!loadEmbeddedRetinaFace()) {
+        Logger::getInstance().warning("Failed to load embedded RetinaFace model (fallback unavailable)");
+        // Don't fail - YuNet is the primary detector
+    } else {
+        detection2_model_loaded_ = true;
+    }
+    
+    // Load recognition model from filesystem
+    std::string models_dir = CONFIG_DIR "/models";
+    std::string recognition_param_path;
+    std::string recognition_bin_path;
+    
+    // If a specific model path is provided, use it
+    if (!model_base_path.empty()) {
+        recognition_param_path = model_base_path + ".param";
+        recognition_bin_path = model_base_path + ".bin";
+        
+        // Try .ncnn.param/.ncnn.bin if .param/.bin doesn't exist
+        if (!std::ifstream(recognition_param_path).good()) {
+            recognition_param_path = model_base_path + ".ncnn.param";
+            recognition_bin_path = model_base_path + ".ncnn.bin";
+        }
+    } else {
+        // Auto-detect available model in models directory
+        auto [model_base, encoding_dim] = findAvailableModel(models_dir);
+        if (model_base.empty()) {
+            Logger::getInstance().error("No recognition model found in " + models_dir);
+            return false;
+        }
+        
+        recognition_param_path = model_base + ".param";
+        recognition_bin_path = model_base + ".bin";
+        
+        // Try .ncnn.param/.ncnn.bin if .param/.bin doesn't exist
+        if (!std::ifstream(recognition_param_path).good()) {
+            recognition_param_path = model_base + ".ncnn.param";
+            recognition_bin_path = model_base + ".ncnn.bin";
+        }
+        
+        current_encoding_dim_ = encoding_dim;
+    }
+    
+    // Check if model files exist
+    if (!std::ifstream(recognition_param_path).good()) {
+        Logger::getInstance().error("Recognition model param file not found: " + recognition_param_path);
+        return false;
+    }
+    if (!std::ifstream(recognition_bin_path).good()) {
+        Logger::getInstance().error("Recognition model bin file not found: " + recognition_bin_path);
         return false;
     }
     
-    // Load binary model from memory using DataReaderFromMemory
-    const unsigned char* model_data = embedded::yunet_model_bin;
-    ncnn::DataReaderFromMemory mem_reader(model_data);
-    ret = yunet_net_.load_model(mem_reader);
+    // Parse output dimension from param file
+    size_t detected_dim = parseModelOutputDim(recognition_param_path);
+    if (detected_dim > 0) {
+        current_encoding_dim_ = detected_dim;
+    }
+    
+    // Extract model name from path
+    size_t last_slash = recognition_param_path.find_last_of("/");
+    if (last_slash != std::string::npos) {
+        current_model_name_ = recognition_param_path.substr(last_slash + 1);
+        // Remove .param or .ncnn.param extension
+        if (current_model_name_.size() > 6 && 
+            current_model_name_.substr(current_model_name_.size() - 6) == ".param") {
+            current_model_name_ = current_model_name_.substr(0, current_model_name_.size() - 6);
+        }
+    }
+    
+    // Load the recognition model
+    int ret = ncnn_net_.load_param(recognition_param_path.c_str());
     if (ret != 0) {
-        Logger::getInstance().error("Failed to load YuNet model from memory, ret=" + std::to_string(ret));
+        Logger::getInstance().error("Failed to load recognition model param: " + recognition_param_path);
         return false;
     }
     
-    Logger::getInstance().info("✓ Embedded YuNet model loaded successfully (" + 
-                               std::to_string(embedded::yunet_model_bin_size / 1024) + " KB)");
+    ret = ncnn_net_.load_model(recognition_bin_path.c_str());
+    if (ret != 0) {
+        Logger::getInstance().error("Failed to load recognition model bin: " + recognition_bin_path);
+        return false;
+    }
+    
+    models_loaded_ = true;
+    
+    Logger::getInstance().info("✓ Face detection models loaded successfully:");
+    Logger::getInstance().info("  - Detection: YuNet (embedded)" + 
+                               std::string(detection2_model_loaded_ ? " + RetinaFace (embedded fallback)" : ""));
+    Logger::getInstance().info("  - Recognition: " + current_model_name_ + 
+                               " (" + std::to_string(current_encoding_dim_) + "D)");
+    
     return true;
 }
 
-// Helper: Load embedded RetinaFace model from memory (fallback detection)
 bool FaceDetector::loadEmbeddedRetinaFace() {
     Logger::getInstance().debug("Loading embedded RetinaFace detection model...");
     
-    // Get num_threads from config (default: 4)
-    int num_threads = Config::getInstance().getInt("recognition", "num_threads").value_or(4);
+    // Get num_threads from config
+    int num_threads = Config::instance().recognition.num_threads;
     
     retinaface_net_.opt.use_vulkan_compute = false;
     retinaface_net_.opt.num_threads = num_threads;
@@ -263,182 +378,36 @@ bool FaceDetector::loadEmbeddedRetinaFace() {
     return true;
 }
 
-bool FaceDetector::loadModels(const std::string& model_base_path) {
-    try {
-        // Load detection confidence threshold from config
-        auto confidence_opt = Config::getInstance().getDouble("recognition", "confidence");
-        bool user_specified_confidence = confidence_opt.has_value();
-        
-        if (user_specified_confidence) {
-            detection_confidence_threshold_ = static_cast<float>(confidence_opt.value());
-            Logger::getInstance().debug("Detection confidence threshold from config: " + 
-                std::to_string(detection_confidence_threshold_));
-        } else {
-            // Use sensible defaults based on model type (will be adjusted after model detection)
-            detection_confidence_threshold_ = 0.8f;
-            Logger::getInstance().debug("Using default detection confidence threshold: 0.8 (will adjust based on model type)");
-        }
-        
-        std::string base_path;
-        size_t output_dim = 0;
-        
-        // If explicit path provided, use it
-        if (!model_base_path.empty()) {
-            base_path = model_base_path;
-            Logger::getInstance().debug("Using explicit model path: " + base_path);
-            
-            // Try to detect output dimension
-            std::string param_path = base_path + ".param";
-            output_dim = parseModelOutputDim(param_path);
-            if (output_dim == 0) {
-                Logger::getInstance().debug("Warning: Could not auto-detect output dimension, using default " + 
-                    std::to_string(FACE_ENCODING_DIM) + "D");
-                output_dim = FACE_ENCODING_DIM;
-            }
-        } else {
-            // Priority 1: Try standard name "recognition.{param,bin}"
-            std::string standard_path = std::string(MODELS_DIR) + "/recognition";
-            std::string standard_param = standard_path + ".param";
-            std::string standard_bin = standard_path + ".bin";
-            
-            std::ifstream param_check(standard_param);
-            std::ifstream bin_check(standard_bin);
-            
-            if (param_check.good() && bin_check.good()) {
-                Logger::getInstance().debug("Found standard recognition model: recognition.{param,bin}");
-                base_path = standard_path;
-                output_dim = parseModelOutputDim(standard_param);
-                if (output_dim == 0) {
-                    Logger::getInstance().debug("Warning: Could not detect dimension, using default");
-                    output_dim = FACE_ENCODING_DIM;
-                }
-            } else {
-                // Priority 2: Auto-detect from available models
-                Logger::getInstance().debug("Standard name not found, auto-detecting recognition model...");
-                auto model_info = findAvailableModel(std::string(MODELS_DIR));
-                base_path = model_info.first;
-                output_dim = model_info.second;
-                
-                if (base_path.empty() || output_dim == 0) {
-                    // Priority 3: Fall back to legacy "sface"
-                    Logger::getInstance().debug("No valid models found, falling back to legacy sface");
-                    base_path = std::string(MODELS_DIR) + "/sface";
-                    output_dim = FACE_ENCODING_DIM;
-                }
-            }
-        }
-        
-        std::string param_path = base_path + ".param";
-        std::string bin_path = base_path + ".bin";
-        
-        // Check if .param exists, if not try .ncnn.param
-        std::ifstream param_check(param_path);
-        if (!param_check.good()) {
-            param_path = base_path + ".ncnn.param";
-            bin_path = base_path + ".ncnn.bin";
-        }
-        
-        // Extract model name from path
-        size_t last_slash = base_path.find_last_of("/\\");
-        current_model_name_ = (last_slash != std::string::npos) ? 
-            base_path.substr(last_slash + 1) : base_path;
-        
-        // Try to read original model name from .use file
-        std::string use_file = std::string(MODELS_DIR) + "/.use";
-        std::ifstream use_stream(use_file);
-        if (use_stream.good()) {
-            std::string line;
-            while (std::getline(use_stream, line)) {
-                if (line.empty() || line[0] == '#') continue;
-                
-                size_t eq_pos = line.find('=');
-                if (eq_pos != std::string::npos) {
-                    std::string key = line.substr(0, eq_pos);
-                    std::string value = line.substr(eq_pos + 1);
-                    if (key == "recognition") {
-                        current_model_name_ = value;
-                        break;
-                    }
-                }
-            }
-        }
-        
-        current_encoding_dim_ = output_dim;
-        
-        Logger::getInstance().debug("Loading recognition model: " + current_model_name_ + 
-            " (" + std::to_string(current_encoding_dim_) + "D)");
-        Logger::getInstance().debug("  param: " + param_path);
-        Logger::getInstance().debug("  bin:   " + bin_path);
-        
-        // Check if this model was already loaded (file system cache helps)
-        bool was_cached = isModelCached(param_path, bin_path);
-        if (was_cached) {
-            Logger::getInstance().debug("Model cache HIT: This model was loaded before (faster due to FS cache)");
-        }
-        
-        // Get num_threads from config (default: 4)
-        int num_threads = Config::getInstance().getInt("recognition", "num_threads").value_or(4);
-        Logger::getInstance().debug("NCNN num_threads: " + std::to_string(num_threads));
-        
-        // Configure NCNN options for optimal CPU performance
-        ncnn_net_.opt.use_vulkan_compute = false;
-        ncnn_net_.opt.num_threads = num_threads;
-        ncnn_net_.opt.use_fp16_packed = false;
-        ncnn_net_.opt.use_fp16_storage = false;
-        
-        Logger::getInstance().debug("Loading param file...");
-        int ret = ncnn_net_.load_param(param_path.c_str());
-        if (ret != 0) {
-            Logger::getInstance().debug("Failed to load param file, ret=" + std::to_string(ret));
-            return false;
-        }
-        Logger::getInstance().debug("Param file loaded successfully");
-        
-        Logger::getInstance().debug("Loading model file...");
-        ret = ncnn_net_.load_model(bin_path.c_str());
-        if (ret != 0) {
-            Logger::getInstance().debug("Failed to load model file, ret=" + std::to_string(ret));
-            return false;
-        }
-        Logger::getInstance().debug("Model file loaded successfully");
-        
-        try {
-            ncnn::Extractor ex = ncnn_net_.create_extractor();
-            Logger::getInstance().debug("NCNN extractor created successfully");
-        } catch (...) {
-            Logger::getInstance().debug("Failed to create NCNN extractor");
-            return false;
-        }
-        
-        // Mark this model as cached for future reference
-        if (!was_cached) {
-            markModelCached(param_path, bin_path);
-        }
-        
-        models_loaded_ = true;
-        Logger::getInstance().debug("✓ Recognition model loaded: " + current_model_name_ + 
-            " (" + std::to_string(current_encoding_dim_) + "D)");
-        
-        // Load embedded detection models
-        if (!loadEmbeddedYuNet()) {
-            Logger::getInstance().error("Failed to load embedded YuNet model");
-            return false;
-        }
-        detection_model_loaded_ = true;
-        detection_model_type_ = DetectionModelType::YUNET;
-        
-        if (!loadEmbeddedRetinaFace()) {
-            Logger::getInstance().error("Failed to load embedded RetinaFace model");
-            return false;
-        }
-        detection2_model_loaded_ = true;
-        detection2_model_type_ = DetectionModelType::RETINAFACE;
-        
-        return true;
-    } catch (const std::exception& e) {
-        Logger::getInstance().error("Exception in loadModels: " + std::string(e.what()));
+bool FaceDetector::loadEmbeddedYuNet() {
+    Logger::getInstance().debug("Loading embedded YuNet detection model...");
+    
+    // Get num_threads from config
+    int num_threads = Config::instance().recognition.num_threads;
+    
+    yunet_net_.opt.use_vulkan_compute = false;
+    yunet_net_.opt.num_threads = num_threads;
+    yunet_net_.opt.use_fp16_packed = false;
+    yunet_net_.opt.use_fp16_storage = false;
+    
+    // Load param from memory (null-terminated string)
+    int ret = yunet_net_.load_param_mem(embedded::yunet_model_param);
+    if (ret != 0) {
+        Logger::getInstance().error("Failed to load YuNet param from memory, ret=" + std::to_string(ret));
         return false;
     }
+    
+    // Load binary model from memory using DataReaderFromMemory
+    const unsigned char* model_data = embedded::yunet_model_bin;
+    ncnn::DataReaderFromMemory mem_reader(model_data);
+    ret = yunet_net_.load_model(mem_reader);
+    if (ret != 0) {
+        Logger::getInstance().error("Failed to load YuNet model from memory, ret=" + std::to_string(ret));
+        return false;
+    }
+    
+    Logger::getInstance().info("✓ Embedded YuNet model loaded successfully (" + 
+                               std::to_string(embedded::yunet_model_bin_size / 1024) + " KB)");
+    return true;
 }
 
 std::vector<Rect> FaceDetector::detectFaces(const ImageView& frame, bool downscale, float confidence_threshold) {
@@ -786,12 +755,17 @@ std::vector<FaceEncoding> FaceDetector::encodeFaces(
     double min_quality_override,
     std::vector<float>* out_quality_scores) {
     
+    syslog(LOG_ERR, "FaceDetector::encodeFaces called, models_loaded_=%d, face_locations.size()=%zu", 
+           models_loaded_, face_locations.size());
+    
     if (!models_loaded_ || face_locations.empty()) {
         if (!models_loaded_) {
             Logger::getInstance().debug("encodeFaces() called but models_loaded_=false");
+            syslog(LOG_ERR, "FaceDetector::encodeFaces returning empty: models_loaded_=false");
         }
         if (face_locations.empty()) {
             Logger::getInstance().debug("encodeFaces() called but face_locations is empty");
+            syslog(LOG_ERR, "FaceDetector::encodeFaces returning empty: face_locations is empty");
         }
         return {};
     }
@@ -809,7 +783,7 @@ std::vector<FaceEncoding> FaceDetector::encodeFaces(
         // QUICK WIN #4: Apply head pose correction if enabled and landmarks available
         Image corrected_frame;
         bool pose_corrected = false;
-        if (Config::getInstance().getBool("recognition", "enable_head_pose_correction").value_or(true) &&
+        if (Config::instance().recognition.enable_head_pose_correction &&
             face_rect.hasLandmarks()) {
             HeadPose pose = estimateHeadPose(face_rect.landmarks);
             Logger::getInstance().debug("Face " + std::to_string(idx) + " head pose: yaw=" + 
@@ -840,19 +814,19 @@ std::vector<FaceEncoding> FaceDetector::encodeFaces(
         // Order: Gamma → Brightness → CLAHE → Histogram EQ (legacy)
         
         // Step 1: Adaptive gamma correction (for extreme lighting)
-        if (Config::getInstance().getBool("recognition", "enable_gamma_correction").value_or(true)) {
+        if (Config::instance().recognition.enable_gamma_correction) {
             aligned = applyAdaptiveGammaCorrection(aligned);
             Logger::getInstance().debug("Gamma correction applied to face " + std::to_string(idx));
         }
         
         // Step 2: Brightness normalization (linear scaling)
-        if (Config::getInstance().getBool("recognition", "enable_brightness_normalization").value_or(true)) {
+        if (Config::instance().recognition.enable_brightness_normalization) {
             aligned = normalizeBrightness(aligned);
             Logger::getInstance().debug("Brightness normalization applied to face " + std::to_string(idx));
         }
         
         // Step 3: Adaptive CLAHE (contrast enhancement)
-        if (Config::getInstance().getBool("recognition", "enable_adaptive_clahe").value_or(true)) {
+        if (Config::instance().recognition.enable_adaptive_clahe) {
             aligned = applyAdaptiveCLAHE(aligned);
             Logger::getInstance().debug("Adaptive CLAHE applied to face " + std::to_string(idx));
         }
@@ -861,10 +835,8 @@ std::vector<FaceEncoding> FaceDetector::encodeFaces(
         // Use override if provided (for enrollment auto-detection), otherwise use config
         // Note: -1.0 means "use config", 0.0 means "accept all", >0 means specific threshold
         double min_quality = (min_quality_override >= 0.0) ? min_quality_override :
-                             Config::getInstance().getDouble("recognition", "min_face_quality")
-                             .value_or(0.70);
-        bool debug_quality = Config::getInstance().getBool("recognition", "debug_face_quality")
-                             .value_or(false);
+                             Config::instance().recognition.min_face_quality;
+        bool debug_quality = Config::instance().recognition.debug_face_quality;
         
         FaceQuality quality = assessFaceQuality(aligned, face_rect, frame.width(), 1.0f);
         
@@ -887,6 +859,9 @@ std::vector<FaceEncoding> FaceDetector::encodeFaces(
                              std::to_string(quality.overall_score) + " < " +
                              std::to_string(min_quality);
             Logger::getInstance().debug(msg);
+            syslog(LOG_ERR, "FaceDetector: Face %zu skipped - quality %.3f < threshold %.3f (blur=%.3f size=%.3f brightness=%.3f confidence=%.3f)",
+                   idx, quality.overall_score, min_quality, quality.blur_score, quality.size_score,
+                   quality.brightness_score, quality.confidence_score);
             // Debug output disabled - check /var/log/faceid.log if needed
             // std::cerr << "[ENROLLMENT DEBUG] " << msg << std::endl;
             continue;
@@ -1112,13 +1087,6 @@ Image FaceDetector::preprocessFrame(const ImageView& frame) {
     // CLAHE is for contrast enhancement in low-light/IR cameras
     // In normal/bright lighting, it's unnecessary CPU work
     if (avg_brightness >= 0.5f) {
-        // Optional debug logging
-        if (Config::getInstance().getBool("debug", "log_brightness").value_or(false)) {
-            char buf[128];
-            snprintf(buf, sizeof(buf), "Frame brightness: %.2f - SKIPPING CLAHE (good lighting)", 
-                     avg_brightness);
-            Logger::getInstance().debug(buf);
-        }
         return processed;  // Return original without CLAHE
     }
     
@@ -1152,13 +1120,7 @@ Image FaceDetector::preprocessFrame(const ImageView& frame) {
         clip_limit = 2.0;                 // Moderate enhancement
     }
     
-    // Optional debug logging (controlled by config: [debug] log_brightness = true)
-    if (Config::getInstance().getBool("debug", "log_brightness").value_or(false)) {
-        char buf[128];
-        snprintf(buf, sizeof(buf), "Frame brightness: %.2f, CLAHE clip: %.1f", 
-                 avg_brightness, clip_limit);
-        Logger::getInstance().debug(buf);
-    }
+
     
     // Apply CLAHE to Y (luminance) channel only using standalone implementation
     faceid::CLAHE clahe(clip_limit, 8, 8);
@@ -1236,13 +1198,7 @@ Image FaceDetector::preprocessFrameAggressive(const ImageView& frame) {
         tile_size = 6;
     }
     
-    // Optional debug logging
-    if (Config::getInstance().getBool("debug", "log_brightness").value_or(false)) {
-        char buf[128];
-        snprintf(buf, sizeof(buf), "Aggressive preprocessing: brightness=%.2f, CLAHE clip=%.1f, tile=%dx%d", 
-                 avg_brightness, clip_limit, tile_size, tile_size);
-        Logger::getInstance().debug(buf);
-    }
+
     
     // Apply aggressive CLAHE to Y (luminance) channel
     faceid::CLAHE clahe(clip_limit, tile_size, tile_size);

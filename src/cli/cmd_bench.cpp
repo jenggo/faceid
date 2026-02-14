@@ -1,5 +1,7 @@
 #include "cli_common.h"
 #include "embedded_test_image.h"
+#include "config_paths.h"
+#include "../daemon/config.h"
 #include <iostream>
 #include <chrono>
 #include <vector>
@@ -380,10 +382,15 @@ int cmd_bench(const std::string& test_dir, bool show_detail, const std::string& 
         std::cout << "No test images available, using camera..." << std::endl;
 
         // Get camera settings from config
-        Config& config = Config::getInstance();
-        auto device = config.getString("camera", "device").value_or("/dev/video0");
-        int width = config.getInt("camera", "width").value_or(640);
-        int height = config.getInt("camera", "height").value_or(480);
+        std::string config_path = std::string(CONFIG_DIR) + "/faceid.conf";
+        auto config_ptr = ::Config::load();
+        if (!config_ptr) {
+            std::cerr << "Warning: Could not load config, using defaults" << std::endl;
+        }
+        ::Config& config = config_ptr ? *config_ptr : ::Config::instance();
+        auto device = config.camera.device;
+        int width = config.camera.width;
+        int height = config.camera.height;
 
         std::cout << "Initializing camera: " << device << " (" << width << "x" << height << ")" << std::endl;
         Camera camera(device);
@@ -580,7 +587,7 @@ int cmd_bench(const std::string& test_dir, bool show_detail, const std::string& 
         FaceDetector temp_detector;
         if (!temp_detector.loadModels()) {
             std::cerr << "Error: Failed to load default detection model" << std::endl;
-            std::cerr << "Please ensure detection model is available in: " << MODELS_DIR << std::endl;
+            std::cerr << "Please ensure detection model is available in: " << cli::getModelsDir() << std::endl;
             return 1;
         }
 

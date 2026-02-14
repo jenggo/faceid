@@ -23,14 +23,18 @@
 #include <dirent.h>
 #include <fnmatch.h>
 #include <cstdio>
+#include <unistd.h>
+#include <sys/types.h>
+#include <pwd.h>
 
 // ========== FaceID Library Includes ==========
-#include "../config.h"
+#include "../daemon/config.h"
 #include "../face_detector.h"
 #include "../camera.h"
 #include "../display.h"
 #include "../image.h"
 #include "config_paths.h"
+#include "../path_utils.h"
 
 // ========== Using Declarations ==========
 using namespace faceid;
@@ -86,34 +90,47 @@ namespace cli {
 /**
  * Load FaceID configuration from default path
  * 
- * Attempts to load from CONFIG_DIR/faceid.conf
- * Falls back to sensible defaults if file not found
+ * Attempts to load from YAML config files
+ * Falls back to sensible defaults if files not found
  * 
- * @return Reference to Config singleton with loaded values
+ * @return unique_ptr to Config with loaded values
  */
-inline faceid::Config& loadDefaultConfig() {
-    faceid::Config& config = faceid::Config::getInstance();
-    std::string config_path = std::string(CONFIG_DIR) + "/faceid.conf";
-    config.load(config_path);  // Silently fails if file not found (uses defaults)
-    return config;
+inline std::unique_ptr<Config> loadDefaultConfig() {
+    return Config::load();  // Uses 3-tier loading: config.yaml -> advanced.yaml -> expert.yaml
 }
 
 /**
  * Get the models directory path (for NCNN models like sface, RFB-320)
+ * FHS compliant: /var/lib/faceid/models
  * 
  * @return Full path to models directory
  */
 inline std::string getModelsDir() {
-    return std::string(MODELS_DIR);
+    return "/var/lib/faceid/models";
 }
 
 /**
  * Get the faces directory path (for user enrollment data)
+ * FHS compliant: /var/lib/faceid/faces/<username>
  * 
- * @return Full path to faces directory
+ * @param username The username whose face data to access
+ * @return Full path to faces directory for the user
  */
-inline std::string getFacesDir() {
-    return std::string(FACES_DIR);
+inline std::string getFacesDir(const std::string& username) {
+    if (username.empty()) {
+        // Get current user
+        const char* user = getenv("USER");
+        if (!user) user = getenv("LOGNAME");
+        if (!user) {
+            struct passwd* pw = getpwuid(getuid());
+            if (pw) user = pw->pw_name;
+        }
+        if (user) {
+            return std::string("/var/lib/faceid/faces/") + user;
+        }
+        return "";
+    }
+    return std::string("/var/lib/faceid/faces/") + username;
 }
 
 /**
@@ -205,7 +222,7 @@ inline bool isValidUsername(const std::string& username) {
  */
 inline std::vector<std::string> findUserModelFiles(const std::string& username) {
     std::vector<std::string> files;
-    std::string faces_dir = getFacesDir();
+    std::string faces_dir = getFacesDir(username);
     
     DIR* dir = opendir(faces_dir.c_str());
     if (!dir) {
@@ -247,7 +264,7 @@ inline std::vector<std::string> findUserModelFiles(const std::string& username) 
  * @return Full path to model file, or empty string if not found
  */
 inline std::string getUserModelFile(const std::string& username) {
-    std::string faces_dir = getFacesDir();
+    std::string faces_dir = getFacesDir(username);
     std::string primary = faces_dir + "/" + username + ".bin";
     
     // Check primary file first
@@ -269,7 +286,7 @@ inline std::string getUserModelFile(const std::string& username) {
  */
 inline std::vector<std::string> getEnrolledUsers() {
     std::vector<std::string> users;
-    std::string faces_dir = getFacesDir();
+    std::string faces_dir = "/var/lib/faceid/faces";  // Base directory for scanning
     
     DIR* dir = opendir(faces_dir.c_str());
     if (!dir) {

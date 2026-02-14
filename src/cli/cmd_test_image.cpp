@@ -1,5 +1,7 @@
 #include "commands.h"
 #include "cli_common.h"
+#include "config_paths.h"
+#include "../daemon/config.h"
 #include <chrono>
 #include <vector>
 #include <string>
@@ -384,16 +386,19 @@ int cmd_test_image(const std::vector<std::string>& args) {
     }
 
     // Load configuration
-    faceid::Config& config = faceid::Config::getInstance();
     std::string config_path = std::string(CONFIG_DIR) + "/faceid.conf";
-    config.load(config_path);
+    auto config_ptr = ::Config::load();
+    if (!config_ptr) {
+        std::cerr << "Warning: Could not load config, using defaults" << std::endl;
+    }
+    ::Config& config = config_ptr ? *config_ptr : ::Config::instance();
 
-    double recognition_threshold = config.getDouble("recognition", "threshold").value_or(0.6);
-    double detection_confidence_config = config.getDouble("recognition", "confidence").value_or(0.8);
+    double recognition_threshold = config.recognition.threshold;
+    double detection_confidence_config = config.face_detection.confidence_threshold;
     
     // Load camera resolution for image normalization
-    int camera_width = config.getInt("camera", "width").value_or(640);
-    int camera_height = config.getInt("camera", "height").value_or(480);
+    int camera_width = config.camera.width;
+    int camera_height = config.camera.height;
     
     // Use CLI override if provided, otherwise use config value
     float detection_confidence = (confidence_threshold > 0.0f) ? confidence_threshold : static_cast<float>(detection_confidence_config);
@@ -420,7 +425,7 @@ int cmd_test_image(const std::vector<std::string>& args) {
         return 1;
     }
     
-    std::string models_dir = std::string(MODELS_DIR);
+    std::string models_dir = cli::getModelsDir();
     if (verbose) {
         std::cout << "✓ Models loaded successfully" << std::endl;
         std::cout << "  Models directory: " << models_dir << std::endl;

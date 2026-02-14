@@ -1,6 +1,7 @@
 #include "commands.h"
 #include "cli_common.h"
 #include "cli_helpers.h"
+#include "../daemon/config.h"
 #include <algorithm>  // for std::reverse
 
 namespace faceid {
@@ -12,16 +13,17 @@ int cmd_show() {
     std::cout << "Press 'q' or ESC to quit" << std::endl << std::endl;
     
     // Load configuration
-    faceid::Config& config = faceid::Config::getInstance();
     std::string config_path = std::string(CONFIG_DIR) + "/faceid.conf";
-    if (!config.load(config_path)) {
+    auto config_ptr = ::Config::load();
+    if (!config_ptr) {
         std::cerr << "Warning: Could not load config, using defaults" << std::endl;
     }
+    ::Config& config = config_ptr ? *config_ptr : ::Config::instance();
     
     // Get camera settings
-    auto device = config.getString("camera", "device").value_or("/dev/video0");
-    auto width = config.getInt("camera", "width").value_or(640);
-    auto height = config.getInt("camera", "height").value_or(480);
+    auto device = config.camera.device;
+    auto width = config.camera.width;
+    auto height = config.camera.height;
     
     std::cout << "Using camera: " << device << " (" << width << "x" << height << ")" << std::endl;
     
@@ -40,9 +42,9 @@ int cmd_show() {
     faceid::FaceDetector detector;
     
     std::cout << "Loading face detection model..." << std::endl;
-    if (!detector.loadModels()) {  // Use default MODELS_DIR/sface path
+    if (!detector.loadModels()) {  // Use default models path
         std::cerr << "Error: Failed to load face detection model" << std::endl;
-        std::cerr << "Expected files: " << MODELS_DIR << "/sface.param and sface.bin" << std::endl;
+        std::cerr << "Expected files: " << cli::getModelsDir() << "/sface.param and sface.bin" << std::endl;
         std::cerr << "Run: sudo make install-models" << std::endl;
         return 1;
     }

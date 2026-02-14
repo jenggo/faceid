@@ -103,6 +103,16 @@ int cmd_test_image(const std::vector<std::string>& args);
 int cmd_bench(const std::string& test_dir, bool show_detail = false, const std::string& custom_image_path = "");
 
 /**
+ * GPU Benchmark - CPU vs Vulkan comparison
+ * 
+ * @param models_dir Directory containing models (default: auto-detect)
+ * @param verbose Show detailed output
+ * @param custom_image Path to custom test image (optional)
+ * @return 0 on success, 1 on failure
+ */
+int cmd_bench_gpu(const std::string& models_dir, bool verbose = false, const std::string& custom_image = "");
+
+/**
  * Switch active model (detection, detection2, or recognition)
  * 
  * Automatically detects if the model is for detection or recognition,

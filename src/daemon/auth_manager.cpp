@@ -1,6 +1,8 @@
 #include "auth_manager.h"
 #include "config.h"
 #include "face_detector_manager.h"
+#include "camera_manager.h"
+#include "model_store.h"
 #include "fingerprint_manager.h"
 #include <syslog.h>
 #include <cstring>
@@ -104,8 +106,8 @@ void AuthManager::verify_stop() {
 void AuthManager::run_face_verification(sd_bus* bus, const std::string& username) {
     syslog(LOG_DEBUG, "Face verification thread started for %s", username.c_str());
     
+    // Step 1: Initialize face detector if needed
     FaceDetectorManager& face_mgr = FaceDetectorManager::instance();
-    
     if (!face_mgr.is_ready()) {
         syslog(LOG_DEBUG, "Face detector not ready, initializing...");
         if (!face_mgr.initialize()) {
@@ -116,20 +118,75 @@ void AuthManager::run_face_verification(sd_bus* bus, const std::string& username
         }
     }
     
-    // Run face verification
-    float confidence = face_mgr.verify_face(username);
+    // Step 2: Initialize camera if needed
+    CameraManager& camera_mgr = CameraManager::instance();
+    if (!camera_mgr.is_ready()) {
+        syslog(LOG_DEBUG, "Camera not ready, initializing...");
+        if (!camera_mgr.initialize()) {
+            syslog(LOG_ERR, "Failed to initialize camera");
+            emit_verify_status(bus, "camera_error", true);
+            status_ = AuthStatus::FAILED;
+            return;
+        }
+    }
+    
+    // Step 3: Capture frame
+    faceid::Image frame = camera_mgr.capture_frame();
+    if (frame.empty()) {
+        syslog(LOG_ERR, "Failed to capture frame from camera");
+        emit_verify_status(bus, "camera_error", true);
+        status_ = AuthStatus::FAILED;
+        return;
+    }
+    
+    if (cancel_verification_) {
+        syslog(LOG_DEBUG, "Face verification cancelled after frame capture");
+        return;
+    }
+    
+    // Step 4: Detect faces
+    std::vector<faceid::Rect> faces = face_mgr.detect_faces(frame);
+    if (faces.empty()) {
+        syslog(LOG_INFO, "No faces detected for %s", username.c_str());
+        emit_verify_status(bus, "no_face", true);
+        status_ = AuthStatus::FAILED;
+        return;
+    }
+    
+    if (cancel_verification_) {
+        syslog(LOG_DEBUG, "Face verification cancelled after detection");
+        return;
+    }
+    
+    // Step 5: Load user models
+    ModelStore& model_store = ModelStore::instance();
+    std::vector<faceid::FaceEncoding> stored_models = model_store.get_user_model(username);
+    if (stored_models.empty()) {
+        syslog(LOG_INFO, "No face models enrolled for %s", username.c_str());
+        emit_verify_status(bus, "no_model", true);
+        status_ = AuthStatus::FAILED;
+        return;
+    }
+    
+    // Step 6: Verify face
+    float confidence = face_mgr.verify_face(frame, faces, stored_models);
     
     if (cancel_verification_) {
         syslog(LOG_DEBUG, "Face verification cancelled");
         return;
     }
     
-    if (confidence > 0.7f) {
-        syslog(LOG_INFO, "Face verification successful (confidence: %.2f)", confidence);
+    // Step 7: Check confidence threshold
+    float threshold = 0.40f;  // Default threshold (can be made configurable later)
+    
+    if (confidence >= threshold) {
+        syslog(LOG_INFO, "Face verification successful for %s (confidence: %.3f >= %.3f)", 
+               username.c_str(), confidence, threshold);
         emit_verify_status(bus, "success", true);
         status_ = AuthStatus::COMPLETED;
     } else {
-        syslog(LOG_WARNING, "Face verification failed (confidence: %.2f)", confidence);
+        syslog(LOG_WARNING, "Face verification failed for %s (confidence: %.3f < %.3f)", 
+               username.c_str(), confidence, threshold);
         emit_verify_status(bus, "face_failure", true);
         status_ = AuthStatus::FAILED;
     }
@@ -146,17 +203,19 @@ void AuthManager::run_fingerprint_verification(sd_bus* bus, const std::string& u
     
     syslog(LOG_DEBUG, "Fingerprint verification thread started for %s", username.c_str());
     
-    FingerprintManager& fp_mgr = FingerprintManager::instance();
+    faceid::daemon::FingerprintManager& fp_mgr = faceid::daemon::FingerprintManager::instance();
     
     if (!fp_mgr.is_available()) {
         syslog(LOG_DEBUG, "Fingerprint reader not available");
         return;
     }
     
-    // Run fingerprint verification
-    float confidence = fp_mgr.verify_fingerprint(username);
+    // Run fingerprint verification with cancel flag
+    std::atomic<bool> cancel_flag{false};
+    float confidence = fp_mgr.verify_fingerprint(username, cancel_flag);
     
     if (cancel_verification_) {
+        cancel_flag.store(true);
         syslog(LOG_DEBUG, "Fingerprint verification cancelled");
         return;
     }
